@@ -1,0 +1,17 @@
+[package]
+name = "browser-compositor"
+description = "Layer tree, tile management and damage tracking"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+browser-style = { workspace = true }
+browser-dom = { workspace = true }
+browser-layout = { workspace = true }
+
+[lints]
+workspace = true

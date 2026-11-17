@@ -1,0 +1,30 @@
+//! Compositor: layer tree, tiling, damage tracking and animation clocks.
+//!
+//! The compositor never touches pixels itself. It decides *what* needs repainting
+//! and in which order layers are composited, and hands that information to the
+//! paint/raster or GPU backend.
+//!
+//! ```
+//! use browser_layout::Size;
+//! use browser_compositor::{Damage, LayerTree};
+//!
+//! let layout = browser_layout::LayoutTree::new();
+//! let mut layers = LayerTree::build(&layout, Size::default());
+//! layers.resize(Size { width: 800.0, height: 600.0 });
+//! let damage: Damage = layers.take_damage();
+//! assert!(damage.is_empty());
+//! ```
+
+#![forbid(unsafe_code)]
+
+pub mod animations;
+pub mod clipping;
+pub mod damage;
+pub mod layers;
+pub mod tiles;
+
+pub use animations::{Animation, AnimationTimeline, Easing};
+pub use clipping::ClipStack;
+pub use damage::Damage;
+pub use layers::{Layer, LayerId, LayerTree};
+pub use tiles::TileGrid;
