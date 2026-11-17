@@ -1,0 +1,32 @@
+[package]
+name = "browser-core"
+description = "Engine facade wiring network, DOM, CSS, layout, paint and JS"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+browser-url = { workspace = true }
+browser-http = { workspace = true }
+browser-resource-loader = { workspace = true }
+browser-dom = { workspace = true }
+browser-html-parser = { workspace = true }
+browser-selectors = { workspace = true }
+browser-css = { workspace = true }
+browser-style = { workspace = true }
+browser-text = { workspace = true }
+browser-layout = { workspace = true }
+browser-paint = { workspace = true }
+browser-compositor = { workspace = true }
+browser-js-parser = { workspace = true }
+browser-js = { workspace = true }
+browser-event-loop = { workspace = true }
+browser-web-apis = { workspace = true }
+browser-navigation = { workspace = true }
+browser-security = { workspace = true }
+
+[lints]
+workspace = true
