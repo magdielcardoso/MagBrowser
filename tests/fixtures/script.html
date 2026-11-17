@@ -1,0 +1,18 @@
+<!DOCTYPE html>
+<html>
+<head><title>Script page</title></head>
+<body>
+  <div id="out">start</div>
+  <button id="go">Go</button>
+  <script>
+    var out = document.getElementById('out');
+    out.textContent = 'script ran';
+    var hits = 0;
+    document.getElementById('go').addEventListener('click', function () {
+      hits = hits + 1;
+      out.textContent = 'clicked ' + hits;
+    });
+    console.log('script ready');
+  </script>
+</body>
+</html>

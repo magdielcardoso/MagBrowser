@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <title>Mag test page</title>
+  <style>
+    :root { --brand: #1a73e8; --ink: #202124; }
+    body { margin: 16px; color: var(--ink); font-size: 16px; }
+    h1 { color: var(--brand); margin-top: 0; }
+    .card { border: 1px solid #dadce0; padding: 8px; background-color: #f8f9fa; }
+    .row { display: flex; gap: 8px; }
+    .badge { background-color: #1a73e8; color: #ffffff; padding: 2px; }
+    a { color: #1a73e8; }
+    #hidden { display: none; }
+  </style>
+</head>
+<body>
+  <h1>Mag engine</h1>
+  <p class="card">A browser engine written from scratch in Rust.</p>
+  <div class="row">
+    <span class="badge">layout</span>
+    <span class="badge">css</span>
+    <span class="badge">js</span>
+  </div>
+  <ul>
+    <li>Networking</li>
+    <li>HTML parsing</li>
+    <li>Layout</li>
+  </ul>
+  <p><a href="/next">Next page</a></p>
+  <div id="hidden">invisible</div>
+</body>
+</html>
