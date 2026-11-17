@@ -176,11 +176,11 @@ impl Url {
     pub fn host_header(&self) -> Option<String> {
         let host = self.host.as_ref()?;
         let mut out = host.clone();
-        if let (Some(port), Some(default)) = (self.port, default_port(&self.scheme)) {
-            if port != default {
-                out.push(':');
-                out.push_str(&port.to_string());
-            }
+        if let (Some(port), Some(default)) = (self.port, default_port(&self.scheme))
+            && port != default
+        {
+            out.push(':');
+            out.push_str(&port.to_string());
         }
         Some(out)
     }
@@ -204,11 +204,11 @@ impl Url {
         if let Some(host) = &self.host {
             out.push_str(host);
         }
-        if let (Some(port), Some(default)) = (self.port, default_port(&self.scheme)) {
-            if port != default {
-                out.push(':');
-                out.push_str(&port.to_string());
-            }
+        if let (Some(port), Some(default)) = (self.port, default_port(&self.scheme))
+            && port != default
+        {
+            out.push(':');
+            out.push_str(&port.to_string());
         }
         out.push_str(&self.path());
         if let Some(q) = &self.query {
@@ -270,10 +270,6 @@ impl Url {
 
     pub(crate) fn set_fragment(&mut self, value: Option<String>) {
         self.fragment = value;
-    }
-
-    pub(crate) fn is_empty_path(&self) -> bool {
-        self.path.is_empty()
     }
 }
 
@@ -472,10 +468,7 @@ mod tests {
         assert_eq!(a.origin(), b.origin());
         assert_ne!(a.origin(), c.origin());
         assert_eq!(a.origin().to_string(), "https://example.com:443");
-        assert_eq!(
-            Url::parse("file:///tmp/x").unwrap().origin().is_opaque(),
-            true
-        );
+        assert!(Url::parse("file:///tmp/x").unwrap().origin().is_opaque());
     }
 
     #[test]

@@ -208,10 +208,10 @@ fn parse_authority(auth: &str, url: &mut Url) -> Result<(), UrlError> {
         return Err(UrlError::InvalidHost);
     }
     url.set_host(Some(&host.to_ascii_lowercase()));
-    if let Some(p) = port {
-        if !p.is_empty() {
-            url.set_port(Some(parse_port(p)?));
-        }
+    if let Some(p) = port
+        && !p.is_empty()
+    {
+        url.set_port(Some(parse_port(p)?));
     }
     Ok(())
 }

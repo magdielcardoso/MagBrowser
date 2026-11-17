@@ -1,0 +1,16 @@
+[package]
+name = "browser-resource-loader"
+description = "Resource loading, MIME sniffing and preload scanning"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+browser-url = { workspace = true }
+browser-http = { workspace = true }
+
+[lints]
+workspace = true
