@@ -71,7 +71,6 @@ browser-text = { path = "crates/layout/text" }
 browser-layout = { path = "crates/layout/layout" }
 browser-paint = { path = "crates/graphics/paint" }
 browser-compositor = { path = "crates/graphics/compositor" }
-browser-gpu = { path = "crates/graphics/gpu" }
 browser-js-parser = { path = "crates/javascript/js-parser" }
 browser-js = { path = "crates/javascript/js-runtime" }
 browser-event-loop = { path = "crates/web/event-loop" }
