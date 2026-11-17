@@ -20,7 +20,12 @@ pub fn layout_flex(tree: &mut LayoutTree, doc: &Document, index: usize) -> f32 {
     let align = style.align_items();
     let row_gap = style.row_gap();
     let column_gap = style.column_gap();
-    let children = tree.boxes[index].children.clone();
+    let children: Vec<usize> = tree.boxes[index]
+        .children
+        .iter()
+        .copied()
+        .filter(|child| !crate::tree::is_ignorable_child(tree, *child))
+        .collect();
     if children.is_empty() {
         return 0.0;
     }

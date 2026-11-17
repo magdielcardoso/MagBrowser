@@ -300,11 +300,16 @@ impl<'a> TreeBuilder<'a> {
                     return None;
                 }
                 let name = self.doc.element_name(node).unwrap_or("");
-                let box_type = match name {
+                let mut box_type = match name {
                     "br" => BoxType::LineBreak,
                     "img" => BoxType::Image,
                     _ => box_type_from_display(style.display()),
                 };
+                // `float` blockifies the box, so a floated inline element takes part
+                // in block flow (CSS 2.1 §9.7).
+                if style.float() != browser_style::Float::None {
+                    box_type = BoxType::Block;
+                }
                 let mut b = LayoutBox::new(Some(node), box_type, style.clone());
                 b.z_index = self.style_for(node, parent_style).z_index();
                 b.positioned = matches!(
@@ -436,6 +441,34 @@ fn box_type_from_display(display: Display) -> BoxType {
         Display::TableRow => BoxType::TableRow,
         Display::TableCell => BoxType::TableCell,
         Display::Contents | Display::None => BoxType::Block,
+    }
+}
+
+/// True for boxes that only contain collapsible whitespace.
+///
+/// Flex and grid containers must not create items for those (they would each
+/// become an empty item and distort the layout).
+pub fn is_ignorable_child(tree: &LayoutTree, index: usize) -> bool {
+    let Some(b) = tree.boxes.get(index) else {
+        return true;
+    };
+    match b.box_type {
+        BoxType::Text => b.text.trim().is_empty(),
+        BoxType::AnonymousBlock => {
+            let mut stack = b.children.clone();
+            while let Some(child) = stack.pop() {
+                let Some(node) = tree.boxes.get(child) else {
+                    continue;
+                };
+                match node.box_type {
+                    BoxType::Text if !node.text.trim().is_empty() => return false,
+                    BoxType::Text => {}
+                    _ => stack.extend(node.children.iter().copied()),
+                }
+            }
+            true
+        }
+        _ => false,
     }
 }
 

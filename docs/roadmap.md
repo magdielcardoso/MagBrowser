@@ -39,8 +39,10 @@ with documented gaps, **planned** = designed but not implemented.
   collapsing; inline flow with greedy line breaking, `text-align`, `white-space`,
   inline-blocks and `<br>`; basic flexbox; absolute/fixed positioning; relative
   offsets; overflow clipping and scroll ranges; hit testing and paint order.
-- **Not done:** floats, CSS grid, full table layout (column widths, row spanning),
-  `vertical-align` beyond keywords, bidirectional text.
+- Floats (left/right with per-line float bands and `clear`) and a CSS Grid subset
+  (`px`/`%`/`fr`/`auto`/`repeat()`, gaps, row-major placement).
+- **Not done:** full table layout (column widths, row spanning), `vertical-align`
+  beyond keywords, named grid lines/areas, bidirectional text.
 
 ## Phase 4 — Rendering — done (software), GPU planned
 
@@ -49,8 +51,12 @@ with documented gaps, **planned** = designed but not implemented.
 - Dependency-free PNG encoder; deterministic screenshots; headless CLI.
 - Compositor: layers, tiles, damage rectangles, clip stack, animation timeline.
 - GPU abstraction with embedded WGSL shaders and a software reference device.
+- Image decoding: PNG (all filters, palette/grey/RGBA, interlaced) and 24/32-bit
+  BMP, wired into `<img>` rendering; GIF/JPEG/WebP are detected but still
+  unsupported.
+- Synthetic bold/italic and list markers in the rasterizer.
 - **Planned:** native `wgpu` device + `winit` window in `apps/browser`, damage-based
-  partial repaint, real font loading/shaping, image decoding (PNG/JPEG).
+  partial repaint, real font loading/shaping, GIF/JPEG/WebP decoding.
 
 ## Phase 5 — Navigation — done
 
@@ -61,8 +67,8 @@ with documented gaps, **planned** = designed but not implemented.
 
 - Lexer, parser, AST, interpreter, values, operators, scopes, closures, objects,
   arrays, prototypes, exceptions, mark-and-sweep GC, microtasks and promises.
-- **Not done:** regex literals, bit shifts, destructuring, classes, generators,
-  async/await, getters/setters in literals, `eval`.
+- **Not done:** classes, generators, async/await, getters/setters in literals,
+  `eval`; regex literals, bit shifts and destructuring are being added.
 
 ## Phase 7 — DOM + JavaScript — done
 

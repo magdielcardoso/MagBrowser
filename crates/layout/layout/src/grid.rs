@@ -37,7 +37,12 @@ enum Track {
 pub fn layout_grid(tree: &mut LayoutTree, doc: &Document, index: usize) -> f32 {
     let style = tree.boxes[index].style.clone();
     let content = tree.boxes[index].content;
-    let children = tree.boxes[index].children.clone();
+    let children: Vec<usize> = tree.boxes[index]
+        .children
+        .iter()
+        .copied()
+        .filter(|child| !crate::tree::is_ignorable_child(tree, *child))
+        .collect();
     let column_gap = style.column_gap().max(0.0);
     let row_gap = style.row_gap().max(0.0);
 
