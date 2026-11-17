@@ -31,6 +31,9 @@ navigation and security policy primitives.
   `setTimeout`/`setInterval`, `localStorage`, `console`, `location`.
 - **Browser core** — tabs, navigation with history, address-bar normalisation, CSP
   enforcement for scripts and stylesheets, rendering and PNG screenshots.
+- **Desktop window** — `--features window` opens a native `winit` + `wgpu` window
+  with engine-drawn chrome (tabs, back/forward/reload, address field, status pill);
+  `--window-selfcheck` renders the same composition to PNG.
 
 ## Quick start
 
@@ -44,6 +47,12 @@ cargo run -p browser-cli -- styles  tests/fixtures/page.html "h1"
 cargo run -p browser-cli -- layout  tests/fixtures/page.html
 cargo run -p browser-cli -- render  tests/fixtures/page.html -o out/page.png
 
+# Native desktop window (adds wgpu/winit)
+cargo run -p mag-browser --features window -- tests/fixtures/page.html
+
+# Window composition to PNG (works without the feature too)
+cargo run -p mag-browser -- --window-selfcheck out/window.png tests/fixtures/page.html
+
 # Interactive browser shell (frames written as PNG)
 cargo run -p mag-browser -- tests/fixtures/script.html --script
 
@@ -53,9 +62,9 @@ cargo run -p mag-browser -- tests/fixtures/script.html --script
 
 ## Limitations (documented, not hidden)
 
-No native window/GPU path yet (frames are PNGs), no image decoders in the default
-build until the media task lands, no floats/grid in layout until the layout task
-lands, no regex literals or classes in JavaScript, no process isolation. See
+The native window is feature-gated (default build stays GPU-free), there is no
+process isolation yet, and JavaScript still lacks classes, generators and
+`async`/`await`. See
 `docs/roadmap.md` for the full list and `docs/security.md` for the threat model.
 
 ## Layout

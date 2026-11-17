@@ -56,8 +56,10 @@ with documented gaps, **planned** = designed but not implemented.
   frame of animations) and uncompressed 24/32-bit BMP. JPEG and WebP are detected
   but not decoded yet.
 - Synthetic bold/italic and list markers in the rasterizer.
-- **Planned:** native `wgpu` device + `winit` window in `apps/browser`, damage-based
-  partial repaint, real font loading/shaping, GIF/JPEG/WebP decoding.
+- Native desktop window: `winit 0.30` + `wgpu 30` behind the `window` feature,
+  with engine-drawn chrome and a `--window-selfcheck` PNG mode.
+- **Planned:** damage-based partial repaint, HiDPI-perfect composition, real font
+  loading/shaping, WebP decoding.
 
 ## Phase 5 — Navigation — done
 
@@ -98,8 +100,8 @@ with documented gaps, **planned** = designed but not implemented.
 
 1. No incremental style/layout invalidation: every mutation re-renders the page.
 2. PNG-only image support: no decoder for network images yet.
-3. No native window: the default build renders to PNG buffers, not to a desktop
-   window.
+3. The desktop window requires `--features window` (adds `wgpu`/`winit`); the
+   default build renders to PNG buffers.
 4. Scripts from external `<script src>` are not fetched or executed.
 5. No process isolation, so untrusted web content should not be loaded with
    scripting enabled.

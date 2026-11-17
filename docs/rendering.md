@@ -92,10 +92,29 @@ rasterizer yet; both sides exist and are tested independently.
 
 `Device` is the boundary: `render(display_list, viewport) -> ImageBuffer`,
 `create_texture`, `upload_texture`. `SoftwareDevice` implements it with the
-rasterizer, and the WGSL sources for the rectangle and image pipelines are embedded
-at compile time. A native `wgpu` device is planned (see the roadmap); until it
-exists the windowed shell uses the same software path, so behaviour is identical
-between headless and windowed rendering.
+rasterizer; `NativeDevice`/`NativePresenter` (feature `wgpu-backend`) add a real
+`wgpu` surface with a single fullscreen textured-quad pipeline. Composition is done
+on the CPU (deterministic), uploaded as one sRGB texture and presented with
+`PresentMode::Fifo`, so the window and `--window-selfcheck` PNG are pixel-identical.
+
+### Desktop window (`apps/browser`)
+
+`--features window` opens a `winit` 0.30 window with chrome drawn by the engine's
+own primitives and bitmap font:
+
+```
+tab strip (36 px)  →  tabs + "+"
+toolbar   (44 px)  →  back / forward / reload chips, address field, caret
+page area          →  display list clipped inside a 1 px frame
+status pill        →  Pronto / Carregando… / Erro
+```
+
+The chrome geometry lives in `chrome/layout.rs` (pure functions, tested), the
+composition in `chrome/render.rs`, and input handling in `window_app.rs`. Text in
+the chrome comes from a glyph atlas generated from `browser_text::Font`; page text
+still uses the software rasterizer for exact deterministic output. A live window
+was smoke-tested on macOS; CI validates the same composition through
+`--window-selfcheck <out.png>`.
 
 ## Determinism and testing
 
