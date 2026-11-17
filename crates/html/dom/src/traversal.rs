@@ -55,7 +55,7 @@ impl Document {
 
     /// Pre-order traversal of `id`'s subtree, excluding `id`.
     pub fn descendants(&self, id: NodeId) -> Descendants<'_> {
-        let mut stack: Vec<NodeId> = self.node(id).children.iter().rev().copied().collect();
+        let stack: Vec<NodeId> = self.node(id).children.iter().rev().copied().collect();
         Descendants { doc: self, stack }
     }
 
