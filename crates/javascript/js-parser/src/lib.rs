@@ -9,15 +9,17 @@
 pub mod ast;
 pub mod lexer;
 pub mod parser;
+pub mod regexp;
 pub mod syntax;
 
 pub use ast::{
     AssignOp, BinaryOp, CatchClause, DeclKind, Expr, ForInit, ForTarget, Function, LogicalOp,
-    Position, Program, Property, PropertyKey, Stmt, SwitchCase, UnaryOp, UpdateOp, VarDecl,
-    VarDeclarator,
+    ObjectPatternProperty, Pattern, Position, Program, Property, PropertyKey, Stmt, SwitchCase,
+    UnaryOp, UpdateOp, VarDecl, VarDeclarator,
 };
 pub use lexer::{Lexer, Punct, Token, TokenKind, tokenize};
 pub use parser::{ParseError, Parser, parse};
+pub use regexp::{Regex, RegexError, RegexFlags, RegexMatch};
 pub use syntax::{Keyword, is_keyword};
 
 #[cfg(test)]
@@ -575,5 +577,400 @@ mod tests {
         assert_eq!(tokens[0].position.column, 1);
         assert_eq!(tokens[1].position.line, 2);
         assert_eq!(tokens[1].position.column, 3);
+    }
+
+    // -----------------------------------------------------------------------
+    // Bit shifts
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn lexes_shift_operators() {
+        assert_eq!(
+            kinds("<< >> >>> <<= >>= >>>="),
+            vec![
+                TokenKind::Punct(Punct::LtLt),
+                TokenKind::Punct(Punct::GtGt),
+                TokenKind::Punct(Punct::GtGtGt),
+                TokenKind::Punct(Punct::LtLtEq),
+                TokenKind::Punct(Punct::GtGtEq),
+                TokenKind::Punct(Punct::GtGtGtEq),
+                TokenKind::Eof,
+            ]
+        );
+        // `>=` and `>>` stay distinct.
+        assert_eq!(
+            kinds("a >= b >> c"),
+            vec![
+                TokenKind::Identifier("a".to_owned()),
+                TokenKind::Punct(Punct::GtEq),
+                TokenKind::Identifier("b".to_owned()),
+                TokenKind::Punct(Punct::GtGt),
+                TokenKind::Identifier("c".to_owned()),
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn shift_binds_looser_than_addition() {
+        match expr("a << 1 + 2") {
+            Expr::Binary {
+                op: BinaryOp::Shl,
+                right,
+                ..
+            } => assert!(matches!(
+                *right,
+                Expr::Binary {
+                    op: BinaryOp::Add,
+                    ..
+                }
+            )),
+            other => panic!("expected shift, got {other:?}"),
+        }
+        match expr("1 < 2 << 3") {
+            Expr::Binary {
+                op: BinaryOp::Lt,
+                right,
+                ..
+            } => assert!(matches!(
+                *right,
+                Expr::Binary {
+                    op: BinaryOp::Shl,
+                    ..
+                }
+            )),
+            other => panic!("expected less-than, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_shift_assignment_operators() {
+        assert!(matches!(
+            expr("a <<= 1"),
+            Expr::Assign {
+                op: AssignOp::Shl,
+                ..
+            }
+        ));
+        assert!(matches!(
+            expr("a >>= 1"),
+            Expr::Assign {
+                op: AssignOp::Shr,
+                ..
+            }
+        ));
+        assert!(matches!(
+            expr("a >>>= 1"),
+            Expr::Assign {
+                op: AssignOp::UShr,
+                ..
+            }
+        ));
+        assert!(matches!(
+            expr("a >>> b"),
+            Expr::Binary {
+                op: BinaryOp::UShr,
+                ..
+            }
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Regular expression literals
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn lexes_regex_literals() {
+        assert_eq!(
+            kinds("/abc/g"),
+            vec![
+                TokenKind::Regex {
+                    pattern: "abc".to_owned(),
+                    flags: "g".to_owned(),
+                },
+                TokenKind::Eof,
+            ]
+        );
+        assert_eq!(
+            kinds(r"/a\/b[\]x]/im"),
+            vec![
+                TokenKind::Regex {
+                    pattern: r"a\/b[\]x]".to_owned(),
+                    flags: "im".to_owned(),
+                },
+                TokenKind::Eof,
+            ]
+        );
+        // At an expression start `/=` begins a regex, not an assignment.
+        assert_eq!(
+            kinds("/=/"),
+            vec![
+                TokenKind::Regex {
+                    pattern: "=".to_owned(),
+                    flags: String::new(),
+                },
+                TokenKind::Eof,
+            ]
+        );
+        let tokens = kinds("a /= 2");
+        assert!(matches!(tokens[1], TokenKind::Punct(Punct::SlashEq)));
+    }
+
+    #[test]
+    fn slash_after_operand_is_division() {
+        let tokens = kinds("a / b");
+        assert!(matches!(tokens[1], TokenKind::Punct(Punct::Slash)));
+        let tokens = kinds("1 / 2");
+        assert!(matches!(tokens[1], TokenKind::Punct(Punct::Slash)));
+        let tokens = kinds("f(x) / 2");
+        assert!(matches!(tokens[4], TokenKind::Punct(Punct::Slash)));
+        let tokens = kinds("arr[0] / 2");
+        assert!(matches!(tokens[4], TokenKind::Punct(Punct::Slash)));
+        let tokens = kinds("'s' / 2");
+        assert!(matches!(tokens[1], TokenKind::Punct(Punct::Slash)));
+        assert!(!matches!(tokens[1], TokenKind::Punct(Punct::SlashEq)));
+    }
+
+    #[test]
+    fn slash_after_operators_starts_a_regex() {
+        for source in [
+            "x = /a/",
+            "x + /a/",
+            "(/a/)",
+            "[ /a/ ]",
+            "return /a/",
+            "a && /b/",
+        ] {
+            let tokens = kinds(source);
+            assert!(
+                tokens.iter().any(|token| matches!(
+                    token,
+                    TokenKind::Regex { pattern, .. } if pattern == "a" || pattern == "b"
+                )),
+                "expected a regex token in {source:?}, got {tokens:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn regex_allowed_after_control_paren() {
+        let tokens = kinds("if (x) /a/.test(s)");
+        assert!(
+            tokens
+                .iter()
+                .any(|token| matches!(token, TokenKind::Regex { .. }))
+        );
+        let tokens = kinds("while (x) /a/.test(s)");
+        assert!(
+            tokens
+                .iter()
+                .any(|token| matches!(token, TokenKind::Regex { .. }))
+        );
+        // A call parenthesis ends an operand, so `/` is division there.
+        let tokens = kinds("f(x) / a");
+        assert!(
+            !tokens
+                .iter()
+                .any(|token| matches!(token, TokenKind::Regex { .. }))
+        );
+    }
+
+    #[test]
+    fn parses_regex_literal_expression() {
+        match expr("/ab+c/gi") {
+            Expr::Regex { pattern, flags } => {
+                assert_eq!(pattern, "ab+c");
+                assert_eq!(flags, "gi");
+            }
+            other => panic!("expected regex, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn invalid_regex_literal_is_a_parse_error() {
+        let error = parse("/a(/").expect_err("invalid regex");
+        assert!(error.message.contains("invalid regular expression"));
+        assert!(parse("/[abc/").is_err());
+        assert!(parse("/a/qq").is_err());
+        assert!(parse("/a/gg").is_err());
+    }
+
+    #[test]
+    fn unterminated_regex_literal_is_a_parse_error() {
+        let error = parse("var re = /abc").expect_err("unterminated regex");
+        assert!(error.message.contains("unterminated"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Destructuring
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parses_array_destructuring_declaration() {
+        let program = parse_ok("var [a, , b = 1, ...rest] = items;");
+        let Stmt::VarDecl(declaration) = &program.body[0] else {
+            panic!("expected declaration");
+        };
+        let Pattern::Array(elements) = &declaration.declarations[0].pattern else {
+            panic!("expected array pattern");
+        };
+        assert_eq!(elements.len(), 4);
+        assert!(elements[1].is_none());
+        assert!(matches!(elements[2], Some(Pattern::Default { .. })));
+        assert!(matches!(elements[3], Some(Pattern::Rest(_))));
+    }
+
+    #[test]
+    fn parses_object_destructuring_declaration() {
+        let program = parse_ok("let {a, b: c, d = 2, ...rest} = source;");
+        let Stmt::VarDecl(declaration) = &program.body[0] else {
+            panic!("expected declaration");
+        };
+        let Pattern::Object { properties, rest } = &declaration.declarations[0].pattern else {
+            panic!("expected object pattern");
+        };
+        assert_eq!(properties.len(), 3);
+        assert!(matches!(properties[0].value, Pattern::Identifier(ref name) if name == "a"));
+        assert!(matches!(properties[1].value, Pattern::Identifier(ref name) if name == "c"));
+        assert!(matches!(properties[2].value, Pattern::Default { .. }));
+        assert!(rest.is_some());
+    }
+
+    #[test]
+    fn parses_nested_destructuring_patterns() {
+        let program = parse_ok("var {a: [b, {c = 3}]} = source;");
+        let Stmt::VarDecl(declaration) = &program.body[0] else {
+            panic!("expected declaration");
+        };
+        let Pattern::Object { properties, .. } = &declaration.declarations[0].pattern else {
+            panic!("expected object pattern");
+        };
+        let Pattern::Array(elements) = &properties[0].value else {
+            panic!("expected nested array pattern");
+        };
+        assert_eq!(elements.len(), 2);
+        assert!(matches!(elements[1], Some(Pattern::Object { .. })));
+    }
+
+    #[test]
+    fn parses_destructuring_assignment_expressions() {
+        match expr("[a, b = 2] = [b, a]") {
+            Expr::AssignPattern { pattern, .. } => {
+                let Pattern::Array(elements) = pattern else {
+                    panic!("expected array pattern");
+                };
+                assert_eq!(elements.len(), 2);
+                assert!(matches!(elements[1], Some(Pattern::Default { .. })));
+            }
+            other => panic!("expected destructuring assignment, got {other:?}"),
+        }
+        match expr("({a, b: c = 1} = source)") {
+            Expr::AssignPattern { pattern, .. } => {
+                let Pattern::Object { properties, .. } = pattern else {
+                    panic!("expected object pattern");
+                };
+                assert_eq!(properties.len(), 2);
+            }
+            other => panic!("expected destructuring assignment, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn simple_assignments_remain_plain_assignments() {
+        assert!(matches!(
+            expr("a = 1"),
+            Expr::Assign {
+                op: AssignOp::Assign,
+                ..
+            }
+        ));
+        assert!(matches!(
+            expr("obj.x = 1"),
+            Expr::Assign {
+                op: AssignOp::Assign,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn rejects_malformed_patterns() {
+        assert!(parse("var [a = ;").is_err());
+        assert!(parse("var {a: } = x;").is_err());
+        assert!(parse("var [...a, b] = x;").is_err());
+        assert!(parse("var {a} = ;").is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Default and rest parameters
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parses_default_parameters() {
+        let program = parse_ok("function f(a, b = 2, c = a + b) { return c; }");
+        let Stmt::FunctionDecl(function) = &program.body[0] else {
+            panic!("expected function");
+        };
+        assert_eq!(function.patterns.len(), 3);
+        assert!(matches!(function.patterns[0], Pattern::Identifier(_)));
+        assert!(matches!(function.patterns[1], Pattern::Default { .. }));
+        assert!(matches!(function.patterns[2], Pattern::Default { .. }));
+    }
+
+    #[test]
+    fn parses_rest_parameters() {
+        let program = parse_ok("function f(first, ...rest) { return rest; }");
+        let Stmt::FunctionDecl(function) = &program.body[0] else {
+            panic!("expected function");
+        };
+        assert_eq!(function.params, vec!["first"]);
+        assert!(matches!(function.patterns[1], Pattern::Rest(_)));
+    }
+
+    #[test]
+    fn parses_destructuring_and_default_arrow_parameters() {
+        match expr("([a, b = 1], {c}) => a + b + c") {
+            Expr::Arrow(function) => {
+                assert_eq!(function.patterns.len(), 2);
+                assert!(matches!(function.patterns[0], Pattern::Array(_)));
+                assert!(matches!(function.patterns[1], Pattern::Object { .. }));
+            }
+            other => panic!("expected arrow, got {other:?}"),
+        }
+        match expr("(...args) => args.length") {
+            Expr::Arrow(function) => {
+                assert!(matches!(function.patterns[0], Pattern::Rest(_)));
+            }
+            other => panic!("expected arrow, got {other:?}"),
+        }
+        match expr("(a = 5) => a") {
+            Expr::Arrow(function) => {
+                assert!(matches!(function.patterns[0], Pattern::Default { .. }));
+            }
+            other => panic!("expected arrow, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parenthesized_expressions_still_parse_after_arrow_attempt() {
+        assert!(matches!(expr("(a, b)"), Expr::Sequence(_)));
+        assert!(matches!(expr("(a = 1)"), Expr::Assign { .. }));
+        assert!(matches!(expr("([1, 2])"), Expr::Array(_)));
+        assert!(matches!(expr("(a + b) * c"), Expr::Binary { .. }));
+    }
+
+    #[test]
+    fn parses_object_methods_with_complex_parameters() {
+        let Expr::Object(properties) = expr("({ m({a}, b = 1, ...rest) { return a + b; } })")
+        else {
+            panic!("expected object literal");
+        };
+        let Expr::Function(function) = &properties[0].value else {
+            panic!("expected method function");
+        };
+        assert_eq!(function.patterns.len(), 3);
+        assert!(matches!(function.patterns[0], Pattern::Object { .. }));
+        assert!(matches!(function.patterns[1], Pattern::Default { .. }));
+        assert!(matches!(function.patterns[2], Pattern::Rest(_)));
     }
 }

@@ -87,6 +87,7 @@ impl Runtime {
                 boolean: ObjectId(0),
                 error: ObjectId(0),
                 promise: ObjectId(0),
+                regexp: ObjectId(0),
             },
             global: ObjectId(0),
             global_scope: ScopeId(0),

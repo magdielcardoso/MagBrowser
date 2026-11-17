@@ -1,5 +1,9 @@
 //! Builtin objects and functions installed into the global environment.
 
+use std::rc::Rc;
+
+use browser_js_parser::{Regex, RegexMatch};
+
 use crate::Runtime;
 use crate::errors::JsError;
 use crate::object::ObjectKind;
@@ -17,6 +21,7 @@ impl Runtime {
         self.prototypes.boolean = self.bootstrap_object(Some(object_prototype));
         self.prototypes.error = self.bootstrap_object(Some(object_prototype));
         self.prototypes.promise = self.bootstrap_object(Some(object_prototype));
+        self.prototypes.regexp = self.bootstrap_object(Some(object_prototype));
 
         let global = self.bootstrap_object(Some(object_prototype));
         self.global = global;
@@ -32,6 +37,7 @@ impl Runtime {
         self.install_number_prototype();
         self.install_boolean_prototype();
         self.install_error();
+        self.install_regexp();
         self.install_globals();
         self.install_math();
         self.install_json();
@@ -157,6 +163,7 @@ impl Runtime {
         self.define_builtin_method(prototype, "split", 2, string_split);
         self.define_builtin_method(prototype, "trim", 0, string_trim);
         self.define_builtin_method(prototype, "replace", 2, string_replace);
+        self.define_builtin_method(prototype, "match", 1, string_match);
         self.define_builtin_method(prototype, "includes", 1, string_includes);
         self.define_builtin_method(prototype, "startsWith", 1, string_starts_with);
         self.define_builtin_method(prototype, "endsWith", 1, string_ends_with);
@@ -203,6 +210,19 @@ impl Runtime {
             }
             self.declare_global(name, constructor);
         }
+    }
+
+    fn install_regexp(&mut self) {
+        let prototype = self.prototypes.regexp;
+        self.define_builtin_method(prototype, "test", 1, regexp_test);
+        self.define_builtin_method(prototype, "exec", 1, regexp_exec);
+        self.define_builtin_method(prototype, "toString", 0, regexp_to_string);
+
+        let constructor = self.new_builtin_value("RegExp", 2, global_regexp);
+        if let Value::Object(id) = &constructor {
+            self.define_data_property(*id, "prototype", Value::Object(prototype));
+        }
+        self.declare_global("RegExp", constructor);
     }
 
     fn install_math(&mut self) {
@@ -496,6 +516,7 @@ fn object_to_string(
             Some(ObjectKind::Array(_)) => "Array",
             Some(ObjectKind::Function(_)) => "Function",
             Some(ObjectKind::Promise(_)) => "Promise",
+            Some(ObjectKind::RegExp(_)) => "RegExp",
             _ => "Object",
         },
         _ => "Object",
@@ -975,6 +996,12 @@ fn string_split(runtime: &mut Runtime, this: Value, args: Vec<Value>) -> Result<
         Some(number) if number.is_finite() && number >= 0.0 => number as usize,
         _ => usize::MAX,
     };
+    if let Some(regex) = args
+        .first()
+        .and_then(|separator| runtime.regex_of(separator))
+    {
+        return Ok(split_with_regex(runtime, &regex, &text, limit));
+    }
     let pieces: Vec<String> = match args.first() {
         None | Some(Value::Undefined) => vec![text],
         Some(separator) => {
@@ -991,6 +1018,38 @@ fn string_split(runtime: &mut Runtime, this: Value, args: Vec<Value>) -> Result<
     Ok(runtime.new_array(pieces.into_iter().take(limit).map(Value::String).collect()))
 }
 
+fn split_with_regex(runtime: &mut Runtime, regex: &Regex, text: &str, limit: usize) -> Value {
+    let chars: Vec<char> = text.chars().collect();
+    let mut pieces: Vec<Value> = Vec::new();
+    let mut last = 0usize;
+    let mut cursor = 0usize;
+    while cursor <= chars.len() && pieces.len() < limit {
+        let Some(found) = regex.find_from(&chars, cursor) else {
+            break;
+        };
+        pieces.push(Value::String(chars[last..found.start].iter().collect()));
+        for group in found.groups.iter().skip(1) {
+            pieces.push(match group {
+                Some(value) => Value::String(value.clone()),
+                None => Value::Undefined,
+            });
+        }
+        last = found.end;
+        cursor = if found.end == found.start {
+            found.end + 1
+        } else {
+            found.end
+        };
+    }
+    if pieces.len() < limit {
+        pieces.push(Value::String(
+            chars[last.min(chars.len())..].iter().collect(),
+        ));
+    }
+    pieces.truncate(limit);
+    runtime.new_array(pieces)
+}
+
 fn string_trim(runtime: &mut Runtime, this: Value, _args: Vec<Value>) -> Result<Value, JsError> {
     Ok(Value::String(
         this_string(runtime, &this)?.trim().to_owned(),
@@ -999,8 +1058,25 @@ fn string_trim(runtime: &mut Runtime, this: Value, _args: Vec<Value>) -> Result<
 
 fn string_replace(runtime: &mut Runtime, this: Value, args: Vec<Value>) -> Result<Value, JsError> {
     let text = this_string(runtime, &this)?;
+    let replacement = match args.get(1) {
+        Some(Value::Object(_)) => {
+            return Err(JsError::type_error(
+                "function replacements are not supported",
+            ));
+        }
+        Some(value) => runtime.to_string_rt(value)?,
+        None => "undefined".to_owned(),
+    };
+    if let Some(regex) = args.first().and_then(|pattern| runtime.regex_of(pattern)) {
+        let replaced = replace_with_regex(&regex, &text, &replacement);
+        if let Some(pattern) = args.first()
+            && regex.flags().global
+        {
+            runtime.set_property(pattern.clone(), "lastIndex", Value::Number(0.0));
+        }
+        return Ok(Value::String(replaced));
+    }
     let pattern = runtime.to_string_rt(&args.first().cloned().unwrap_or(Value::Undefined))?;
-    let replacement = runtime.to_string_rt(&args.get(1).cloned().unwrap_or(Value::Undefined))?;
     if pattern.is_empty() {
         return Ok(Value::String(format!("{replacement}{text}")));
     }
@@ -1014,6 +1090,253 @@ fn string_replace(runtime: &mut Runtime, this: Value, args: Vec<Value>) -> Resul
         }
         None => text,
     }))
+}
+
+/// Replace every (or the first) match of `regex` inside `text`, expanding
+/// `$1`, `$&` and `$$` in `replacement`.
+fn replace_with_regex(regex: &Regex, text: &str, replacement: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let global = regex.flags().global;
+    let mut out = String::new();
+    let mut last = 0usize;
+    let mut cursor = 0usize;
+    while cursor <= chars.len() {
+        let Some(found) = regex.find_from(&chars, cursor) else {
+            break;
+        };
+        out.extend(chars[last..found.start].iter());
+        expand_replacement(&mut out, replacement, &found);
+        last = found.end;
+        if !global {
+            break;
+        }
+        cursor = if found.end == found.start {
+            found.end + 1
+        } else {
+            found.end
+        };
+    }
+    out.extend(chars[last..].iter());
+    out
+}
+
+fn expand_replacement(out: &mut String, replacement: &str, found: &RegexMatch) {
+    let chars: Vec<char> = replacement.chars().collect();
+    let mut index = 0;
+    while index < chars.len() {
+        let ch = chars[index];
+        if ch != '$' {
+            out.push(ch);
+            index += 1;
+            continue;
+        }
+        let Some(next) = chars.get(index + 1).copied() else {
+            out.push('$');
+            break;
+        };
+        match next {
+            '$' => {
+                out.push('$');
+                index += 2;
+            }
+            '&' => {
+                out.push_str(
+                    found
+                        .groups
+                        .first()
+                        .and_then(|group| group.as_deref())
+                        .unwrap_or(""),
+                );
+                index += 2;
+            }
+            '`' => {
+                out.push_str("");
+                index += 2;
+            }
+            digit if digit.is_ascii_digit() => {
+                let group = digit.to_digit(10).unwrap_or(0) as usize;
+                if let Some(value) = found.groups.get(group).and_then(|group| group.as_deref()) {
+                    out.push_str(value);
+                    index += 2;
+                } else {
+                    out.push('$');
+                    index += 1;
+                }
+            }
+            _ => {
+                out.push('$');
+                index += 1;
+            }
+        }
+    }
+}
+
+fn string_match(runtime: &mut Runtime, this: Value, args: Vec<Value>) -> Result<Value, JsError> {
+    let text = this_string(runtime, &this)?;
+    if let Some(regex) = args.first().and_then(|pattern| runtime.regex_of(pattern)) {
+        let chars: Vec<char> = text.chars().collect();
+        if regex.flags().global {
+            let mut matches = Vec::new();
+            let mut cursor = 0usize;
+            while cursor <= chars.len() {
+                let Some(found) = regex.find_from(&chars, cursor) else {
+                    break;
+                };
+                matches.push(Value::String(
+                    found.groups.first().cloned().flatten().unwrap_or_default(),
+                ));
+                cursor = if found.end == found.start {
+                    found.end + 1
+                } else {
+                    found.end
+                };
+            }
+            if matches.is_empty() {
+                return Ok(Value::Null);
+            }
+            return Ok(runtime.new_array(matches));
+        }
+        return Ok(match regex.find_from(&chars, 0) {
+            Some(found) => match_value(runtime, &text, &found),
+            None => Value::Null,
+        });
+    }
+    let needle = runtime.to_string_rt(&args.first().cloned().unwrap_or(Value::Undefined))?;
+    Ok(match text.find(&needle) {
+        Some(index) => {
+            let array = runtime.new_array(vec![Value::String(needle)]);
+            runtime.set_property(array.clone(), "index", Value::Number(index as f64));
+            runtime.set_property(array.clone(), "input", Value::String(text));
+            array
+        }
+        None => Value::Null,
+    })
+}
+
+fn match_value(runtime: &mut Runtime, text: &str, found: &RegexMatch) -> Value {
+    let items: Vec<Value> = found
+        .groups
+        .iter()
+        .map(|group| match group {
+            Some(value) => Value::String(value.clone()),
+            None => Value::Undefined,
+        })
+        .collect();
+    let array = runtime.new_array(items);
+    runtime.set_property(array.clone(), "index", Value::Number(found.start as f64));
+    runtime.set_property(array.clone(), "input", Value::String(text.to_owned()));
+    array
+}
+
+fn global_regexp(runtime: &mut Runtime, _this: Value, args: Vec<Value>) -> Result<Value, JsError> {
+    let pattern = args.first().cloned().unwrap_or(Value::Undefined);
+    if let Some(regex) = runtime.regex_of(&pattern) {
+        if args
+            .get(1)
+            .is_none_or(|flags| matches!(flags, Value::Undefined))
+            && matches!(pattern, Value::Object(_))
+        {
+            return Ok(pattern);
+        }
+        let flags = match args.get(1) {
+            Some(Value::Undefined) | None => regex.flags().as_string(),
+            Some(value) => runtime.to_string_rt(value)?,
+        };
+        return runtime.new_regexp_value(regex.source(), &flags);
+    }
+    let source = match &pattern {
+        Value::Undefined => String::new(),
+        value => runtime.to_string_rt(value)?,
+    };
+    let flags = match args.get(1) {
+        Some(Value::Undefined) | None => String::new(),
+        Some(value) => runtime.to_string_rt(value)?,
+    };
+    runtime.new_regexp_value(&source, &flags)
+}
+
+fn require_regexp(runtime: &mut Runtime, this: &Value) -> Result<Rc<Regex>, JsError> {
+    runtime
+        .regex_of(this)
+        .ok_or_else(|| JsError::type_error("RegExp method called on an incompatible receiver"))
+}
+
+fn regexp_test(runtime: &mut Runtime, this: Value, args: Vec<Value>) -> Result<Value, JsError> {
+    let regex = require_regexp(runtime, &this)?;
+    let text = runtime.to_string_rt(&args.first().cloned().unwrap_or(Value::Undefined))?;
+    let chars: Vec<char> = text.chars().collect();
+    let global = regex.flags().global;
+    let start = last_index(runtime, &this, global);
+    match regex.find_from(&chars, start) {
+        Some(found) => {
+            if global {
+                advance_last_index(runtime, &this, &found);
+            }
+            Ok(Value::Bool(true))
+        }
+        None => {
+            if global {
+                runtime.set_property(this, "lastIndex", Value::Number(0.0));
+            }
+            Ok(Value::Bool(false))
+        }
+    }
+}
+
+fn regexp_exec(runtime: &mut Runtime, this: Value, args: Vec<Value>) -> Result<Value, JsError> {
+    let regex = require_regexp(runtime, &this)?;
+    let text = runtime.to_string_rt(&args.first().cloned().unwrap_or(Value::Undefined))?;
+    let chars: Vec<char> = text.chars().collect();
+    let global = regex.flags().global;
+    let start = last_index(runtime, &this, global);
+    match regex.find_from(&chars, start) {
+        Some(found) => {
+            if global {
+                advance_last_index(runtime, &this, &found);
+            }
+            Ok(match_value(runtime, &text, &found))
+        }
+        None => {
+            if global {
+                runtime.set_property(this, "lastIndex", Value::Number(0.0));
+            }
+            Ok(Value::Null)
+        }
+    }
+}
+
+fn last_index(runtime: &mut Runtime, this: &Value, global: bool) -> usize {
+    if !global {
+        return 0;
+    }
+    let value = runtime.get_property(this, "lastIndex").to_number();
+    if !value.is_finite() || value <= 0.0 {
+        0
+    } else {
+        value as usize
+    }
+}
+
+fn advance_last_index(runtime: &mut Runtime, this: &Value, found: &RegexMatch) {
+    let next = if found.end == found.start {
+        found.end + 1
+    } else {
+        found.end
+    };
+    runtime.set_property(this.clone(), "lastIndex", Value::Number(next as f64));
+}
+
+fn regexp_to_string(
+    runtime: &mut Runtime,
+    this: Value,
+    _args: Vec<Value>,
+) -> Result<Value, JsError> {
+    let regex = require_regexp(runtime, &this)?;
+    Ok(Value::String(format!(
+        "/{}/{}",
+        regex.source(),
+        regex.flags().as_string()
+    )))
 }
 
 fn string_includes(runtime: &mut Runtime, this: Value, args: Vec<Value>) -> Result<Value, JsError> {

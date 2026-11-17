@@ -29,11 +29,80 @@ pub enum DeclKind {
     Const,
 }
 
+/// A binding or destructuring pattern.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Pattern {
+    /// A single identifier binding.
+    Identifier(String),
+    /// An array pattern. `None` elements are elisions (holes).
+    Array(Vec<Option<Pattern>>),
+    /// An object pattern.
+    Object {
+        /// Named properties in source order.
+        properties: Vec<ObjectPatternProperty>,
+        /// Optional `...rest` binding.
+        rest: Option<Box<Pattern>>,
+    },
+    /// A `...target` rest element or parameter.
+    Rest(Box<Pattern>),
+    /// A pattern with a default value, applied when the bound value is `undefined`.
+    Default {
+        /// Pattern receiving the value.
+        target: Box<Pattern>,
+        /// Expression evaluated when the value is missing.
+        default: Box<Expr>,
+    },
+    /// A member expression target, used by destructuring assignments.
+    Member(Box<Expr>),
+}
+
+impl Pattern {
+    /// Collect every identifier bound by the pattern, in source order.
+    pub fn bound_names(&self, out: &mut Vec<String>) {
+        match self {
+            Self::Identifier(name) => out.push(name.clone()),
+            Self::Array(elements) => {
+                for element in elements.iter().flatten() {
+                    element.bound_names(out);
+                }
+            }
+            Self::Object { properties, rest } => {
+                for property in properties {
+                    property.value.bound_names(out);
+                }
+                if let Some(rest) = rest {
+                    rest.bound_names(out);
+                }
+            }
+            Self::Rest(target) | Self::Default { target, .. } => target.bound_names(out),
+            Self::Member(_) => {}
+        }
+    }
+
+    /// Whether the pattern contains a default value or a rest element, which
+    /// means it cannot be used as a plain `for...in`/`for...of` target.
+    pub fn is_simple_identifier(&self) -> Option<&str> {
+        match self {
+            Self::Identifier(name) => Some(name),
+            _ => None,
+        }
+    }
+}
+
+/// A single property of an object binding pattern.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ObjectPatternProperty {
+    /// Property key to read from the source object.
+    pub key: PropertyKey,
+    /// Pattern receiving the property value.
+    pub value: Pattern,
+}
+
 /// A single declarator inside a variable declaration.
 #[derive(Clone, Debug, PartialEq)]
 pub struct VarDeclarator {
-    /// Bound name. Destructuring is not supported.
-    pub name: String,
+    /// Bound pattern.
+    pub pattern: Pattern,
     /// Optional initializer.
     pub init: Option<Expr>,
 }
@@ -54,8 +123,12 @@ pub struct VarDecl {
 pub struct Function {
     /// Name of the function, when one was written.
     pub name: Option<String>,
-    /// Parameter names.
+    /// Simple identifier parameter names, in source order. Patterns that are not
+    /// plain identifiers are omitted; use [`Function::patterns`] for the full
+    /// parameter list.
     pub params: Vec<String>,
+    /// Full parameter patterns, including destructuring, defaults and rest.
+    pub patterns: Vec<Pattern>,
     /// Function body statements.
     pub body: Vec<Stmt>,
     /// Whether the function is an arrow function.
@@ -176,6 +249,12 @@ pub enum BinaryOp {
     BitOr,
     /// `^`
     BitXor,
+    /// `<<`
+    Shl,
+    /// `>>`
+    Shr,
+    /// `>>>`
+    UShr,
 }
 
 /// Short-circuiting logical operators.
@@ -206,6 +285,12 @@ pub enum AssignOp {
     Mod,
     /// `**=`
     Exp,
+    /// `<<=`
+    Shl,
+    /// `>>=`
+    Shr,
+    /// `>>>=`
+    UShr,
 }
 
 /// A JavaScript expression.
@@ -227,10 +312,24 @@ pub enum Expr {
     Array(Vec<Option<Expr>>),
     /// Object literal.
     Object(Vec<Property>),
+    /// Regular expression literal.
+    Regex {
+        /// Pattern text, without the surrounding slashes.
+        pattern: String,
+        /// Flag characters, in source order.
+        flags: String,
+    },
     /// Function expression or declaration body.
     Function(Function),
     /// Arrow function.
     Arrow(Function),
+    /// Destructuring assignment such as `[a, b] = [b, a]`.
+    AssignPattern {
+        /// Target pattern.
+        pattern: Pattern,
+        /// Assigned value.
+        value: Box<Expr>,
+    },
     /// Unary expression.
     Unary {
         /// Operator.

@@ -53,6 +53,12 @@ pub enum Punct {
     AmpEq,
     PipeEq,
     CaretEq,
+    LtLt,
+    GtGt,
+    GtGtGt,
+    LtLtEq,
+    GtGtEq,
+    GtGtGtEq,
     PlusPlus,
     MinusMinus,
 }
@@ -106,6 +112,12 @@ impl Punct {
             Self::AmpEq => "&=",
             Self::PipeEq => "|=",
             Self::CaretEq => "^=",
+            Self::LtLt => "<<",
+            Self::GtGt => ">>",
+            Self::GtGtGt => ">>>",
+            Self::LtLtEq => "<<=",
+            Self::GtGtEq => ">>=",
+            Self::GtGtGtEq => ">>>=",
             Self::PlusPlus => "++",
             Self::MinusMinus => "--",
         }
@@ -128,6 +140,13 @@ pub enum TokenKind {
     },
     /// Identifier or contextual keyword.
     Identifier(String),
+    /// Regular expression literal.
+    Regex {
+        /// Pattern text without the surrounding slashes.
+        pattern: String,
+        /// Flag characters.
+        flags: String,
+    },
     /// Reserved word.
     Keyword(Keyword),
     /// Punctuator or operator.
@@ -144,6 +163,7 @@ impl TokenKind {
             Self::String(s) => format!("string `{s}`"),
             Self::TemplatePart { .. } => "template literal".to_owned(),
             Self::Identifier(name) => format!("identifier `{name}`"),
+            Self::Regex { pattern, .. } => format!("regular expression `/{pattern}/`"),
             Self::Keyword(kw) => format!("keyword `{kw}`"),
             Self::Punct(p) => format!("`{}`", p.as_str()),
             Self::Eof => "end of input".to_owned(),
@@ -178,6 +198,14 @@ pub struct Lexer<'a> {
     newline_before: bool,
     /// Brace depth per open template interpolation.
     template_stack: Vec<usize>,
+    /// Whether a `/` at the current position would start a regular expression.
+    regex_allowed: bool,
+    /// For every open parenthesis, whether it follows a control keyword. The
+    /// closing `)` of such a parenthesis ends a statement header, after which an
+    /// expression (and so a regular expression) may start.
+    paren_stack: Vec<bool>,
+    /// The most recently produced token kind, used for regex disambiguation.
+    last_kind: Option<TokenKind>,
     source_len: usize,
     _source: &'a str,
 }
@@ -194,6 +222,9 @@ impl<'a> Lexer<'a> {
             column: 1,
             newline_before: false,
             template_stack: Vec::new(),
+            regex_allowed: true,
+            paren_stack: Vec::new(),
+            last_kind: None,
             source_len,
             _source: source,
         }
@@ -307,11 +338,37 @@ impl<'a> Lexer<'a> {
             });
         }
         let kind = self.scan_token()?;
+        self.update_regex_context(&kind);
+        self.last_kind = Some(kind.clone());
         Ok(Token {
             kind,
             position,
             newline_before,
         })
+    }
+
+    /// Decide whether the token just scanned ends an operand. After an operand a
+    /// `/` is division; anywhere else it starts a regular expression literal.
+    fn update_regex_context(&mut self, kind: &TokenKind) {
+        self.regex_allowed = match kind {
+            TokenKind::Number(_) | TokenKind::String(_) | TokenKind::Regex { .. } => false,
+            TokenKind::Identifier(_) => false,
+            TokenKind::Keyword(keyword) => !matches!(
+                keyword,
+                Keyword::This | Keyword::True | Keyword::False | Keyword::Null
+            ),
+            TokenKind::TemplatePart { tail, .. } => !tail,
+            TokenKind::Punct(punct) => match punct {
+                Punct::RParen => self.paren_stack.pop().unwrap_or(false),
+                Punct::RBracket => false,
+                // A closing brace usually ends a block, after which an
+                // expression may start.
+                Punct::RBrace => true,
+                Punct::PlusPlus | Punct::MinusMinus => false,
+                _ => true,
+            },
+            TokenKind::Eof => false,
+        };
     }
 
     fn scan_token(&mut self) -> Result<TokenKind, ParseError> {
@@ -330,7 +387,80 @@ impl<'a> Lexer<'a> {
         if is_ident_start(ch) {
             return Ok(self.scan_identifier());
         }
+        if ch == '/' && self.regex_allowed {
+            return self.scan_regex();
+        }
         self.scan_punct()
+    }
+
+    fn scan_regex(&mut self) -> Result<TokenKind, ParseError> {
+        let start_line = self.line;
+        let start_column = self.column;
+        self.bump();
+        let mut pattern = String::new();
+        let mut in_class = false;
+        loop {
+            let ch = match self.bump() {
+                Some(ch) => ch,
+                None => {
+                    return Err(ParseError::new(
+                        "unterminated regular expression literal",
+                        start_line,
+                        start_column,
+                    ));
+                }
+            };
+            if ch == '\n' || ch == '\r' {
+                return Err(ParseError::new(
+                    "unterminated regular expression literal",
+                    start_line,
+                    start_column,
+                ));
+            }
+            if ch == '\\' {
+                let escaped = self.bump().ok_or_else(|| {
+                    ParseError::new(
+                        "unterminated regular expression literal",
+                        start_line,
+                        start_column,
+                    )
+                })?;
+                if escaped == '\n' || escaped == '\r' {
+                    return Err(ParseError::new(
+                        "unterminated regular expression literal",
+                        start_line,
+                        start_column,
+                    ));
+                }
+                pattern.push('\\');
+                pattern.push(escaped);
+                continue;
+            }
+            if ch == '[' {
+                in_class = true;
+                pattern.push(ch);
+                continue;
+            }
+            if ch == ']' {
+                in_class = false;
+                pattern.push(ch);
+                continue;
+            }
+            if ch == '/' && !in_class {
+                break;
+            }
+            pattern.push(ch);
+        }
+        let mut flags = String::new();
+        while let Some(ch) = self.peek_char() {
+            if ch.is_alphabetic() {
+                flags.push(ch);
+                self.bump();
+            } else {
+                break;
+            }
+        }
+        Ok(TokenKind::Regex { pattern, flags })
     }
 
     fn scan_identifier(&mut self) -> TokenKind {
@@ -585,7 +715,16 @@ impl<'a> Lexer<'a> {
         let next = self.peek_char();
         let next2 = self.peek_at(1);
         let (punct, len) = match ch {
-            '(' => (Punct::LParen, 0),
+            '(' => {
+                let control = matches!(
+                    self.last_kind,
+                    Some(TokenKind::Keyword(
+                        Keyword::If | Keyword::While | Keyword::For
+                    ))
+                );
+                self.paren_stack.push(control);
+                (Punct::LParen, 0)
+            }
             ')' => (Punct::RParen, 0),
             '{' => {
                 if let Some(depth) = self.template_stack.last_mut() {
@@ -675,10 +814,28 @@ impl<'a> Lexer<'a> {
                 _ => (Punct::Caret, 0),
             },
             '<' => match next {
+                Some('<') => {
+                    if next2 == Some('=') {
+                        (Punct::LtLtEq, 2)
+                    } else {
+                        (Punct::LtLt, 1)
+                    }
+                }
                 Some('=') => (Punct::LtEq, 1),
                 _ => (Punct::Lt, 0),
             },
             '>' => match next {
+                Some('>') => match next2 {
+                    Some('>') => {
+                        if self.peek_at(2) == Some('=') {
+                            (Punct::GtGtGtEq, 3)
+                        } else {
+                            (Punct::GtGtGt, 2)
+                        }
+                    }
+                    Some('=') => (Punct::GtGtEq, 2),
+                    _ => (Punct::GtGt, 1),
+                },
                 Some('=') => (Punct::GtEq, 1),
                 _ => (Punct::Gt, 0),
             },

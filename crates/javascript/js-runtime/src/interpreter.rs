@@ -4,7 +4,7 @@ use std::rc::Rc;
 
 use browser_js_parser::{
     AssignOp, BinaryOp, CatchClause, DeclKind, Expr, ForInit, ForTarget, Function, LogicalOp,
-    Program, Stmt, SwitchCase, UnaryOp, UpdateOp, VarDecl,
+    Pattern, Program, Stmt, SwitchCase, UnaryOp, UpdateOp, VarDecl,
 };
 
 use crate::errors::JsError;
@@ -26,6 +26,24 @@ pub(crate) fn to_int32(value: f64) -> i32 {
     } else {
         modulo as i32
     }
+}
+
+/// The `.length` of a function: the number of parameters before the first
+/// default value or rest parameter.
+fn function_length(patterns: &[Pattern]) -> usize {
+    let mut length = 0;
+    for pattern in patterns {
+        if matches!(pattern, Pattern::Default { .. } | Pattern::Rest(_)) {
+            break;
+        }
+        length += 1;
+    }
+    length
+}
+
+/// Convert a number to an unsigned 32 bit integer the way JavaScript does.
+pub(crate) fn to_uint32(value: f64) -> u32 {
+    to_int32(value) as u32
 }
 
 impl crate::Runtime {
@@ -132,23 +150,242 @@ impl crate::Runtime {
 
     fn exec_var_decl(&mut self, declaration: &VarDecl) -> Result<(), JsError> {
         for declarator in &declaration.declarations {
-            if declaration.kind == DeclKind::Var {
-                if let Some(init) = &declarator.init {
-                    let value = self.eval_expr(init)?;
-                    if !self.assign_binding(&declarator.name, value.clone())? {
-                        self.declare_var(&declarator.name, value);
+            match (&declarator.pattern, &declarator.init) {
+                (Pattern::Identifier(name), None) => {
+                    if declaration.kind == DeclKind::Var {
+                        if self.resolve_scope(name).is_none() {
+                            self.declare_var(name, Value::Undefined);
+                        }
+                    } else {
+                        let scope = self.current_scope();
+                        self.initialize_binding(scope, name, Value::Undefined)?;
                     }
-                } else if self.resolve_scope(&declarator.name).is_none() {
-                    self.declare_var(&declarator.name, Value::Undefined);
                 }
-            } else {
-                let value = match &declarator.init {
-                    Some(init) => self.eval_expr(init)?,
-                    None => Value::Undefined,
-                };
-                let scope = self.current_scope();
-                self.initialize_binding(scope, &declarator.name, value)?;
+                (pattern, Some(init)) => {
+                    let value = self.eval_expr(init)?;
+                    match declaration.kind {
+                        DeclKind::Var => self.bind_decl_pattern(pattern, value, DeclKind::Var)?,
+                        DeclKind::Let => self.bind_decl_pattern(pattern, value, DeclKind::Let)?,
+                        DeclKind::Const => {
+                            self.bind_decl_pattern(pattern, value, DeclKind::Const)?
+                        }
+                    }
+                }
+                (_, None) => {
+                    return Err(JsError::syntax_error(
+                        "destructuring declaration requires an initializer",
+                    ));
+                }
             }
+        }
+        Ok(())
+    }
+
+    /// Bind a declaration pattern to `value`.
+    fn bind_decl_pattern(
+        &mut self,
+        pattern: &Pattern,
+        value: Value,
+        kind: DeclKind,
+    ) -> Result<(), JsError> {
+        match pattern {
+            Pattern::Identifier(name) => {
+                if kind == DeclKind::Var {
+                    if !self.assign_binding(name, value.clone())? {
+                        self.declare_var(name, value);
+                    }
+                    Ok(())
+                } else {
+                    let scope = self.current_scope();
+                    self.initialize_binding(scope, name, value)
+                }
+            }
+            Pattern::Default { target, default } => {
+                let value = if matches!(value, Value::Undefined) {
+                    self.eval_expr(default)?
+                } else {
+                    value
+                };
+                self.bind_decl_pattern(target, value, kind)
+            }
+            Pattern::Array(elements) => {
+                let items = self.destructure_iterable(&value)?;
+                self.bind_array_pattern(elements, &items, |runtime, pattern, item| {
+                    runtime.bind_decl_pattern(pattern, item, kind)
+                })
+            }
+            Pattern::Object { properties, rest } => self.bind_object_pattern(
+                properties,
+                rest.as_deref(),
+                &value,
+                |runtime, pattern, item| runtime.bind_decl_pattern(pattern, item, kind),
+            ),
+            Pattern::Rest(_) => Err(JsError::syntax_error("unexpected rest element")),
+            Pattern::Member(_) => Err(JsError::syntax_error(
+                "member expressions cannot be declaration targets",
+            )),
+        }
+    }
+
+    /// Bind a parameter pattern in its call scope.
+    pub(crate) fn bind_param_pattern(
+        &mut self,
+        pattern: &Pattern,
+        value: Value,
+    ) -> Result<(), JsError> {
+        match pattern {
+            Pattern::Identifier(name) => {
+                let scope = self.current_scope();
+                self.declare_binding(scope, name, BindingKind::Param, value, true);
+                Ok(())
+            }
+            Pattern::Default { target, default } => {
+                let value = if matches!(value, Value::Undefined) {
+                    self.eval_expr(default)?
+                } else {
+                    value
+                };
+                self.bind_param_pattern(target, value)
+            }
+            Pattern::Array(elements) => {
+                let items = self.destructure_iterable(&value)?;
+                self.bind_array_pattern(elements, &items, |runtime, pattern, item| {
+                    runtime.bind_param_pattern(pattern, item)
+                })
+            }
+            Pattern::Object { properties, rest } => self.bind_object_pattern(
+                properties,
+                rest.as_deref(),
+                &value,
+                |runtime, pattern, item| runtime.bind_param_pattern(pattern, item),
+            ),
+            Pattern::Rest(_) => Err(JsError::syntax_error("unexpected rest element")),
+            Pattern::Member(_) => Err(JsError::syntax_error(
+                "member expressions cannot be parameter targets",
+            )),
+        }
+    }
+
+    /// Assign a destructuring pattern in an expression context.
+    pub(crate) fn assign_pattern(
+        &mut self,
+        pattern: &Pattern,
+        value: Value,
+    ) -> Result<(), JsError> {
+        match pattern {
+            Pattern::Identifier(name) => {
+                if !self.assign_binding(name, value.clone())? {
+                    let global_scope = self.global_scope;
+                    self.declare_binding(global_scope, name, BindingKind::Var, value, true);
+                }
+                Ok(())
+            }
+            Pattern::Member(expr) => self.assign_target(expr, value),
+            Pattern::Default { target, default } => {
+                let value = if matches!(value, Value::Undefined) {
+                    self.eval_expr(default)?
+                } else {
+                    value
+                };
+                self.assign_pattern(target, value)
+            }
+            Pattern::Array(elements) => {
+                let items = self.destructure_iterable(&value)?;
+                self.bind_array_pattern(elements, &items, |runtime, pattern, item| {
+                    runtime.assign_pattern(pattern, item)
+                })
+            }
+            Pattern::Object { properties, rest } => self.bind_object_pattern(
+                properties,
+                rest.as_deref(),
+                &value,
+                |runtime, pattern, item| runtime.assign_pattern(pattern, item),
+            ),
+            Pattern::Rest(_) => Err(JsError::syntax_error("unexpected rest element")),
+        }
+    }
+
+    /// Convert a value to the element sequence an array pattern consumes.
+    fn destructure_iterable(&mut self, value: &Value) -> Result<Vec<Value>, JsError> {
+        if let Some(items) = self.object_array_items(value) {
+            return Ok(items);
+        }
+        match value {
+            Value::String(text) => Ok(text
+                .chars()
+                .map(|ch| Value::String(ch.to_string()))
+                .collect()),
+            Value::Undefined | Value::Null => {
+                Err(JsError::type_error("cannot destructure undefined or null"))
+            }
+            _ => Err(JsError::type_error("value is not iterable")),
+        }
+    }
+
+    fn bind_array_pattern(
+        &mut self,
+        elements: &[Option<Pattern>],
+        items: &[Value],
+        bind: impl Fn(&mut Self, &Pattern, Value) -> Result<(), JsError>,
+    ) -> Result<(), JsError> {
+        for (index, element) in elements.iter().enumerate() {
+            let Some(pattern) = element else {
+                continue;
+            };
+            if let Pattern::Rest(target) = pattern {
+                let rest = items
+                    .get(index..)
+                    .map(<[Value]>::to_vec)
+                    .unwrap_or_default();
+                let array = self.new_array(rest);
+                bind(self, target, array)?;
+                break;
+            }
+            let value = items.get(index).cloned().unwrap_or(Value::Undefined);
+            bind(self, pattern, value)?;
+        }
+        Ok(())
+    }
+
+    fn bind_object_pattern(
+        &mut self,
+        properties: &[browser_js_parser::ObjectPatternProperty],
+        rest: Option<&Pattern>,
+        value: &Value,
+        bind: impl Fn(&mut Self, &Pattern, Value) -> Result<(), JsError>,
+    ) -> Result<(), JsError> {
+        match value {
+            Value::Undefined | Value::Null => {
+                return Err(JsError::type_error("cannot destructure undefined or null"));
+            }
+            _ => {}
+        }
+        let mut consumed = Vec::with_capacity(properties.len());
+        for property in properties {
+            let key = property.key.as_key_string();
+            consumed.push(key.clone());
+            let item = self.get_property_checked(value, &key)?;
+            bind(self, &property.value, item)?;
+        }
+        if let Some(rest) = rest {
+            let object = self.new_object();
+            let mark = self.temp_roots.len();
+            self.temp_roots.push(object.clone());
+            let outcome = (|| -> Result<(), JsError> {
+                if matches!(value, Value::Object(_)) {
+                    for key in self.object_keys(value) {
+                        if consumed.iter().any(|existing| existing == &key) {
+                            continue;
+                        }
+                        let item = self.get_property_checked(value, &key)?;
+                        self.set_property_checked(&object, &key, item)?;
+                    }
+                }
+                Ok(())
+            })();
+            self.temp_roots.truncate(mark);
+            outcome?;
+            bind(self, rest, object)?;
         }
         Ok(())
     }
@@ -174,7 +411,11 @@ impl crate::Runtime {
                     BindingKind::Let
                 };
                 for declarator in &declaration.declarations {
-                    self.declare_binding(scope, &declarator.name, kind, Value::Undefined, false);
+                    let mut names = Vec::new();
+                    declarator.pattern.bound_names(&mut names);
+                    for name in names {
+                        self.declare_binding(scope, &name, kind, Value::Undefined, false);
+                    }
                 }
             }
         }
@@ -220,12 +461,13 @@ impl crate::Runtime {
         let name = function.name.clone().unwrap_or_default();
         let user = UserFunction {
             name: name.clone(),
-            params: function.params.clone(),
+            patterns: function.patterns.clone(),
             body: function.body.clone(),
             env,
             is_arrow: function.is_arrow,
         };
-        let value = self.new_user_function_value(&name, function.params.len(), Rc::new(user));
+        let value =
+            self.new_user_function_value(&name, function_length(&function.patterns), Rc::new(user));
         if !function.is_arrow {
             let mark = self.temp_roots.len();
             self.temp_roots.push(value.clone());
@@ -298,7 +540,11 @@ impl crate::Runtime {
                 BindingKind::Let
             };
             for declarator in &declaration.declarations {
-                self.declare_binding(scope, &declarator.name, kind, Value::Undefined, false);
+                let mut names = Vec::new();
+                declarator.pattern.bound_names(&mut names);
+                for name in names {
+                    self.declare_binding(scope, &name, kind, Value::Undefined, false);
+                }
             }
             self.env_stack.push(scope);
             loop_scope = Some(scope);
@@ -504,6 +750,12 @@ impl crate::Runtime {
             Expr::Identifier(name) => self.read_binding(name),
             Expr::Array(items) => self.eval_array(items),
             Expr::Object(properties) => self.eval_object(properties),
+            Expr::Regex { pattern, flags } => self.new_regexp_value(pattern, flags),
+            Expr::AssignPattern { pattern, value } => {
+                let assigned = self.eval_expr(value)?;
+                self.assign_pattern(pattern, assigned.clone())?;
+                Ok(assigned)
+            }
             Expr::Function(function) | Expr::Arrow(function) => {
                 let env = self.current_scope();
                 Ok(self.create_function_from_ast(function, env))
@@ -915,6 +1167,9 @@ impl crate::Runtime {
             AssignOp::Div => BinaryOp::Div,
             AssignOp::Mod => BinaryOp::Mod,
             AssignOp::Exp => BinaryOp::Exp,
+            AssignOp::Shl => BinaryOp::Shl,
+            AssignOp::Shr => BinaryOp::Shr,
+            AssignOp::UShr => BinaryOp::UShr,
         };
         self.apply_binary(binary, &old_value, value)
     }
@@ -1145,6 +1400,21 @@ impl crate::Runtime {
                 let a = to_int32(self.to_number_rt(left)?);
                 let b = to_int32(self.to_number_rt(right)?);
                 Ok(Value::Number(f64::from(a ^ b)))
+            }
+            BinaryOp::Shl => {
+                let a = to_int32(self.to_number_rt(left)?);
+                let shift = to_uint32(self.to_number_rt(right)?) & 31;
+                Ok(Value::Number(f64::from(a.wrapping_shl(shift))))
+            }
+            BinaryOp::Shr => {
+                let a = to_int32(self.to_number_rt(left)?);
+                let shift = to_uint32(self.to_number_rt(right)?) & 31;
+                Ok(Value::Number(f64::from(a.wrapping_shr(shift))))
+            }
+            BinaryOp::UShr => {
+                let a = to_uint32(self.to_number_rt(left)?);
+                let shift = to_uint32(self.to_number_rt(right)?) & 31;
+                Ok(Value::Number(f64::from(a.wrapping_shr(shift))))
             }
             BinaryOp::In => {
                 if !matches!(right, Value::Object(_)) {

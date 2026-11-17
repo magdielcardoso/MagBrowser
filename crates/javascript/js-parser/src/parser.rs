@@ -4,10 +4,11 @@ use std::fmt;
 
 use crate::ast::{
     AssignOp, BinaryOp, CatchClause, DeclKind, Expr, ForInit, ForTarget, Function, LogicalOp,
-    Position, Program, Property, PropertyKey, Stmt, SwitchCase, UnaryOp, UpdateOp, VarDecl,
-    VarDeclarator,
+    ObjectPatternProperty, Pattern, Position, Program, Property, PropertyKey, Stmt, SwitchCase,
+    UnaryOp, UpdateOp, VarDecl, VarDeclarator,
 };
 use crate::lexer::{Punct, Token, TokenKind, tokenize};
+use crate::regexp::Regex;
 use crate::syntax::Keyword;
 
 /// A syntax error with a source position.
@@ -272,13 +273,13 @@ impl Parser {
         self.advance();
         let mut declarations = Vec::new();
         loop {
-            let name = self.binding_identifier()?;
+            let pattern = self.parse_binding_pattern(false)?;
             let init = if self.eat_punct(Punct::Eq) {
                 Some(self.parse_assignment()?)
             } else {
                 None
             };
-            declarations.push(VarDeclarator { name, init });
+            declarations.push(VarDeclarator { pattern, init });
             if !self.eat_punct(Punct::Comma) {
                 break;
             }
@@ -288,6 +289,119 @@ impl Parser {
             declarations,
             pos: position,
         })
+    }
+
+    /// Parse a binding pattern. `allow_default` permits a trailing `= expr`
+    /// inside parameter and array/object element positions.
+    fn parse_binding_pattern(&mut self, allow_default: bool) -> Result<Pattern, ParseError> {
+        let base = self.parse_binding_pattern_base()?;
+        if allow_default && self.eat_punct(Punct::Eq) {
+            let default = self.parse_assignment()?;
+            return Ok(Pattern::Default {
+                target: Box::new(base),
+                default: Box::new(default),
+            });
+        }
+        Ok(base)
+    }
+
+    fn parse_binding_pattern_base(&mut self) -> Result<Pattern, ParseError> {
+        match self.kind().clone() {
+            TokenKind::Identifier(name) => {
+                self.advance();
+                Ok(Pattern::Identifier(name))
+            }
+            TokenKind::Punct(Punct::LBracket) => {
+                self.advance();
+                let mut elements: Vec<Option<Pattern>> = Vec::new();
+                loop {
+                    if self.eat_punct(Punct::RBracket) {
+                        break;
+                    }
+                    if self.eat_punct(Punct::Comma) {
+                        elements.push(None);
+                        continue;
+                    }
+                    if self.eat_punct(Punct::Ellipsis) {
+                        let target = self.parse_binding_pattern(false)?;
+                        elements.push(Some(Pattern::Rest(Box::new(target))));
+                        self.expect_punct(Punct::RBracket)?;
+                        break;
+                    }
+                    let element = self.parse_binding_pattern(true)?;
+                    elements.push(Some(element));
+                    if self.eat_punct(Punct::Comma) {
+                        continue;
+                    }
+                    self.expect_punct(Punct::RBracket)?;
+                    break;
+                }
+                Ok(Pattern::Array(elements))
+            }
+            TokenKind::Punct(Punct::LBrace) => {
+                self.advance();
+                let mut properties = Vec::new();
+                let mut rest = None;
+                loop {
+                    if self.eat_punct(Punct::RBrace) {
+                        break;
+                    }
+                    if self.eat_punct(Punct::Ellipsis) {
+                        let target = self.parse_binding_pattern(false)?;
+                        rest = Some(Box::new(target));
+                        self.expect_punct(Punct::RBrace)?;
+                        break;
+                    }
+                    let key = self.parse_property_key()?;
+                    let value = if self.eat_punct(Punct::Colon) {
+                        self.parse_binding_pattern(true)?
+                    } else {
+                        let PropertyKey::Ident(name) = &key else {
+                            return self.error("shorthand object patterns need an identifier key");
+                        };
+                        let base = Pattern::Identifier(name.clone());
+                        if self.eat_punct(Punct::Eq) {
+                            Pattern::Default {
+                                target: Box::new(base),
+                                default: Box::new(self.parse_assignment()?),
+                            }
+                        } else {
+                            base
+                        }
+                    };
+                    properties.push(ObjectPatternProperty { key, value });
+                    if self.eat_punct(Punct::Comma) {
+                        continue;
+                    }
+                    self.expect_punct(Punct::RBrace)?;
+                    break;
+                }
+                Ok(Pattern::Object { properties, rest })
+            }
+            _ => self.unexpected("a binding pattern"),
+        }
+    }
+
+    fn parse_property_key(&mut self) -> Result<PropertyKey, ParseError> {
+        match self.kind().clone() {
+            TokenKind::Identifier(name) => {
+                self.advance();
+                Ok(PropertyKey::Ident(name))
+            }
+            TokenKind::Keyword(keyword) => {
+                self.advance();
+                Ok(PropertyKey::Ident(keyword.as_str().to_owned()))
+            }
+            TokenKind::String(value) => {
+                self.advance();
+                Ok(PropertyKey::String(value))
+            }
+            TokenKind::Number(value) => {
+                self.advance();
+                Ok(PropertyKey::Number(value))
+            }
+            _ => self.unexpected("a property key"),
+        }
     }
 
     fn parse_if(&mut self) -> Result<Stmt, ParseError> {
@@ -387,9 +501,12 @@ impl Parser {
         if declarator.init.is_some() {
             return self.error("for-in/of declaration may not have an initializer");
         }
+        let Some(name) = declarator.pattern.is_simple_identifier() else {
+            return self.error("for-in/of destructuring targets are not supported");
+        };
         let left = ForTarget::Var {
             kind: decl.kind,
-            name: declarator.name.clone(),
+            name: name.to_owned(),
         };
         self.expect_punct(Punct::RParen)?;
         let body = Box::new(self.parse_statement()?);
@@ -571,6 +688,11 @@ impl Parser {
     }
 
     fn parse_assignment(&mut self) -> Result<Expr, ParseError> {
+        if self.is_punct(Punct::LBrace)
+            && let Some(expr) = self.try_parse_object_assignment_pattern()?
+        {
+            return Ok(expr);
+        }
         let target = self.parse_conditional()?;
         let op = match self.kind() {
             TokenKind::Punct(Punct::Eq) => Some(AssignOp::Assign),
@@ -580,18 +702,150 @@ impl Parser {
             TokenKind::Punct(Punct::SlashEq) => Some(AssignOp::Div),
             TokenKind::Punct(Punct::PercentEq) => Some(AssignOp::Mod),
             TokenKind::Punct(Punct::StarStarEq) => Some(AssignOp::Exp),
+            TokenKind::Punct(Punct::LtLtEq) => Some(AssignOp::Shl),
+            TokenKind::Punct(Punct::GtGtEq) => Some(AssignOp::Shr),
+            TokenKind::Punct(Punct::GtGtGtEq) => Some(AssignOp::UShr),
             _ => None,
         };
         let Some(op) = op else {
             return Ok(target);
         };
         self.advance();
+        if op == AssignOp::Assign
+            && matches!(target, Expr::Array(_) | Expr::Object(_))
+            && let Some(pattern) = pattern_from_expression(&target)
+        {
+            let value = self.parse_assignment()?;
+            return Ok(Expr::AssignPattern {
+                pattern,
+                value: Box::new(value),
+            });
+        }
         let value = self.parse_assignment()?;
         Ok(Expr::Assign {
             op,
             target: Box::new(target),
             value: Box::new(value),
         })
+    }
+
+    /// Try to parse `{ pattern } = value` as a destructuring assignment. The
+    /// object configuration is ambiguous with an object literal, so this backs
+    /// up and restores the cursor when no `=` follows the pattern.
+    fn try_parse_object_assignment_pattern(&mut self) -> Result<Option<Expr>, ParseError> {
+        let saved = self.pos;
+        let saved_no_in = self.no_in;
+        let attempt = (|| -> Result<Option<Expr>, ParseError> {
+            let pattern = self.parse_assignment_pattern_object()?;
+            if !self.eat_punct(Punct::Eq) {
+                return Ok(None);
+            }
+            let value = self.parse_assignment()?;
+            Ok(Some(Expr::AssignPattern {
+                pattern,
+                value: Box::new(value),
+            }))
+        })();
+        match attempt {
+            Ok(Some(expr)) => Ok(Some(expr)),
+            _ => {
+                self.pos = saved;
+                self.no_in = saved_no_in;
+                Ok(None)
+            }
+        }
+    }
+
+    /// Parse an object destructuring assignment target, allowing member
+    /// expressions on the right hand side of `:`.
+    fn parse_assignment_pattern_object(&mut self) -> Result<Pattern, ParseError> {
+        self.expect_punct(Punct::LBrace)?;
+        let mut properties = Vec::new();
+        let mut rest = None;
+        loop {
+            if self.eat_punct(Punct::RBrace) {
+                break;
+            }
+            if self.eat_punct(Punct::Ellipsis) {
+                rest = Some(Box::new(self.parse_assignment_pattern_target(false)?));
+                self.expect_punct(Punct::RBrace)?;
+                break;
+            }
+            let key = self.parse_property_key()?;
+            let value = if self.eat_punct(Punct::Colon) {
+                self.parse_assignment_pattern_target(true)?
+            } else {
+                let PropertyKey::Ident(name) = &key else {
+                    return self.error("shorthand object patterns need an identifier key");
+                };
+                let base = Pattern::Identifier(name.clone());
+                if self.eat_punct(Punct::Eq) {
+                    Pattern::Default {
+                        target: Box::new(base),
+                        default: Box::new(self.parse_assignment()?),
+                    }
+                } else {
+                    base
+                }
+            };
+            properties.push(ObjectPatternProperty { key, value });
+            if self.eat_punct(Punct::Comma) {
+                continue;
+            }
+            self.expect_punct(Punct::RBrace)?;
+            break;
+        }
+        Ok(Pattern::Object { properties, rest })
+    }
+
+    /// Parse a single assignment target: an identifier with member suffixes, or
+    /// a nested array/object pattern.
+    fn parse_assignment_pattern_target(
+        &mut self,
+        allow_default: bool,
+    ) -> Result<Pattern, ParseError> {
+        let base = match self.kind().clone() {
+            TokenKind::Punct(Punct::LBracket) => self.parse_binding_pattern_base()?,
+            TokenKind::Punct(Punct::LBrace) => self.parse_assignment_pattern_object()?,
+            TokenKind::Identifier(name) => {
+                self.advance();
+                let mut member_expr = Expr::Identifier(name.clone());
+                let mut member = false;
+                while matches!(self.kind(), TokenKind::Punct(Punct::Dot | Punct::LBracket)) {
+                    if self.eat_punct(Punct::Dot) {
+                        let property = self.identifier_name()?;
+                        member_expr = Expr::Member {
+                            object: Box::new(member_expr),
+                            property: Box::new(Expr::Identifier(property)),
+                            computed: false,
+                        };
+                    } else {
+                        self.expect_punct(Punct::LBracket)?;
+                        let property = self.parse_expression()?;
+                        self.expect_punct(Punct::RBracket)?;
+                        member_expr = Expr::Member {
+                            object: Box::new(member_expr),
+                            property: Box::new(property),
+                            computed: true,
+                        };
+                    }
+                    member = true;
+                }
+                if member {
+                    Pattern::Member(Box::new(member_expr))
+                } else {
+                    Pattern::Identifier(name)
+                }
+            }
+            _ => return self.unexpected("an assignment target"),
+        };
+        if allow_default && self.eat_punct(Punct::Eq) {
+            return Ok(Pattern::Default {
+                target: Box::new(base),
+                default: Box::new(self.parse_assignment()?),
+            });
+        }
+        Ok(base)
     }
 
     fn parse_conditional(&mut self) -> Result<Expr, ParseError> {
@@ -612,33 +866,36 @@ impl Parser {
     fn binary_operator(&self) -> Option<(u8, bool, BinaryKind)> {
         let kind = match self.kind() {
             TokenKind::Punct(punct) => match punct {
-                Punct::StarStar => (10, true, BinaryKind::Binary(BinaryOp::Exp)),
-                Punct::Star => (9, false, BinaryKind::Binary(BinaryOp::Mul)),
-                Punct::Slash => (9, false, BinaryKind::Binary(BinaryOp::Div)),
-                Punct::Percent => (9, false, BinaryKind::Binary(BinaryOp::Mod)),
-                Punct::Plus => (8, false, BinaryKind::Binary(BinaryOp::Add)),
-                Punct::Minus => (8, false, BinaryKind::Binary(BinaryOp::Sub)),
-                Punct::Lt => (7, false, BinaryKind::Binary(BinaryOp::Lt)),
-                Punct::LtEq => (7, false, BinaryKind::Binary(BinaryOp::Le)),
-                Punct::Gt => (7, false, BinaryKind::Binary(BinaryOp::Gt)),
-                Punct::GtEq => (7, false, BinaryKind::Binary(BinaryOp::Ge)),
-                Punct::EqEq => (6, false, BinaryKind::Binary(BinaryOp::Eq)),
-                Punct::BangEq => (6, false, BinaryKind::Binary(BinaryOp::Ne)),
-                Punct::EqEqEq => (6, false, BinaryKind::Binary(BinaryOp::StrictEq)),
-                Punct::BangEqEq => (6, false, BinaryKind::Binary(BinaryOp::StrictNe)),
-                Punct::Amp => (5, false, BinaryKind::Binary(BinaryOp::BitAnd)),
-                Punct::Caret => (4, false, BinaryKind::Binary(BinaryOp::BitXor)),
-                Punct::Pipe => (3, false, BinaryKind::Binary(BinaryOp::BitOr)),
-                Punct::AmpAmp => (2, false, BinaryKind::Logical(LogicalOp::And)),
-                Punct::PipePipe => (1, false, BinaryKind::Logical(LogicalOp::Or)),
-                Punct::QuestionQuestion => (1, false, BinaryKind::Logical(LogicalOp::Nullish)),
+                Punct::StarStar => (12, true, BinaryKind::Binary(BinaryOp::Exp)),
+                Punct::Star => (11, false, BinaryKind::Binary(BinaryOp::Mul)),
+                Punct::Slash => (11, false, BinaryKind::Binary(BinaryOp::Div)),
+                Punct::Percent => (11, false, BinaryKind::Binary(BinaryOp::Mod)),
+                Punct::Plus => (10, false, BinaryKind::Binary(BinaryOp::Add)),
+                Punct::Minus => (10, false, BinaryKind::Binary(BinaryOp::Sub)),
+                Punct::LtLt => (9, false, BinaryKind::Binary(BinaryOp::Shl)),
+                Punct::GtGt => (9, false, BinaryKind::Binary(BinaryOp::Shr)),
+                Punct::GtGtGt => (9, false, BinaryKind::Binary(BinaryOp::UShr)),
+                Punct::Lt => (8, false, BinaryKind::Binary(BinaryOp::Lt)),
+                Punct::LtEq => (8, false, BinaryKind::Binary(BinaryOp::Le)),
+                Punct::Gt => (8, false, BinaryKind::Binary(BinaryOp::Gt)),
+                Punct::GtEq => (8, false, BinaryKind::Binary(BinaryOp::Ge)),
+                Punct::EqEq => (7, false, BinaryKind::Binary(BinaryOp::Eq)),
+                Punct::BangEq => (7, false, BinaryKind::Binary(BinaryOp::Ne)),
+                Punct::EqEqEq => (7, false, BinaryKind::Binary(BinaryOp::StrictEq)),
+                Punct::BangEqEq => (7, false, BinaryKind::Binary(BinaryOp::StrictNe)),
+                Punct::Amp => (6, false, BinaryKind::Binary(BinaryOp::BitAnd)),
+                Punct::Caret => (5, false, BinaryKind::Binary(BinaryOp::BitXor)),
+                Punct::Pipe => (4, false, BinaryKind::Binary(BinaryOp::BitOr)),
+                Punct::AmpAmp => (3, false, BinaryKind::Logical(LogicalOp::And)),
+                Punct::PipePipe => (2, false, BinaryKind::Logical(LogicalOp::Or)),
+                Punct::QuestionQuestion => (2, false, BinaryKind::Logical(LogicalOp::Nullish)),
                 _ => return None,
             },
             TokenKind::Keyword(Keyword::InstanceOf) => {
-                (7, false, BinaryKind::Binary(BinaryOp::InstanceOf))
+                (8, false, BinaryKind::Binary(BinaryOp::InstanceOf))
             }
             TokenKind::Keyword(Keyword::In) if !self.no_in => {
-                (7, false, BinaryKind::Binary(BinaryOp::In))
+                (8, false, BinaryKind::Binary(BinaryOp::In))
             }
             _ => return None,
         };
@@ -826,37 +1083,37 @@ impl Parser {
         }
     }
 
-    fn arrow_parameter_count(&self) -> Option<usize> {
-        // Current token is `(`. Match `( ident (, ident)* ) =>`.
-        let mut index = self.pos + 1;
-        if matches!(
-            self.tokens.get(index).map(|t| &t.kind),
-            Some(TokenKind::Punct(Punct::RParen))
-        ) {
-            index += 1;
-        } else {
-            loop {
-                match self.tokens.get(index).map(|t| &t.kind) {
-                    Some(TokenKind::Identifier(_)) => index += 1,
-                    _ => return None,
-                }
-                match self.tokens.get(index).map(|t| &t.kind) {
-                    Some(TokenKind::Punct(Punct::Comma)) => index += 1,
-                    Some(TokenKind::Punct(Punct::RParen)) => {
-                        index += 1;
-                        break;
-                    }
-                    _ => return None,
-                }
+    /// Attempt to parse `( parameters ) =>` as an arrow function. The cursor is
+    /// restored when the parenthesised text turns out to be an expression.
+    fn try_parse_arrow(&mut self) -> Result<Option<Expr>, ParseError> {
+        let saved = self.pos;
+        let saved_no_in = self.no_in;
+        let position = self.current().position;
+        let attempt = (|| -> Result<Expr, ParseError> {
+            self.expect_punct(Punct::LParen)?;
+            let patterns = self.parse_parameter_patterns()?;
+            if self.current().newline_before || !self.is_punct(Punct::Arrow) {
+                return self.unexpected("`=>`");
             }
-        }
-        match self.tokens.get(index).map(|t| &t.kind) {
-            Some(TokenKind::Punct(Punct::Arrow)) => Some(index - self.pos),
-            _ => None,
+            self.parse_arrow(patterns, position)
+        })();
+        match attempt {
+            Ok(expr) => Ok(Some(expr)),
+            Err(_) => {
+                self.pos = saved;
+                self.no_in = saved_no_in;
+                Ok(None)
+            }
         }
     }
 
-    fn parse_arrow(&mut self, params: Vec<String>, position: Position) -> Result<Expr, ParseError> {
+    /// Parse the parameter list of an arrow function or a parenthesised
+    /// expression, then convert it to an arrow function body.
+    fn parse_arrow(
+        &mut self,
+        patterns: Vec<Pattern>,
+        position: Position,
+    ) -> Result<Expr, ParseError> {
         self.expect_punct(Punct::Arrow)?;
         let body = if self.is_punct(Punct::LBrace) {
             self.parse_block()?
@@ -866,7 +1123,8 @@ impl Parser {
         };
         Ok(Expr::Arrow(Function {
             name: None,
-            params,
+            params: simple_parameter_names(&patterns),
+            patterns,
             body,
             is_arrow: true,
             pos: position,
@@ -907,33 +1165,32 @@ impl Parser {
                 let function = self.parse_function(true)?;
                 Ok(Expr::Function(function))
             }
+            TokenKind::Regex { pattern, flags } => {
+                let position = self.current().position;
+                Regex::new(&pattern, &flags).map_err(|error| {
+                    ParseError::at(
+                        format!("invalid regular expression: {}", error.message),
+                        position,
+                    )
+                })?;
+                self.advance();
+                Ok(Expr::Regex { pattern, flags })
+            }
             TokenKind::Identifier(name) => {
                 if matches!(self.peek_kind(1), TokenKind::Punct(Punct::Arrow))
                     && !self.tokens[self.pos + 1].newline_before
                 {
                     let position = self.current().position;
                     self.advance();
-                    return self.parse_arrow(vec![name], position);
+                    let patterns = vec![Pattern::Identifier(name)];
+                    return self.parse_arrow(patterns, position);
                 }
                 self.advance();
                 Ok(Expr::Identifier(name))
             }
             TokenKind::Punct(Punct::LParen) => {
-                if self.arrow_parameter_count().is_some() {
-                    let position = self.current().position;
-                    self.advance();
-                    let mut params = Vec::new();
-                    if !self.eat_punct(Punct::RParen) {
-                        loop {
-                            params.push(self.binding_identifier()?);
-                            if self.eat_punct(Punct::Comma) {
-                                continue;
-                            }
-                            self.expect_punct(Punct::RParen)?;
-                            break;
-                        }
-                    }
-                    return self.parse_arrow(params, position);
+                if let Some(arrow) = self.try_parse_arrow()? {
+                    return Ok(arrow);
                 }
                 self.advance();
                 let expr = self.parse_expression()?;
@@ -1020,7 +1277,7 @@ impl Parser {
             let (value, shorthand) = if self.eat_punct(Punct::Colon) {
                 (self.parse_assignment()?, false)
             } else if self.is_punct(Punct::LParen) {
-                let params = self.parse_parameter_list()?;
+                let patterns = self.parse_parameter_list()?;
                 self.expect_punct(Punct::LBrace)?;
                 let body = self.parse_block_body()?;
                 let name = match &key {
@@ -1030,7 +1287,8 @@ impl Parser {
                 (
                     Expr::Function(Function {
                         name,
-                        params,
+                        params: simple_parameter_names(&patterns),
+                        patterns,
                         body,
                         is_arrow: false,
                         pos: position,
@@ -1058,19 +1316,30 @@ impl Parser {
         }
     }
 
-    fn parse_parameter_list(&mut self) -> Result<Vec<String>, ParseError> {
+    fn parse_parameter_list(&mut self) -> Result<Vec<Pattern>, ParseError> {
         self.expect_punct(Punct::LParen)?;
-        let mut params = Vec::new();
+        self.parse_parameter_patterns()
+    }
+
+    /// Parse parameters with the opening parenthesis already consumed.
+    fn parse_parameter_patterns(&mut self) -> Result<Vec<Pattern>, ParseError> {
+        let mut patterns = Vec::new();
         if self.eat_punct(Punct::RParen) {
-            return Ok(params);
+            return Ok(patterns);
         }
         loop {
-            params.push(self.binding_identifier()?);
+            if self.eat_punct(Punct::Ellipsis) {
+                let target = self.parse_binding_pattern(false)?;
+                patterns.push(Pattern::Rest(Box::new(target)));
+                self.expect_punct(Punct::RParen)?;
+                return Ok(patterns);
+            }
+            patterns.push(self.parse_binding_pattern(true)?);
             if self.eat_punct(Punct::Comma) {
                 continue;
             }
             self.expect_punct(Punct::RParen)?;
-            return Ok(params);
+            return Ok(patterns);
         }
     }
 
@@ -1089,17 +1358,78 @@ impl Parser {
                 None
             }
         };
-        let params = self.parse_parameter_list()?;
+        let patterns = self.parse_parameter_list()?;
         self.expect_punct(Punct::LBrace)?;
         let body = self.parse_block_body()?;
         Ok(Function {
             name,
-            params,
+            params: simple_parameter_names(&patterns),
+            patterns,
             body,
             is_arrow: false,
             pos: position,
         })
     }
+}
+
+/// The simple identifier names of a parameter list, omitting patterns.
+fn simple_parameter_names(patterns: &[Pattern]) -> Vec<String> {
+    patterns
+        .iter()
+        .filter_map(|pattern| match pattern {
+            Pattern::Identifier(name) => Some(name.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Convert an expression that was parsed as an array or object literal into a
+/// destructuring assignment pattern, when possible.
+fn pattern_from_expression(expr: &Expr) -> Option<Pattern> {
+    match expr {
+        Expr::Identifier(name) => Some(Pattern::Identifier(name.clone())),
+        Expr::Member { .. } => Some(Pattern::Member(Box::new(expr.clone()))),
+        Expr::Array(items) => {
+            let mut elements = Vec::with_capacity(items.len());
+            for item in items {
+                match item {
+                    None => elements.push(None),
+                    Some(item) => elements.push(Some(assignment_pattern_from_element(item)?)),
+                }
+            }
+            Some(Pattern::Array(elements))
+        }
+        Expr::Object(properties) => {
+            let mut converted = Vec::with_capacity(properties.len());
+            for property in properties {
+                let value = assignment_pattern_from_element(&property.value)?;
+                converted.push(ObjectPatternProperty {
+                    key: property.key.clone(),
+                    value,
+                });
+            }
+            Some(Pattern::Object {
+                properties: converted,
+                rest: None,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn assignment_pattern_from_element(expr: &Expr) -> Option<Pattern> {
+    if let Expr::Assign {
+        op: AssignOp::Assign,
+        target,
+        value,
+    } = expr
+    {
+        return Some(Pattern::Default {
+            target: Box::new(pattern_from_expression(target)?),
+            default: value.clone(),
+        });
+    }
+    pattern_from_expression(expr)
 }
 
 #[derive(Clone, Copy)]

@@ -6,15 +6,26 @@
 //!
 //! # Supported formats
 //!
-//! * **PNG** — 8-bit, non-interlaced images of colour type 0 (grey),
-//!   2 (RGB), 3 (palette), 4 (grey + alpha) and 6 (RGBA). `PLTE` and `tRNS`
-//!   are honoured for palette images. The inflate implementation covers stored,
+//! * **PNG** — colour types 0 (grey), 2 (RGB), 3 (palette), 4 (grey + alpha)
+//!   and 6 (RGBA), at the bit depths the specification allows for each:
+//!   1/2/4/8 for types 0 and 3, and 8 for types 2, 4 and 6. Both
+//!   non-interlaced and interlaced (Adam7) images are supported; every pass
+//!   carries its own filters and is placed into the final RGBA canvas.
+//!   `PLTE` and `tRNS` are honoured for palette images, and `tRNS` applies to
+//!   sub-byte palette images too. The inflate implementation covers stored,
 //!   fixed-Huffman and dynamic-Huffman DEFLATE blocks inside a zlib wrapper
 //!   (no preset dictionaries). CRC32 is checked for every critical chunk.
-//!   Interlaced (Adam7) images, bit depths other than 8 and 16-bit samples are
-//!   rejected with a [`DecodeError`], never silently mis-decoded. Ancillary
-//!   colour chunks (`iCCP`, `gAMA`, `cHRM`) are ignored; APNG frames are ignored
-//!   and the first (default) image is returned.
+//!   16-bit samples are rejected with a [`DecodeError`], never silently
+//!   mis-decoded. Ancillary colour chunks (`iCCP`, `gAMA`, `cHRM`) are ignored;
+//!   APNG frames are ignored and the first (default) image is returned.
+//! * **GIF** — GIF87a and GIF89a. Logical screen, global and local colour
+//!   tables, image descriptors, LZW decompression (clear/end-of-information
+//!   codes and code-size growth up to 12 bits), interlacing, and the
+//!   transparency index from the Graphic Control Extension are supported.
+//!   The first frame is decoded; later frames, and animation timing, are
+//!   ignored (there is no compositing timeline in this crate). The canvas is
+//!   filled with the logical-screen background colour, or left transparent
+//!   when the frame declares a transparent index or has no global table.
 //! * **BMP** — uncompressed (`BI_RGB`) 24-bit and 32-bit images, both
 //!   bottom-up (positive height) and top-down (negative height). For 32-bit
 //!   images the stored fourth byte is used as alpha; if every alpha byte is
@@ -24,9 +35,10 @@
 //!
 //! # Unsupported formats
 //!
-//! GIF is detected by its header but not decoded yet (LZW decompression is not
-//! implemented). JPEG and WebP are detected and reported as unsupported.
-//! [`detect_format`] lets callers choose a fallback without attempting a decode.
+//! JPEG and WebP are detected and reported as unsupported. Animated GIF
+//! frames after the first, APNG animation, and 16-bit PNG samples are not
+//! decoded. [`detect_format`] lets callers choose a fallback without
+//! attempting a decode.
 
 use std::fmt;
 
@@ -37,6 +49,23 @@ use crate::images::ImageData;
 /// Anything larger is rejected before allocating so a hostile file cannot
 /// exhaust memory.
 const MAX_DIMENSION: u32 = 16_384;
+
+/// Largest accepted pixel count, in pixels.
+///
+/// This is a second line of defence: a `16384x16384` image is within the
+/// per-edge limit but would need a gigabyte of RGBA, so files are also capped
+/// on total area before anything is allocated.
+const MAX_PIXELS: u64 = 64 * 1024 * 1024;
+
+fn check_pixel_count(width: u32, height: u32, format: &str) -> Result<(), DecodeError> {
+    let pixels = u64::from(width) * u64::from(height);
+    if pixels > MAX_PIXELS {
+        return Err(DecodeError::new(format!(
+            "{format} dimensions {width}x{height} exceed the {MAX_PIXELS} pixel limit"
+        )));
+    }
+    Ok(())
+}
 
 /// The image container formats this module can recognise.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,9 +137,7 @@ pub fn decode(bytes: &[u8]) -> Result<ImageData, DecodeError> {
     match detect_format(bytes) {
         Some(ImageFormat::Png) => decode_png(bytes),
         Some(ImageFormat::Bmp) => decode_bmp(bytes),
-        Some(ImageFormat::Gif) => Err(DecodeError::unsupported(
-            "GIF (LZW decompression is not implemented yet)",
-        )),
+        Some(ImageFormat::Gif) => decode_gif(bytes),
         Some(ImageFormat::Jpeg) => Err(DecodeError::unsupported(
             "JPEG (baseline and progressive decoding are not implemented)",
         )),
@@ -552,10 +579,215 @@ fn parse_png_header(data: &[u8]) -> Result<PngHeader, DecodeError> {
     })
 }
 
+/// One interlace pass: the position and spacing of its samples in the final
+/// image. A non-interlaced image is a single `(0, 0, 1, 1)` pass.
+#[derive(Clone, Copy)]
+struct PngPass {
+    x_start: usize,
+    y_start: usize,
+    x_step: usize,
+    y_step: usize,
+}
+
+/// The seven Adam7 passes, in the order their data appears in the stream.
+const ADAM7_PASSES: [PngPass; 7] = [
+    PngPass {
+        x_start: 0,
+        y_start: 0,
+        x_step: 8,
+        y_step: 8,
+    },
+    PngPass {
+        x_start: 4,
+        y_start: 0,
+        x_step: 8,
+        y_step: 8,
+    },
+    PngPass {
+        x_start: 0,
+        y_start: 4,
+        x_step: 4,
+        y_step: 8,
+    },
+    PngPass {
+        x_start: 2,
+        y_start: 0,
+        x_step: 4,
+        y_step: 4,
+    },
+    PngPass {
+        x_start: 0,
+        y_start: 2,
+        x_step: 2,
+        y_step: 4,
+    },
+    PngPass {
+        x_start: 1,
+        y_start: 0,
+        x_step: 2,
+        y_step: 2,
+    },
+    PngPass {
+        x_start: 0,
+        y_start: 1,
+        x_step: 1,
+        y_step: 2,
+    },
+];
+
+const NON_INTERLACED_PASS: [PngPass; 1] = [PngPass {
+    x_start: 0,
+    y_start: 0,
+    x_step: 1,
+    y_step: 1,
+}];
+
+/// Number of pixels a pass covers along one axis of the final image.
+fn pass_extent(full: usize, start: usize, step: usize) -> usize {
+    if full <= start {
+        0
+    } else {
+        (full - start).div_ceil(step)
+    }
+}
+
+/// Row size in bytes for `width` pixels of the given sample layout.
+fn png_row_bytes(width: usize, channels: usize, bit_depth: u8) -> Result<usize, DecodeError> {
+    let bits = width
+        .checked_mul(channels)
+        .and_then(|value| value.checked_mul(usize::from(bit_depth)))
+        .ok_or_else(|| DecodeError::new("PNG row size overflow"))?;
+    Ok(bits.div_ceil(8))
+}
+
+/// Bytes per pixel used by the PNG row filters (always at least one).
+fn png_filter_bpp(channels: usize, bit_depth: u8) -> usize {
+    (channels * usize::from(bit_depth)).div_ceil(8).max(1)
+}
+
+/// Maps a colour type and bit depth to a channel count, rejecting layouts the
+/// specification does not allow.
+fn png_channels(color_type: u8, bit_depth: u8) -> Result<usize, DecodeError> {
+    match color_type {
+        0 => match bit_depth {
+            1 | 2 | 4 | 8 => Ok(1),
+            16 => Err(DecodeError::unsupported("16-bit PNG samples")),
+            other => Err(DecodeError::new(format!(
+                "invalid PNG bit depth {other} for greyscale"
+            ))),
+        },
+        2 => match bit_depth {
+            8 => Ok(3),
+            16 => Err(DecodeError::unsupported("16-bit PNG samples")),
+            other => Err(DecodeError::new(format!(
+                "invalid PNG bit depth {other} for RGB"
+            ))),
+        },
+        3 => match bit_depth {
+            1 | 2 | 4 | 8 => Ok(1),
+            16 => Err(DecodeError::unsupported("16-bit PNG samples")),
+            other => Err(DecodeError::new(format!(
+                "invalid PNG bit depth {other} for palette"
+            ))),
+        },
+        4 => match bit_depth {
+            8 => Ok(2),
+            16 => Err(DecodeError::unsupported("16-bit PNG samples")),
+            other => Err(DecodeError::new(format!(
+                "invalid PNG bit depth {other} for grey + alpha"
+            ))),
+        },
+        6 => match bit_depth {
+            8 => Ok(4),
+            16 => Err(DecodeError::unsupported("16-bit PNG samples")),
+            other => Err(DecodeError::new(format!(
+                "invalid PNG bit depth {other} for RGBA"
+            ))),
+        },
+        other => Err(DecodeError::unsupported(format!("PNG colour type {other}"))),
+    }
+}
+
+/// Reads packed sample number `index` (1, 2 and 4 bits are packed MSB first).
+fn png_sample(row: &[u8], index: usize, bit_depth: u8) -> Result<u8, DecodeError> {
+    match bit_depth {
+        1 | 2 | 4 => {
+            let per_byte = 8 / usize::from(bit_depth);
+            let byte = *row
+                .get(index / per_byte)
+                .ok_or_else(|| DecodeError::new("PNG sample index out of range"))?;
+            let shift = (per_byte - 1 - index % per_byte) * usize::from(bit_depth);
+            Ok((byte >> shift) & ((1_u8 << bit_depth) - 1))
+        }
+        8 => row
+            .get(index)
+            .copied()
+            .ok_or_else(|| DecodeError::new("PNG sample index out of range")),
+        other => Err(DecodeError::new(format!(
+            "unsupported PNG sample bit depth {other}"
+        ))),
+    }
+}
+
+/// Converts one sample position of an unfiltered row to RGBA.
+fn png_pixel(
+    row: &[u8],
+    index: usize,
+    color_type: u8,
+    bit_depth: u8,
+    palette: Option<&[[u8; 3]]>,
+    transparency: &[u8],
+) -> Result<[u8; 4], DecodeError> {
+    match color_type {
+        0 => {
+            let sample = png_sample(row, index, bit_depth)?;
+            let scale = match bit_depth {
+                1 => 255,
+                2 => 85,
+                4 => 17,
+                _ => 1,
+            };
+            let grey = sample * scale;
+            Ok([grey, grey, grey, 255])
+        }
+        2 => {
+            let start = index * 3;
+            let pixel = row
+                .get(start..start + 3)
+                .ok_or_else(|| DecodeError::new("PNG RGB sample out of range"))?;
+            Ok([pixel[0], pixel[1], pixel[2], 255])
+        }
+        3 => {
+            let entry_index = usize::from(png_sample(row, index, bit_depth)?);
+            let table =
+                palette.ok_or_else(|| DecodeError::new("palette PNG is missing its PLTE chunk"))?;
+            let entry = table
+                .get(entry_index)
+                .ok_or_else(|| DecodeError::new("palette index is outside the PLTE chunk"))?;
+            let alpha = transparency.get(entry_index).copied().unwrap_or(255);
+            Ok([entry[0], entry[1], entry[2], alpha])
+        }
+        4 => {
+            let start = index * 2;
+            let pixel = row
+                .get(start..start + 2)
+                .ok_or_else(|| DecodeError::new("PNG grey + alpha sample out of range"))?;
+            Ok([pixel[0], pixel[0], pixel[0], pixel[1]])
+        }
+        _ => {
+            let start = index * 4;
+            let pixel = row
+                .get(start..start + 4)
+                .ok_or_else(|| DecodeError::new("PNG RGBA sample out of range"))?;
+            Ok([pixel[0], pixel[1], pixel[2], pixel[3]])
+        }
+    }
+}
+
 /// Decodes a PNG image into RGBA8.
 ///
-/// Interlaced (Adam7) images are rejected with a [`DecodeError`], as are bit
-/// depths other than 8 and colour types not listed in the module docs.
+/// Both non-interlaced and Adam7-interlaced images are supported for colour
+/// types 0, 2, 3, 4 and 6 at the bit depths listed in the module docs.
 pub fn decode_png(bytes: &[u8]) -> Result<ImageData, DecodeError> {
     if !bytes.starts_with(&PNG_SIGNATURE) {
         return Err(DecodeError::new("not a PNG file"));
@@ -655,38 +887,43 @@ pub fn decode_png(bytes: &[u8]) -> Result<ImageData, DecodeError> {
     if compressed.is_empty() {
         return Err(DecodeError::new("missing IDAT chunk"));
     }
-    if header.interlace != 0 {
-        return Err(DecodeError::unsupported("interlaced (Adam7) PNG images"));
+    if header.interlace > 1 {
+        return Err(DecodeError::unsupported("PNG interlace method"));
     }
-    if header.bit_depth != 8 {
-        return Err(DecodeError::unsupported(format!(
-            "PNG bit depth {} (only 8-bit samples are supported)",
-            header.bit_depth
-        )));
-    }
-    let channels = match header.color_type {
-        0 => 1,
-        2 => 3,
-        3 => 1,
-        4 => 2,
-        6 => 4,
-        other => {
-            return Err(DecodeError::unsupported(format!("PNG colour type {other}")));
-        }
-    };
+    let channels = png_channels(header.color_type, header.bit_depth)?;
     if header.color_type == 3 && palette.is_none() {
         return Err(DecodeError::new("palette PNG is missing its PLTE chunk"));
     }
 
     let width = header.width as usize;
     let height = header.height as usize;
-    let stride = width
-        .checked_mul(channels)
-        .ok_or_else(|| DecodeError::new("PNG row size overflow"))?;
-    let raw_length = stride
-        .checked_add(1)
-        .and_then(|row| row.checked_mul(height))
-        .ok_or_else(|| DecodeError::new("PNG image data size overflow"))?;
+    check_pixel_count(header.width, header.height, "PNG")?;
+    let passes: &[PngPass] = if header.interlace == 0 {
+        &NON_INTERLACED_PASS
+    } else {
+        &ADAM7_PASSES
+    };
+
+    // Each pass has its own filter byte, rows and (crucially) its own
+    // previous-row history, so the total decompressed size is the sum over
+    // passes rather than one stride times the full height.
+    let mut raw_length = 0_usize;
+    for pass in passes {
+        let pass_width = pass_extent(width, pass.x_start, pass.x_step);
+        let pass_height = pass_extent(height, pass.y_start, pass.y_step);
+        if pass_width == 0 || pass_height == 0 {
+            continue;
+        }
+        let row_bytes = png_row_bytes(pass_width, channels, header.bit_depth)?;
+        let pass_length = row_bytes
+            .checked_add(1)
+            .and_then(|row| row.checked_mul(pass_height))
+            .ok_or_else(|| DecodeError::new("PNG image data size overflow"))?;
+        raw_length = raw_length
+            .checked_add(pass_length)
+            .ok_or_else(|| DecodeError::new("PNG image data size overflow"))?;
+    }
+
     let raw = inflate_zlib(&compressed, raw_length)?;
     if raw.len() != raw_length {
         return Err(DecodeError::new(
@@ -694,50 +931,62 @@ pub fn decode_png(bytes: &[u8]) -> Result<ImageData, DecodeError> {
         ));
     }
 
-    let mut pixels = Vec::with_capacity(stride * height);
-    let mut previous = vec![0_u8; stride];
-    let mut current = vec![0_u8; stride];
-    for row in 0..height {
-        let start = row * (stride + 1);
-        let filter = raw[start];
-        current.copy_from_slice(&raw[start + 1..start + 1 + stride]);
-        unfilter(filter, &mut current, &previous, channels)?;
+    let pixel_count = width
+        .checked_mul(height)
+        .ok_or_else(|| DecodeError::new("PNG image size overflow"))?;
+    let mut pixels = vec![
+        0_u8;
+        pixel_count
+            .checked_mul(4)
+            .ok_or_else(|| DecodeError::new("PNG image size overflow"))?
+    ];
+    let filter_bpp = png_filter_bpp(channels, header.bit_depth);
+    let palette_table = palette.as_deref();
+    let mut offset = 0_usize;
 
-        match header.color_type {
-            0 => {
-                for &value in &current {
-                    pixels.extend_from_slice(&[value, value, value, 255]);
-                }
-            }
-            2 => {
-                for pixel in current.chunks(3) {
-                    pixels.extend_from_slice(&[pixel[0], pixel[1], pixel[2], 255]);
-                }
-            }
-            3 => {
-                let table = palette
-                    .as_ref()
-                    .ok_or_else(|| DecodeError::new("palette PNG is missing its PLTE chunk"))?;
-                for &index in &current {
-                    let entry = table.get(usize::from(index)).ok_or_else(|| {
-                        DecodeError::new("palette index is outside the PLTE chunk")
-                    })?;
-                    let alpha = transparency.get(usize::from(index)).copied().unwrap_or(255);
-                    pixels.extend_from_slice(&[entry[0], entry[1], entry[2], alpha]);
-                }
-            }
-            4 => {
-                for pixel in current.chunks(2) {
-                    pixels.extend_from_slice(&[pixel[0], pixel[0], pixel[0], pixel[1]]);
-                }
-            }
-            _ => {
-                // Colour type 6: already RGBA.
-                pixels.extend_from_slice(&current);
-            }
+    for pass in passes {
+        let pass_width = pass_extent(width, pass.x_start, pass.x_step);
+        let pass_height = pass_extent(height, pass.y_start, pass.y_step);
+        if pass_width == 0 || pass_height == 0 {
+            continue;
         }
+        let row_bytes = png_row_bytes(pass_width, channels, header.bit_depth)?;
+        let mut previous = vec![0_u8; row_bytes];
+        let mut current = vec![0_u8; row_bytes];
+        for row in 0..pass_height {
+            let filter = *raw
+                .get(offset)
+                .ok_or_else(|| DecodeError::new("truncated PNG image data"))?;
+            let row_start = offset + 1;
+            let row_data = raw
+                .get(row_start..row_start + row_bytes)
+                .ok_or_else(|| DecodeError::new("truncated PNG image data"))?;
+            current.copy_from_slice(row_data);
+            offset = row_start + row_bytes;
+            unfilter(filter, &mut current, &previous, filter_bpp)?;
 
-        std::mem::swap(&mut previous, &mut current);
+            let y = pass.y_start + row * pass.y_step;
+            for column in 0..pass_width {
+                let x = pass.x_start + column * pass.x_step;
+                let color = png_pixel(
+                    &current,
+                    column,
+                    header.color_type,
+                    header.bit_depth,
+                    palette_table,
+                    &transparency,
+                )?;
+                let index = (y * width + x) * 4;
+                pixels[index..index + 4].copy_from_slice(&color);
+            }
+            std::mem::swap(&mut previous, &mut current);
+        }
+    }
+
+    if offset != raw_length {
+        return Err(DecodeError::new(
+            "PNG image data does not match its declared size",
+        ));
     }
 
     ImageData::from_rgba(header.width, header.height, pixels)
@@ -808,6 +1057,421 @@ fn unfilter(
         }
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// GIF
+// ---------------------------------------------------------------------------
+
+const GIF_SIGNATURE_87A: &[u8; 6] = b"GIF87a";
+const GIF_SIGNATURE_89A: &[u8; 6] = b"GIF89a";
+
+/// Reads a little-endian `u16` from a GIF byte stream.
+fn gif_u16(bytes: &[u8], offset: usize) -> Result<u16, DecodeError> {
+    let slice = bytes
+        .get(offset..offset + 2)
+        .ok_or_else(|| DecodeError::new("truncated GIF data"))?;
+    Ok(u16::from_le_bytes([slice[0], slice[1]]))
+}
+
+/// Reads a colour table of `entries` RGB triples.
+fn gif_color_table(
+    bytes: &[u8],
+    offset: usize,
+    entries: usize,
+) -> Result<(Vec<[u8; 3]>, usize), DecodeError> {
+    let length = entries
+        .checked_mul(3)
+        .ok_or_else(|| DecodeError::new("GIF colour table size overflow"))?;
+    let table = bytes
+        .get(offset..offset + length)
+        .ok_or_else(|| DecodeError::new("truncated GIF colour table"))?;
+    let entries: Vec<[u8; 3]> = table.as_chunks::<3>().0.to_vec();
+    Ok((entries, offset + length))
+}
+
+/// Skips a chain of GIF data sub-blocks, returning the offset after the
+/// terminating zero-length block.
+fn gif_skip_sub_blocks(bytes: &[u8], mut offset: usize) -> Result<usize, DecodeError> {
+    loop {
+        let length = usize::from(
+            *bytes
+                .get(offset)
+                .ok_or_else(|| DecodeError::new("truncated GIF sub-block"))?,
+        );
+        offset += 1;
+        if length == 0 {
+            return Ok(offset);
+        }
+        offset = offset
+            .checked_add(length)
+            .ok_or_else(|| DecodeError::new("GIF sub-block size overflow"))?;
+        if offset > bytes.len() {
+            return Err(DecodeError::new("truncated GIF sub-block data"));
+        }
+    }
+}
+
+/// Concatenates a chain of GIF data sub-blocks into one byte buffer.
+fn gif_read_sub_blocks(bytes: &[u8], mut offset: usize) -> Result<(Vec<u8>, usize), DecodeError> {
+    let mut data = Vec::new();
+    loop {
+        let length = usize::from(
+            *bytes
+                .get(offset)
+                .ok_or_else(|| DecodeError::new("truncated GIF sub-block"))?,
+        );
+        offset += 1;
+        if length == 0 {
+            return Ok((data, offset));
+        }
+        let end = offset
+            .checked_add(length)
+            .ok_or_else(|| DecodeError::new("GIF sub-block size overflow"))?;
+        let block = bytes
+            .get(offset..end)
+            .ok_or_else(|| DecodeError::new("truncated GIF sub-block data"))?;
+        if data.len().saturating_add(block.len()) > MAX_PIXELS as usize + 16 {
+            return Err(DecodeError::new("GIF LZW data is too large"));
+        }
+        data.extend_from_slice(block);
+        offset = end;
+    }
+}
+
+/// Bit reader for GIF LZW data. Codes are packed least-significant bit first,
+/// with no padding between sub-blocks (the sub-block framing is removed before
+/// this reader sees the bytes).
+struct GifBitReader<'a> {
+    data: &'a [u8],
+    bit: usize,
+}
+
+impl<'a> GifBitReader<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self { data, bit: 0 }
+    }
+
+    fn read(&mut self, count: u32) -> Result<u32, DecodeError> {
+        let mut value = 0_u32;
+        for index in 0..count {
+            let byte = *self
+                .data
+                .get(self.bit / 8)
+                .ok_or_else(|| DecodeError::new("truncated GIF LZW data"))?;
+            let bit = (byte >> (self.bit % 8)) & 1;
+            value |= u32::from(bit) << index;
+            self.bit += 1;
+        }
+        Ok(value)
+    }
+}
+
+/// Decompresses GIF LZW data into exactly `expected` colour indices.
+///
+/// `min_code_size` is the value stored in the image descriptor (normally 2..=8;
+/// 1 is accepted for two-colour images). The dictionary is reset whenever a
+/// clear code appears, and code width grows from `min_code_size + 1` up to 12
+/// bits as entries are added.
+fn gif_lzw_decode(data: &[u8], min_code_size: u8, expected: usize) -> Result<Vec<u8>, DecodeError> {
+    if !(1..=8).contains(&min_code_size) {
+        return Err(DecodeError::new(format!(
+            "invalid GIF LZW minimum code size {min_code_size}"
+        )));
+    }
+    let clear = 1_u32 << min_code_size;
+    let end_of_information = clear + 1;
+    let initial_code_size = u32::from(min_code_size) + 1;
+
+    // 12-bit codes address at most 4096 entries. Literal entries are
+    // pre-populated so `previous` lookups never need a special case.
+    let mut dictionary: Vec<Vec<u8>> = vec![Vec::new(); 4096];
+    for (index, entry) in dictionary.iter_mut().take(clear as usize).enumerate() {
+        entry.push(index as u8);
+    }
+
+    let mut reader = GifBitReader::new(data);
+    let mut out = Vec::with_capacity(expected.min(MAX_PIXELS as usize));
+    let mut code_size = initial_code_size;
+    let mut next_code = end_of_information + 1;
+    let mut previous: Option<u32> = None;
+
+    loop {
+        let code = reader.read(code_size)?;
+        if code == clear {
+            code_size = initial_code_size;
+            next_code = end_of_information + 1;
+            previous = None;
+            continue;
+        }
+        if code == end_of_information {
+            break;
+        }
+
+        let entry: Vec<u8> = if code < clear {
+            vec![code as u8]
+        } else if code < next_code {
+            dictionary
+                .get(code as usize)
+                .filter(|entry| !entry.is_empty())
+                .cloned()
+                .ok_or_else(|| DecodeError::new("invalid GIF LZW code"))?
+        } else if code == next_code {
+            // The code being read is the one just about to be added: the
+            // decoder emits previous + previous[0] ("KwKwK").
+            let prior = previous
+                .and_then(|prior| dictionary.get(prior as usize))
+                .filter(|entry| !entry.is_empty())
+                .ok_or_else(|| DecodeError::new("invalid GIF LZW code"))?;
+            let mut entry = prior.clone();
+            entry.push(prior[0]);
+            entry
+        } else {
+            return Err(DecodeError::new("invalid GIF LZW code"));
+        };
+
+        if out.len().saturating_add(entry.len()) > expected {
+            return Err(DecodeError::new(
+                "GIF LZW data expands past the frame's pixel count",
+            ));
+        }
+        out.extend_from_slice(&entry);
+
+        if let Some(prior) = previous
+            && (next_code as usize) < dictionary.len()
+        {
+            let mut new_entry = dictionary[prior as usize].clone();
+            new_entry.push(entry[0]);
+            dictionary[next_code as usize] = new_entry;
+            next_code += 1;
+            if next_code == (1_u32 << code_size) && code_size < 12 {
+                code_size += 1;
+            }
+        }
+        previous = Some(code);
+
+        if out.len() == expected {
+            break;
+        }
+    }
+
+    if out.len() != expected {
+        return Err(DecodeError::new("GIF LZW data is truncated"));
+    }
+    Ok(out)
+}
+
+/// Row order for an interlaced GIF frame: four passes, each picking every
+/// eighth, eighth, fourth and second row respectively.
+fn gif_interlaced_rows(height: usize) -> Vec<usize> {
+    let mut rows = Vec::with_capacity(height);
+    for (start, step) in [(0_usize, 8_usize), (4, 8), (2, 4), (1, 2)] {
+        let mut row = start;
+        while row < height {
+            rows.push(row);
+            row += step;
+        }
+    }
+    rows
+}
+
+/// Decodes the first frame of a GIF image into RGBA8.
+///
+/// Animated GIFs are accepted but only their first frame is returned; there is
+/// no frame-compositing model in this crate. Malformed files produce a
+/// [`DecodeError`] rather than a panic.
+fn decode_gif(bytes: &[u8]) -> Result<ImageData, DecodeError> {
+    if bytes.len() < 13 {
+        return Err(DecodeError::new("truncated GIF header"));
+    }
+    if !bytes.starts_with(GIF_SIGNATURE_87A) && !bytes.starts_with(GIF_SIGNATURE_89A) {
+        return Err(DecodeError::new("not a GIF file"));
+    }
+
+    let width = u32::from(gif_u16(bytes, 6)?);
+    let height = u32::from(gif_u16(bytes, 8)?);
+    if width == 0 || height == 0 {
+        return Err(DecodeError::new("GIF has a zero dimension"));
+    }
+    if width > MAX_DIMENSION || height > MAX_DIMENSION {
+        return Err(DecodeError::new(format!(
+            "GIF dimensions {width}x{height} exceed the {MAX_DIMENSION} pixel limit"
+        )));
+    }
+    check_pixel_count(width, height, "GIF")?;
+
+    let packed = bytes[10];
+    let background_index = bytes[11];
+    let mut offset = 13_usize;
+
+    let global_table = if packed & 0x80 != 0 {
+        let entries = 1_usize << (usize::from(packed & 0x07) + 1);
+        let (table, next) = gif_color_table(bytes, offset, entries)?;
+        offset = next;
+        Some(table)
+    } else {
+        None
+    };
+
+    let mut transparent_index: Option<u8> = None;
+
+    loop {
+        let block = *bytes
+            .get(offset)
+            .ok_or_else(|| DecodeError::new("truncated GIF data (missing trailer)"))?;
+        offset += 1;
+        match block {
+            0x21 => {
+                // Extension introducer, followed by a label and sub-blocks.
+                let label = *bytes
+                    .get(offset)
+                    .ok_or_else(|| DecodeError::new("truncated GIF extension"))?;
+                offset += 1;
+                if label == 0xf9 {
+                    // Graphic Control Extension: size (4), flags, delay,
+                    // transparent index, terminator.
+                    let size = usize::from(
+                        *bytes
+                            .get(offset)
+                            .ok_or_else(|| DecodeError::new("truncated GIF control block"))?,
+                    );
+                    if size < 4 {
+                        return Err(DecodeError::new(
+                            "invalid GIF Graphic Control Extension size",
+                        ));
+                    }
+                    let payload = bytes
+                        .get(offset + 1..offset + 1 + size)
+                        .ok_or_else(|| DecodeError::new("truncated GIF control block"))?;
+                    let flags = payload[0];
+                    transparent_index = if flags & 0x01 != 0 {
+                        Some(payload[3])
+                    } else {
+                        None
+                    };
+                    offset = gif_skip_sub_blocks(bytes, offset + 1 + size)?;
+                } else {
+                    offset = gif_skip_sub_blocks(bytes, offset)?;
+                }
+            }
+            0x2c => {
+                // Image descriptor: left, top, width, height, packed flags.
+                let left = usize::from(gif_u16(bytes, offset)?);
+                let top = usize::from(gif_u16(bytes, offset + 2)?);
+                let frame_width = usize::from(gif_u16(bytes, offset + 4)?);
+                let frame_height = usize::from(gif_u16(bytes, offset + 6)?);
+                let frame_packed = *bytes
+                    .get(offset + 8)
+                    .ok_or_else(|| DecodeError::new("truncated GIF image descriptor"))?;
+                offset += 9;
+
+                if frame_width == 0 || frame_height == 0 {
+                    return Err(DecodeError::new("GIF frame has a zero dimension"));
+                }
+                if frame_width > MAX_DIMENSION as usize || frame_height > MAX_DIMENSION as usize {
+                    return Err(DecodeError::new(format!(
+                        "GIF frame dimensions {frame_width}x{frame_height} exceed the {MAX_DIMENSION} pixel limit"
+                    )));
+                }
+                let frame_pixels = frame_width
+                    .checked_mul(frame_height)
+                    .ok_or_else(|| DecodeError::new("GIF frame size overflow"))?;
+                if frame_pixels as u64 > MAX_PIXELS {
+                    return Err(DecodeError::new(format!(
+                        "GIF frame pixel count exceeds the {MAX_PIXELS} pixel limit"
+                    )));
+                }
+
+                let local_table = if frame_packed & 0x80 != 0 {
+                    let entries = 1_usize << (usize::from(frame_packed & 0x07) + 1);
+                    let (table, next) = gif_color_table(bytes, offset, entries)?;
+                    offset = next;
+                    Some(table)
+                } else {
+                    None
+                };
+                let interlaced = frame_packed & 0x40 != 0;
+
+                let color_table = local_table.as_ref().or(global_table.as_ref());
+                let color_table = color_table.ok_or_else(|| {
+                    DecodeError::new("GIF frame has no global or local colour table")
+                })?;
+
+                let min_code_size = *bytes
+                    .get(offset)
+                    .ok_or_else(|| DecodeError::new("truncated GIF LZW header"))?;
+                offset += 1;
+                let (lzw_data, _next) = gif_read_sub_blocks(bytes, offset)?;
+
+                let indices = gif_lzw_decode(&lzw_data, min_code_size, frame_pixels)?;
+
+                // Fill the canvas with the logical-screen background, unless a
+                // transparent index is in effect, in which case anything not
+                // covered by the frame must stay transparent.
+                let canvas_pixels = (width as usize)
+                    .checked_mul(height as usize)
+                    .ok_or_else(|| DecodeError::new("GIF canvas size overflow"))?;
+                let mut pixels = vec![0_u8; canvas_pixels * 4];
+                if transparent_index.is_none()
+                    && let Some(color) = global_table
+                        .as_ref()
+                        .and_then(|table| table.get(usize::from(background_index)))
+                {
+                    for pixel in pixels.as_chunks_mut::<4>().0 {
+                        pixel.copy_from_slice(&[color[0], color[1], color[2], 255]);
+                    }
+                }
+
+                let row_order = if interlaced {
+                    gif_interlaced_rows(frame_height)
+                } else {
+                    (0..frame_height).collect()
+                };
+
+                let canvas_width = width as usize;
+                let canvas_height = height as usize;
+                for (source_row, row) in row_order.into_iter().enumerate() {
+                    let start = source_row * frame_width;
+                    let row_indices = indices
+                        .get(start..start + frame_width)
+                        .ok_or_else(|| DecodeError::new("truncated GIF frame data"))?;
+                    let y = top + row;
+                    if y >= canvas_height {
+                        continue;
+                    }
+                    for (column, &index) in row_indices.iter().enumerate() {
+                        if Some(index) == transparent_index {
+                            continue;
+                        }
+                        let x = left + column;
+                        if x >= canvas_width {
+                            continue;
+                        }
+                        let entry = color_table.get(usize::from(index)).ok_or_else(|| {
+                            DecodeError::new("GIF colour index is outside the colour table")
+                        })?;
+                        let target = (y * canvas_width + x) * 4;
+                        pixels[target..target + 4]
+                            .copy_from_slice(&[entry[0], entry[1], entry[2], 255]);
+                    }
+                }
+
+                return ImageData::from_rgba(width, height, pixels);
+            }
+            0x3b => {
+                return Err(DecodeError::new("GIF contains no image frame"));
+            }
+            0x00 => {
+                // Some encoders pad between blocks; skip the filler byte.
+                continue;
+            }
+            other => {
+                return Err(DecodeError::new(format!(
+                    "unexpected GIF block 0x{other:02x}"
+                )));
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -960,6 +1624,7 @@ mod tests {
         height: u32,
         bit_depth: u8,
         color_type: u8,
+        interlace: u8,
         extra: &[(&[u8; 4], &[u8])],
         idat: &[u8],
     ) -> Vec<u8> {
@@ -967,7 +1632,7 @@ mod tests {
         let mut header = Vec::new();
         header.extend_from_slice(&width.to_be_bytes());
         header.extend_from_slice(&height.to_be_bytes());
-        header.extend_from_slice(&[bit_depth, color_type, 0, 0, 0]);
+        header.extend_from_slice(&[bit_depth, color_type, 0, 0, interlace]);
         write_chunk(&mut out, b"IHDR", &header);
         for (kind, data) in extra {
             write_chunk(&mut out, kind, data);
@@ -990,6 +1655,26 @@ mod tests {
             height,
             bit_depth,
             color_type,
+            0,
+            extra,
+            &zlib_stored(raw),
+        )
+    }
+
+    fn png_with_raw_interlaced(
+        width: u32,
+        height: u32,
+        bit_depth: u8,
+        color_type: u8,
+        extra: &[(&[u8; 4], &[u8])],
+        raw: &[u8],
+    ) -> Vec<u8> {
+        assemble_png(
+            width,
+            height,
+            bit_depth,
+            color_type,
+            1,
             extra,
             &zlib_stored(raw),
         )
@@ -1244,7 +1929,7 @@ mod tests {
             let zlib = zlib_wrap(&deflate, &raw);
             let out = inflate_zlib(&zlib, raw.len()).expect("hand-built stream should inflate");
             assert_eq!(out, raw);
-            let file = assemble_png(30, 20, 8, 6, &[], &zlib);
+            let file = assemble_png(30, 20, 8, 6, 0, &[], &zlib);
             let image = decode_png(&file).expect("PNG with Huffman-coded IDAT");
             let expected: Vec<u8> = raw.chunks(121).flat_map(|row| row[1..].to_vec()).collect();
             assert_eq!(image.pixels, expected);
@@ -1316,19 +2001,6 @@ mod tests {
 
     #[test]
     fn rejects_unsupported_png_variants() {
-        // Interlaced.
-        let mut interlaced = png_with_raw(1, 1, 8, 6, &[], &[0, 1, 2, 3, 4]);
-        let ihdr_data = 8 + 8;
-        interlaced[ihdr_data + 12] = 1;
-        // Repair the IHDR CRC after editing the interlace byte.
-        let crc_start = 8 + 8 + 13;
-        let mut crc_input = Vec::new();
-        crc_input.extend_from_slice(b"IHDR");
-        crc_input.extend_from_slice(&interlaced[ihdr_data..ihdr_data + 13]);
-        let crc = crc32(&crc_input).to_be_bytes();
-        interlaced[crc_start..crc_start + 4].copy_from_slice(&crc);
-        assert!(decode_png(&interlaced).is_err());
-
         // 16-bit samples.
         let deep = png_with_raw(1, 1, 16, 0, &[], &[0, 0, 0]);
         assert!(decode_png(&deep).is_err());
@@ -1341,6 +2013,18 @@ mod tests {
         let palette = [1_u8, 2, 3];
         let out_of_range = png_with_raw(1, 1, 8, 3, &[(b"PLTE", &palette)], &[0, 7]);
         assert!(decode_png(&out_of_range).is_err());
+
+        // An invalid interlace method is rejected by the header parser.
+        let mut header = png_with_raw(1, 1, 8, 6, &[], &[0, 1, 2, 3, 4]);
+        let ihdr_data = 8 + 8;
+        header[ihdr_data + 12] = 2;
+        let crc_start = 8 + 8 + 13;
+        let mut crc_input = Vec::new();
+        crc_input.extend_from_slice(b"IHDR");
+        crc_input.extend_from_slice(&header[ihdr_data..ihdr_data + 13]);
+        let crc = crc32(&crc_input).to_be_bytes();
+        header[crc_start..crc_start + 4].copy_from_slice(&crc);
+        assert!(decode_png(&header).is_err());
     }
 
     fn bmp24(width: u32, rows: &[[[u8; 3]; 3]], top_down: bool) -> Vec<u8> {
@@ -1491,7 +2175,7 @@ mod tests {
 
     #[test]
     fn unsupported_formats_return_errors() {
-        let gif = decode(b"GIF89a\x01\x00\x01\x00").expect_err("GIF is not implemented");
+        let gif = decode(b"GIF89a\x01\x00\x01\x00").expect_err("truncated GIF is rejected");
         assert!(gif.message.contains("GIF"));
         let jpeg = decode(&[0xff, 0xd8, 0xff, 0xe0, 0x00]).expect_err("JPEG is not implemented");
         assert!(jpeg.message.contains("JPEG"));
@@ -1533,6 +2217,925 @@ mod tests {
                 file[index] ^= next();
             }
             let _ = decode(&file);
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // GIF test helpers
+    // ---------------------------------------------------------------------
+
+    struct GifFrameSpec {
+        left: u16,
+        top: u16,
+        width: u16,
+        height: u16,
+        indices: Vec<u8>,
+        interlace: bool,
+        palette: Option<Vec<[u8; 3]>>,
+        min_code_size: u8,
+    }
+
+    /// Low three bits of a GIF packed field for a table of `entries` colours.
+    fn gif_table_bits(entries: usize) -> u8 {
+        let mut size = entries.next_power_of_two().max(2);
+        let mut bits = 0_u8;
+        while size > 2 {
+            size >>= 1;
+            bits += 1;
+        }
+        bits
+    }
+
+    struct GifBitWriter {
+        out: Vec<u8>,
+        accumulator: u32,
+        bits: u32,
+    }
+
+    impl GifBitWriter {
+        fn new() -> Self {
+            Self {
+                out: Vec::new(),
+                accumulator: 0,
+                bits: 0,
+            }
+        }
+
+        fn write(&mut self, value: u32, width: u32) {
+            let mask = if width >= 32 {
+                u32::MAX
+            } else {
+                (1_u32 << width) - 1
+            };
+            self.accumulator |= (value & mask) << self.bits;
+            self.bits += width;
+            while self.bits >= 8 {
+                self.out.push((self.accumulator & 0xff) as u8);
+                self.accumulator >>= 8;
+                self.bits -= 8;
+            }
+        }
+
+        fn finish(mut self) -> Vec<u8> {
+            if self.bits > 0 {
+                self.out.push((self.accumulator & 0xff) as u8);
+            }
+            self.out
+        }
+    }
+
+    /// Minimal GIF LZW encoder. It emits each index as a literal and mirrors the
+    /// decoder's dictionary growth so code widths stay in sync without needing
+    /// a real match-finding dictionary.
+    fn gif_lzw_encode(indices: &[u8], min_code_size: u8) -> Vec<u8> {
+        let clear = 1_u32 << min_code_size;
+        let end_of_information = clear + 1;
+        let mut writer = GifBitWriter::new();
+        let mut code_size = u32::from(min_code_size) + 1;
+        let mut next_code = end_of_information + 1;
+        let mut have_previous = false;
+        writer.write(clear, code_size);
+        for &index in indices {
+            writer.write(u32::from(index), code_size);
+            if have_previous && next_code < 4096 {
+                next_code += 1;
+                if next_code == (1_u32 << code_size) && code_size < 12 {
+                    code_size += 1;
+                }
+            }
+            have_previous = true;
+        }
+        writer.write(end_of_information, code_size);
+        writer.finish()
+    }
+
+    fn build_gif(
+        version: &[u8; 6],
+        width: u16,
+        height: u16,
+        global_table: Option<&[[u8; 3]]>,
+        background: u8,
+        transparent: Option<u8>,
+        frames: &[GifFrameSpec],
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(version);
+        out.extend_from_slice(&width.to_le_bytes());
+        out.extend_from_slice(&height.to_le_bytes());
+        let mut packed = 0_u8;
+        if let Some(table) = global_table {
+            packed |= 0x80 | 0x70 | gif_table_bits(table.len());
+        }
+        out.push(packed);
+        out.push(background);
+        out.push(0);
+        if let Some(table) = global_table {
+            for entry in table {
+                out.extend_from_slice(entry);
+            }
+        }
+        if let Some(index) = transparent {
+            // Graphic Control Extension: flags, delay, transparent index.
+            out.extend_from_slice(&[0x21, 0xf9, 0x04, 0x01, 0, 0, index, 0]);
+        }
+        for frame in frames {
+            out.push(0x2c);
+            out.extend_from_slice(&frame.left.to_le_bytes());
+            out.extend_from_slice(&frame.top.to_le_bytes());
+            out.extend_from_slice(&frame.width.to_le_bytes());
+            out.extend_from_slice(&frame.height.to_le_bytes());
+            let mut frame_packed = 0_u8;
+            if let Some(table) = &frame.palette {
+                frame_packed |= 0x80 | gif_table_bits(table.len());
+            }
+            if frame.interlace {
+                frame_packed |= 0x40;
+            }
+            out.push(frame_packed);
+            if let Some(table) = &frame.palette {
+                for entry in table {
+                    out.extend_from_slice(entry);
+                }
+            }
+            out.push(frame.min_code_size);
+            let data = gif_lzw_encode(&frame.indices, frame.min_code_size);
+            for chunk in data.chunks(255) {
+                out.push(chunk.len() as u8);
+                out.extend_from_slice(chunk);
+            }
+            out.push(0);
+        }
+        out.push(0x3b);
+        out
+    }
+
+    fn solid_frame(width: u16, height: u16, index: u8) -> GifFrameSpec {
+        GifFrameSpec {
+            left: 0,
+            top: 0,
+            width,
+            height,
+            indices: vec![index; usize::from(width) * usize::from(height)],
+            interlace: false,
+            palette: None,
+            min_code_size: 2,
+        }
+    }
+
+    const RED: [u8; 3] = [255, 0, 0];
+    const GREEN: [u8; 3] = [0, 255, 0];
+    const BLUE: [u8; 3] = [0, 0, 255];
+    const WHITE: [u8; 3] = [255, 255, 255];
+
+    #[test]
+    fn decodes_single_colour_gif() {
+        let table = [RED, GREEN];
+        let frames = [solid_frame(1, 1, 0)];
+        let file = build_gif(GIF_SIGNATURE_89A, 1, 1, Some(&table), 0, None, &frames);
+        let image = decode(&file).expect("solid GIF should decode");
+        assert_eq!((image.width, image.height), (1, 1));
+        assert_eq!(image.get(0, 0), [255, 0, 0, 255]);
+        assert_eq!(ImageData::decode(&file).expect("convenience decode"), image);
+    }
+
+    #[test]
+    fn decodes_two_colour_gif() {
+        let table = [RED, GREEN];
+        let mut frame = solid_frame(3, 1, 0);
+        frame.indices = vec![0, 1, 0];
+        let file = build_gif(GIF_SIGNATURE_89A, 3, 1, Some(&table), 0, None, &[frame]);
+        let image = decode(&file).expect("two-colour GIF should decode");
+        assert_eq!(image.get(0, 0), [255, 0, 0, 255]);
+        assert_eq!(image.get(1, 0), [0, 255, 0, 255]);
+        assert_eq!(image.get(2, 0), [255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn decodes_gif_transparency() {
+        let table = [RED, GREEN];
+        let mut frame = solid_frame(2, 1, 0);
+        frame.indices = vec![0, 1];
+        let file = build_gif(GIF_SIGNATURE_89A, 2, 1, Some(&table), 0, Some(1), &[frame]);
+        let image = decode(&file).expect("transparent GIF should decode");
+        assert_eq!(image.get(0, 0), [255, 0, 0, 255]);
+        assert_eq!(image.get(1, 0), [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn decodes_interlaced_gif() {
+        let table: Vec<[u8; 3]> = (0..8).map(|value| [value * 32; 3]).collect();
+        let width = 8_usize;
+        let height = 8_usize;
+        let rows: Vec<Vec<u8>> = (0..height)
+            .map(|_| (0..width).map(|_| 0).collect())
+            .collect();
+        let mut image_rows = rows;
+        for (y, row) in image_rows.iter_mut().enumerate() {
+            for value in row.iter_mut() {
+                *value = y as u8;
+            }
+        }
+        let order = gif_interlaced_rows(height);
+        let indices: Vec<u8> = order
+            .iter()
+            .flat_map(|&row| image_rows[row].clone())
+            .collect();
+        let frame = GifFrameSpec {
+            left: 0,
+            top: 0,
+            width: width as u16,
+            height: height as u16,
+            indices,
+            interlace: true,
+            palette: None,
+            min_code_size: 3,
+        };
+        let file = build_gif(
+            GIF_SIGNATURE_89A,
+            width as u16,
+            height as u16,
+            Some(&table),
+            0,
+            None,
+            &[frame],
+        );
+        let image = decode(&file).expect("interlaced GIF should decode");
+        for y in 0..height {
+            for x in 0..width {
+                let value = (y as u8) * 32;
+                assert_eq!(
+                    image.get(x as u32, y as u32),
+                    [value, value, value, 255],
+                    "at {x},{y}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn decodes_gif_with_lzw_code_size_growth() {
+        let table: Vec<[u8; 3]> = (0..256)
+            .map(|value| [value as u8, (255 - value) as u8, (value / 2) as u8])
+            .collect();
+        let width = 40_usize;
+        let height = 40_usize;
+        let mut indices = Vec::with_capacity(width * height);
+        for y in 0..height {
+            for x in 0..width {
+                indices.push(((x + y * width) % 256) as u8);
+            }
+        }
+        let frame = GifFrameSpec {
+            left: 0,
+            top: 0,
+            width: width as u16,
+            height: height as u16,
+            indices,
+            interlace: false,
+            palette: None,
+            min_code_size: 8,
+        };
+        let file = build_gif(
+            GIF_SIGNATURE_89A,
+            width as u16,
+            height as u16,
+            Some(&table),
+            0,
+            None,
+            &[frame],
+        );
+        let image = decode(&file).expect("GIF with growing code size should decode");
+        for y in 0..height {
+            for x in 0..width {
+                let index = ((x + y * width) % 256) as u8;
+                let expected = [index, 255_u8.wrapping_sub(index), index / 2, 255];
+                assert_eq!(image.get(x as u32, y as u32), expected, "at {x},{y}");
+            }
+        }
+    }
+
+    #[test]
+    fn decodes_gif_versions_87a_and_89a() {
+        let table = [RED, GREEN];
+        for version in [GIF_SIGNATURE_87A, GIF_SIGNATURE_89A] {
+            let file = build_gif(
+                version,
+                1,
+                1,
+                Some(&table),
+                0,
+                None,
+                &[solid_frame(1, 1, 0)],
+            );
+            let image = decode(&file).expect("GIF should decode");
+            assert_eq!(image.get(0, 0), [255, 0, 0, 255]);
+        }
+    }
+
+    #[test]
+    fn gif_skips_unknown_extensions() {
+        let table = [RED, GREEN];
+        let file = build_gif(
+            GIF_SIGNATURE_89A,
+            1,
+            1,
+            Some(&table),
+            0,
+            None,
+            &[solid_frame(1, 1, 0)],
+        );
+        // Header + logical screen + 2-entry global table.
+        let insertion = 6 + 7 + 6;
+        let mut spliced = file[..insertion].to_vec();
+        // Comment extension: label 0xFE, one sub-block, terminator.
+        spliced.extend_from_slice(&[0x21, 0xfe, 3, b'h', b'i', b'!', 0]);
+        // Application extension with an 11-byte identifier.
+        spliced.extend_from_slice(&[0x21, 0xff, 11]);
+        spliced.extend_from_slice(b"NETSCAPE2.0");
+        spliced.extend_from_slice(&[3, 1, 0, 0, 0]);
+        spliced.extend_from_slice(&file[insertion..]);
+        let image = decode(&spliced).expect("extensions should be skipped");
+        assert_eq!(image.get(0, 0), [255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn gif_fills_background_and_clips_frames() {
+        let table = [RED, GREEN, BLUE, WHITE];
+        let frame = GifFrameSpec {
+            left: 1,
+            top: 1,
+            width: 2,
+            height: 2,
+            indices: vec![0; 4],
+            interlace: false,
+            palette: None,
+            min_code_size: 2,
+        };
+        let file = build_gif(
+            GIF_SIGNATURE_89A,
+            4,
+            4,
+            Some(&table),
+            2, // blue background
+            None,
+            &[frame],
+        );
+        let image = decode(&file).expect("GIF with offset frame should decode");
+        assert_eq!(image.get(0, 0), [0, 0, 255, 255]);
+        assert_eq!(image.get(3, 3), [0, 0, 255, 255]);
+        assert_eq!(image.get(1, 1), [255, 0, 0, 255]);
+        assert_eq!(image.get(2, 2), [255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn gif_local_colour_table_overrides_global() {
+        let global = [RED, GREEN];
+        let local = vec![[0_u8, 255, 0], [255, 255, 255]];
+        let frame = GifFrameSpec {
+            left: 0,
+            top: 0,
+            width: 1,
+            height: 1,
+            indices: vec![0],
+            interlace: false,
+            palette: Some(local),
+            min_code_size: 2,
+        };
+        let file = build_gif(GIF_SIGNATURE_89A, 1, 1, Some(&global), 0, None, &[frame]);
+        let image = decode(&file).expect("local colour table should decode");
+        assert_eq!(image.get(0, 0), [0, 255, 0, 255]);
+    }
+
+    #[test]
+    fn gif_returns_first_frame_only() {
+        let table = [RED, GREEN];
+        let first = solid_frame(1, 1, 0);
+        let second = solid_frame(1, 1, 1);
+        let file = build_gif(
+            GIF_SIGNATURE_89A,
+            1,
+            1,
+            Some(&table),
+            0,
+            None,
+            &[first, second],
+        );
+        let image = decode(&file).expect("multi-frame GIF should decode its first frame");
+        assert_eq!(image.get(0, 0), [255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn rejects_malformed_gifs() {
+        let table = [RED, GREEN];
+        let valid = build_gif(
+            GIF_SIGNATURE_89A,
+            4,
+            4,
+            Some(&table),
+            0,
+            None,
+            &[solid_frame(4, 4, 0)],
+        );
+
+        // Truncated inside the frame data.
+        let mut truncated = valid.clone();
+        truncated.truncate(valid.len() * 3 / 5);
+        assert!(decode(&truncated).is_err());
+
+        // Bad signature: the file is no longer detected as a GIF.
+        let mut bad_signature = valid.clone();
+        bad_signature[4] = b'X';
+        let error = decode(&bad_signature).expect_err("bad GIF signature must be rejected");
+        assert!(error.message.contains("unrecognised"));
+
+        // Oversized logical screen.
+        let oversized = build_gif(
+            GIF_SIGNATURE_89A,
+            (MAX_DIMENSION + 1) as u16,
+            1,
+            Some(&table),
+            0,
+            None,
+            &[],
+        );
+        assert!(decode(&oversized).is_err());
+
+        // Zero-sized logical screen.
+        let zero = build_gif(GIF_SIGNATURE_89A, 0, 1, Some(&table), 0, None, &[]);
+        assert!(decode(&zero).is_err());
+
+        // No frame in the file.
+        let empty = build_gif(GIF_SIGNATURE_89A, 1, 1, Some(&table), 0, None, &[]);
+        assert!(decode(&empty).is_err());
+
+        // Frame without any colour table.
+        let no_table = build_gif(
+            GIF_SIGNATURE_89A,
+            1,
+            1,
+            None,
+            0,
+            None,
+            &[solid_frame(1, 1, 0)],
+        );
+        assert!(decode(&no_table).is_err());
+
+        // Frame with a zero dimension.
+        let zero_frame = build_gif(
+            GIF_SIGNATURE_89A,
+            1,
+            1,
+            Some(&table),
+            0,
+            None,
+            &[GifFrameSpec {
+                left: 0,
+                top: 0,
+                width: 0,
+                height: 1,
+                indices: vec![0],
+                interlace: false,
+                palette: None,
+                min_code_size: 2,
+            }],
+        );
+        assert!(decode(&zero_frame).is_err());
+    }
+
+    #[test]
+    fn gif_lzw_rejects_invalid_streams() {
+        assert!(gif_lzw_decode(&[], 2, 4).is_err());
+        assert!(gif_lzw_decode(&[0; 4], 9, 4).is_err());
+        assert!(gif_lzw_decode(&[0xff; 8], 2, 100).is_err());
+        // A clear code followed immediately by end-of-information has no pixels.
+        // min code size 2 => 3-bit codes: clear = 4 (0b100), EOI = 5 (0b101).
+        let clear_then_eoi = [0b0010_1100_u8];
+        assert!(gif_lzw_decode(&clear_then_eoi, 2, 4).is_err());
+    }
+
+    // ---------------------------------------------------------------------
+    // PNG bit-depth and Adam7 test helpers
+    // ---------------------------------------------------------------------
+
+    fn pack_samples(samples: &[u8], bit_depth: u8) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut byte = 0_u8;
+        let mut filled = 0_u32;
+        for &sample in samples {
+            byte = (byte << bit_depth) | (sample & ((1_u8 << bit_depth) - 1));
+            filled += u32::from(bit_depth);
+            if filled == 8 {
+                out.push(byte);
+                byte = 0;
+                filled = 0;
+            }
+        }
+        if filled > 0 {
+            out.push(byte << (8 - filled));
+        }
+        out
+    }
+
+    /// Builds unfiltered Adam7 scanlines from a per-pixel sample callback.
+    fn adam7_raw(
+        width: usize,
+        height: usize,
+        bit_depth: u8,
+        channels: usize,
+        pixel: &dyn Fn(usize, usize) -> Vec<u8>,
+        filter: &dyn Fn(usize, usize) -> u8,
+    ) -> Vec<u8> {
+        let bpp = png_filter_bpp(channels, bit_depth);
+        let mut raw = Vec::new();
+        for (pass_index, pass) in ADAM7_PASSES.iter().enumerate() {
+            let pass_width = pass_extent(width, pass.x_start, pass.x_step);
+            let pass_height = pass_extent(height, pass.y_start, pass.y_step);
+            if pass_width == 0 || pass_height == 0 {
+                continue;
+            }
+            let row_bytes = png_row_bytes(pass_width, channels, bit_depth).expect("pass row size");
+            let mut previous = vec![0_u8; row_bytes];
+            for row in 0..pass_height {
+                let mut samples = Vec::new();
+                for column in 0..pass_width {
+                    let x = pass.x_start + column * pass.x_step;
+                    let y = pass.y_start + row * pass.y_step;
+                    samples.extend_from_slice(&pixel(x, y));
+                }
+                let row_buffer = if bit_depth < 8 {
+                    pack_samples(&samples, bit_depth)
+                } else {
+                    samples
+                };
+                raw.extend_from_slice(&filter_row(
+                    filter(pass_index, row),
+                    &row_buffer,
+                    &previous,
+                    bpp,
+                ));
+                previous = row_buffer;
+            }
+        }
+        raw
+    }
+
+    #[test]
+    fn decodes_interlaced_rgba_png() {
+        let width = 9_usize;
+        let height = 9_usize;
+        let pixel = |x: usize, y: usize| {
+            vec![
+                (x * 23) as u8,
+                (y * 31) as u8,
+                ((x * 7 + y * 3) % 256) as u8,
+                if (x + y).is_multiple_of(3) { 128 } else { 255 },
+            ]
+        };
+        let raw = adam7_raw(width, height, 8, 4, &pixel, &|_, _| 0);
+        let file = png_with_raw_interlaced(width as u32, height as u32, 8, 6, &[], &raw);
+        let image = decode_png(&file).expect("interlaced RGBA PNG should decode");
+        for y in 0..height {
+            for x in 0..width {
+                let expected = pixel(x, y);
+                assert_eq!(
+                    image.get(x as u32, y as u32),
+                    [expected[0], expected[1], expected[2], expected[3]],
+                    "at {x},{y}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn decodes_interlaced_rgb_png() {
+        let width = 10_usize;
+        let height = 7_usize;
+        let pixel = |x: usize, y: usize| vec![(x * 11) as u8, (y * 17) as u8, (x + y) as u8];
+        let raw = adam7_raw(width, height, 8, 3, &pixel, &|_, _| 0);
+        let file = png_with_raw_interlaced(width as u32, height as u32, 8, 2, &[], &raw);
+        let image = decode_png(&file).expect("interlaced RGB PNG should decode");
+        for y in 0..height {
+            for x in 0..width {
+                let expected = pixel(x, y);
+                assert_eq!(
+                    image.get(x as u32, y as u32),
+                    [expected[0], expected[1], expected[2], 255],
+                    "at {x},{y}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn decodes_interlaced_grey_png() {
+        let width = 8_usize;
+        let height = 8_usize;
+        let pixel = |x: usize, y: usize| vec![((x * 19 + y * 29) % 256) as u8];
+        let raw = adam7_raw(width, height, 8, 1, &pixel, &|_, _| 0);
+        let file = png_with_raw_interlaced(width as u32, height as u32, 8, 0, &[], &raw);
+        let image = decode_png(&file).expect("interlaced grey PNG should decode");
+        for y in 0..height {
+            for x in 0..width {
+                let value = pixel(x, y)[0];
+                assert_eq!(image.get(x as u32, y as u32), [value, value, value, 255]);
+            }
+        }
+    }
+
+    #[test]
+    fn decodes_interlaced_palette_png() {
+        let palette: Vec<[u8; 3]> = vec![RED, GREEN, BLUE, WHITE];
+        let mut plte = Vec::new();
+        for entry in &palette {
+            plte.extend_from_slice(entry);
+        }
+        let width = 8_usize;
+        let height = 8_usize;
+        let pixel = |x: usize, y: usize| vec![((x + y) % 4) as u8];
+        let raw = adam7_raw(width, height, 8, 1, &pixel, &|_, _| 0);
+        let file = png_with_raw_interlaced(
+            width as u32,
+            height as u32,
+            8,
+            3,
+            &[(b"PLTE", &plte), (b"tRNS", &[0, 85, 170, 255])],
+            &raw,
+        );
+        let image = decode_png(&file).expect("interlaced palette PNG should decode");
+        let alphas = [0_u8, 85, 170, 255];
+        for y in 0..height {
+            for x in 0..width {
+                let index = (x + y) % 4;
+                let entry = palette[index];
+                assert_eq!(
+                    image.get(x as u32, y as u32),
+                    [entry[0], entry[1], entry[2], alphas[index]]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn decodes_interlaced_png_with_per_pass_filters() {
+        let width = 16_usize;
+        let height = 16_usize;
+        let pixel = |x: usize, y: usize| {
+            vec![
+                (x * 13) as u8,
+                (y * 11) as u8,
+                ((x * y) % 256) as u8,
+                (255 - ((x + y) % 64)) as u8,
+            ]
+        };
+        // Every pass uses its own sequence of filter types; filters must never
+        // see scanlines from another pass.
+        let raw = adam7_raw(width, height, 8, 4, &pixel, &|pass, row| {
+            ((pass + row) % 5) as u8
+        });
+        let file = png_with_raw_interlaced(width as u32, height as u32, 8, 6, &[], &raw);
+        let image = decode_png(&file).expect("filtered interlaced PNG should decode");
+        for y in 0..height {
+            for x in 0..width {
+                let expected = pixel(x, y);
+                assert_eq!(
+                    image.get(x as u32, y as u32),
+                    [expected[0], expected[1], expected[2], expected[3]],
+                    "at {x},{y}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn decodes_1_bit_grey_png() {
+        let samples = [0_u8, 1, 0, 1, 1, 0, 1, 0];
+        let row = pack_samples(&samples, 1);
+        let raw = [0_u8, row[0], 0, row[0]];
+        let file = png_with_raw(8, 2, 1, 0, &[], &raw);
+        let image = decode_png(&file).expect("1-bit grey PNG should decode");
+        for (x, &sample) in samples.iter().enumerate() {
+            let expected = if sample == 0 { 0 } else { 255 };
+            assert_eq!(image.get(x as u32, 0), [expected, expected, expected, 255]);
+            assert_eq!(image.get(x as u32, 1), [expected, expected, expected, 255]);
+        }
+    }
+
+    #[test]
+    fn decodes_2_bit_grey_png() {
+        let samples = [0_u8, 1, 2, 3];
+        let raw = [0_u8, pack_samples(&samples, 2)[0]];
+        let file = png_with_raw(4, 1, 2, 0, &[], &raw);
+        let image = decode_png(&file).expect("2-bit grey PNG should decode");
+        for (x, &sample) in samples.iter().enumerate() {
+            let value = sample * 85;
+            assert_eq!(image.get(x as u32, 0), [value, value, value, 255]);
+        }
+    }
+
+    #[test]
+    fn decodes_4_bit_grey_png() {
+        let samples = [0_u8, 1, 7, 15];
+        let packed = pack_samples(&samples, 4);
+        let raw = [0_u8, packed[0], packed[1]];
+        let file = png_with_raw(4, 1, 4, 0, &[], &raw);
+        let image = decode_png(&file).expect("4-bit grey PNG should decode");
+        for (x, &sample) in samples.iter().enumerate() {
+            let value = sample * 17;
+            assert_eq!(image.get(x as u32, 0), [value, value, value, 255]);
+        }
+    }
+
+    #[test]
+    fn decodes_sub_byte_grey_with_filters() {
+        let width = 4_usize;
+        let rows: [[u8; 4]; 4] = [[0, 1, 2, 3], [4, 5, 6, 7], [8, 9, 10, 11], [12, 13, 14, 15]];
+        let mut raw = Vec::new();
+        let mut previous = vec![0_u8; 2];
+        for (row_index, row) in rows.iter().enumerate() {
+            let packed = pack_samples(row, 4);
+            raw.extend_from_slice(&filter_row(row_index as u8 + 1, &packed, &previous, 1));
+            previous = packed;
+        }
+        let file = png_with_raw(width as u32, 4, 4, 0, &[], &raw);
+        let image = decode_png(&file).expect("filtered 4-bit grey PNG should decode");
+        for (y, row) in rows.iter().enumerate() {
+            for (x, &sample) in row.iter().enumerate() {
+                let value = sample * 17;
+                assert_eq!(
+                    image.get(x as u32, y as u32),
+                    [value, value, value, 255],
+                    "at {x},{y}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn decodes_1_bit_palette_with_transparency() {
+        let plte = [255_u8, 0, 0, 0, 255, 0];
+        let samples = [0_u8, 1, 0, 1, 0, 1, 0, 1];
+        let raw = [0_u8, pack_samples(&samples, 1)[0]];
+        let file = png_with_raw(8, 1, 1, 3, &[(b"PLTE", &plte), (b"tRNS", &[0, 255])], &raw);
+        let image = decode_png(&file).expect("1-bit palette PNG should decode");
+        assert_eq!(image.get(0, 0), [255, 0, 0, 0]);
+        assert_eq!(image.get(1, 0), [0, 255, 0, 255]);
+        assert_eq!(image.get(2, 0), [255, 0, 0, 0]);
+        assert_eq!(image.get(7, 0), [0, 255, 0, 255]);
+    }
+
+    #[test]
+    fn decodes_2_bit_palette_png() {
+        let plte = [RED, GREEN, BLUE, WHITE].concat();
+        let samples = [0_u8, 1, 2, 3];
+        let raw = [0_u8, pack_samples(&samples, 2)[0]];
+        let file = png_with_raw(4, 1, 2, 3, &[(b"PLTE", &plte)], &raw);
+        let image = decode_png(&file).expect("2-bit palette PNG should decode");
+        let table = [RED, GREEN, BLUE, WHITE];
+        for (x, entry) in table.iter().enumerate() {
+            assert_eq!(image.get(x as u32, 0), [entry[0], entry[1], entry[2], 255]);
+        }
+    }
+
+    #[test]
+    fn decodes_4_bit_palette_with_transparency() {
+        let plte = [RED, GREEN, BLUE, WHITE].concat();
+        let samples = [0_u8, 1, 2, 3];
+        let packed = pack_samples(&samples, 4);
+        let raw = [0_u8, packed[0], packed[1]];
+        let file = png_with_raw(
+            4,
+            1,
+            4,
+            3,
+            &[(b"PLTE", &plte), (b"tRNS", &[10, 20, 30, 40])],
+            &raw,
+        );
+        let image = decode_png(&file).expect("4-bit palette PNG should decode");
+        let alphas = [10_u8, 20, 30, 40];
+        let table = [RED, GREEN, BLUE, WHITE];
+        for (x, entry) in table.iter().enumerate() {
+            assert_eq!(
+                image.get(x as u32, 0),
+                [entry[0], entry[1], entry[2], alphas[x]]
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_bad_sub_byte_pngs() {
+        // Sub-byte palette index outside the table.
+        let plte = [RED, GREEN].concat();
+        let samples = [0_u8, 1, 3, 0];
+        let raw = [0_u8, pack_samples(&samples, 2)[0]];
+        let file = png_with_raw(4, 1, 2, 3, &[(b"PLTE", &plte)], &raw);
+        assert!(decode_png(&file).is_err());
+
+        // Too few decompressed bytes for a sub-byte row.
+        let short = png_with_raw(8, 1, 1, 0, &[], &[0]);
+        assert!(decode_png(&short).is_err());
+
+        // 16-bit palette data is not supported.
+        let deep = png_with_raw(1, 1, 16, 3, &[(b"PLTE", &[1, 2, 3])], &[0, 0, 0]);
+        assert!(decode_png(&deep).is_err());
+    }
+
+    #[test]
+    fn fuzz_mutated_gif_never_panics() {
+        let table = [RED, GREEN, BLUE, WHITE];
+        let order = gif_interlaced_rows(4);
+        let indices: Vec<u8> = order
+            .iter()
+            .flat_map(|&row| (0..4).map(move |x| ((row + x) % 4) as u8))
+            .collect();
+        let frame = GifFrameSpec {
+            left: 0,
+            top: 0,
+            width: 4,
+            height: 4,
+            indices,
+            interlace: true,
+            palette: None,
+            min_code_size: 2,
+        };
+        let base = build_gif(GIF_SIGNATURE_89A, 4, 4, Some(&table), 2, Some(3), &[frame]);
+        let mut state = 0x0bad_f00d_dead_beef_u64;
+        for _ in 0..400 {
+            let mut next = || {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                (state >> 33) as u8
+            };
+            let mut file = base.clone();
+            for _ in 0..4 {
+                let index = (next() as usize) % file.len();
+                file[index] ^= next();
+            }
+            let _ = decode(&file);
+            let cut = (next() as usize) % base.len();
+            let _ = decode(&base[..cut]);
+        }
+    }
+
+    #[test]
+    fn fuzz_mutated_interlaced_and_sub_byte_pngs_never_panic() {
+        let rgba = |x: usize, y: usize| vec![(x * 9) as u8, (y * 5) as u8, 0x40, 0xff];
+        let interlaced = png_with_raw_interlaced(
+            8,
+            8,
+            8,
+            6,
+            &[],
+            &adam7_raw(8, 8, 8, 4, &rgba, &|pass, row| ((pass + row) % 5) as u8),
+        );
+        let grey_samples: Vec<u8> = (0..16).map(|value| (value % 16) as u8).collect();
+        let sub_byte = png_with_raw(
+            16,
+            1,
+            4,
+            0,
+            &[],
+            &[
+                0,
+                pack_samples(&grey_samples, 4)[0],
+                pack_samples(&grey_samples, 4)[1],
+            ],
+        );
+
+        let mut state = 0x1234_abcd_9876_5432_u64;
+        for (iteration, base) in [interlaced, sub_byte].iter().enumerate() {
+            for _ in 0..300 {
+                let mut next = || {
+                    state = state
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1_442_695_040_888_963_407);
+                    (state >> 33) as u8
+                };
+                let mut file = base.clone();
+                for _ in 0..5 {
+                    let index = (next() as usize) % file.len();
+                    file[index] ^= next();
+                }
+                let _ = decode(&file);
+                let _ = decode_png(&file);
+                let cut = (next() as usize) % base.len();
+                let _ = decode(&base[..cut]);
+                if iteration == 0 {
+                    // Also repair the CRC occasionally so mutated IHDR/IDAT
+                    // bytes reach the deeper decode paths.
+                    let mut repaired = file.clone();
+                    if repaired.len() > 33 {
+                        let ihdr = &repaired[16..29];
+                        let crc_start = 29;
+                        let mut crc_input = Vec::new();
+                        crc_input.extend_from_slice(b"IHDR");
+                        crc_input.extend_from_slice(ihdr);
+                        repaired[crc_start..crc_start + 4]
+                            .copy_from_slice(&crc32(&crc_input).to_be_bytes());
+                    }
+                    let _ = decode_png(&repaired);
+                }
+            }
         }
     }
 }

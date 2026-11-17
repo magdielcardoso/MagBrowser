@@ -12,7 +12,7 @@ use crate::value::{ObjectId, Value};
 /// An interpreted (user written) function.
 pub(crate) struct UserFunction {
     pub(crate) name: String,
-    pub(crate) params: Vec<String>,
+    pub(crate) patterns: Vec<browser_js_parser::Pattern>,
     pub(crate) body: Vec<Stmt>,
     pub(crate) env: ScopeId,
     pub(crate) is_arrow: bool,
@@ -161,6 +161,30 @@ impl crate::Runtime {
         }
     }
 
+    /// Bind the parameter patterns of a call to the argument list, applying
+    /// default values and collecting rest parameters.
+    fn bind_parameters(
+        &mut self,
+        patterns: &[browser_js_parser::Pattern],
+        args: &[Value],
+    ) -> Result<(), JsError> {
+        for (index, pattern) in patterns.iter().enumerate() {
+            if let browser_js_parser::Pattern::Rest(target) = pattern {
+                let rest = args.get(index..).map(<[Value]>::to_vec).unwrap_or_default();
+                let mark = self.temp_roots.len();
+                let array = self.new_array(rest);
+                self.temp_roots.push(array.clone());
+                let result = self.bind_param_pattern(target, array);
+                self.temp_roots.truncate(mark);
+                result?;
+                return Ok(());
+            }
+            let value = args.get(index).cloned().unwrap_or(Value::Undefined);
+            self.bind_param_pattern(pattern, value)?;
+        }
+        Ok(())
+    }
+
     fn restore_function(&mut self, id: ObjectId, implementation: FunctionImpl) {
         if let Some(object) = self.object_mut(id)
             && let ObjectKind::Function(function) = &mut object.kind
@@ -207,13 +231,9 @@ impl crate::Runtime {
             };
             self.declare_binding(scope, "this", BindingKind::This, this, true);
         }
-        for (index, param) in function.params.iter().enumerate() {
-            let value = args.get(index).cloned().unwrap_or(Value::Undefined);
-            self.declare_binding(scope, param, BindingKind::Param, value, true);
-        }
-        let arguments = self.new_array(args);
+        let arguments = self.new_array(args.clone());
         self.declare_binding(scope, "arguments", BindingKind::Arguments, arguments, true);
-
+        self.bind_parameters(&function.patterns, &args)?;
         self.hoist_vars(&function.body);
         self.hoist_functions(&function.body, scope);
 

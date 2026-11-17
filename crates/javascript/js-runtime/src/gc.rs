@@ -66,6 +66,7 @@ impl crate::Runtime {
         values.push(Value::Object(self.prototypes.boolean));
         values.push(Value::Object(self.prototypes.error));
         values.push(Value::Object(self.prototypes.promise));
+        values.push(Value::Object(self.prototypes.regexp));
         values.push(self.completion_value.clone());
         values.extend(self.gc_roots.iter().cloned());
         values.extend(self.temp_roots.iter().cloned());
@@ -154,6 +155,7 @@ fn mark_object(
         ObjectKind::Promise(state) => {
             push_promise_values(state, values);
         }
+        ObjectKind::RegExp(_) => {}
     }
 }
 

@@ -47,7 +47,7 @@ pub(crate) fn collect_var_names(stmts: &[Stmt], out: &mut Vec<String>) {
             Stmt::VarDecl(declaration) => {
                 if declaration.kind == browser_js_parser::DeclKind::Var {
                     for declarator in &declaration.declarations {
-                        out.push(declarator.name.clone());
+                        declarator.pattern.bound_names(out);
                     }
                 }
             }
@@ -70,7 +70,7 @@ pub(crate) fn collect_var_names(stmts: &[Stmt], out: &mut Vec<String>) {
                     && declaration.kind == browser_js_parser::DeclKind::Var
                 {
                     for declarator in &declaration.declarations {
-                        out.push(declarator.name.clone());
+                        declarator.pattern.bound_names(out);
                     }
                 }
                 collect_var_names(std::slice::from_ref(body), out);

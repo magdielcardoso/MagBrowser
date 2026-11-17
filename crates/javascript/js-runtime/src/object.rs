@@ -36,6 +36,8 @@ pub(crate) enum ObjectKind {
     Function(crate::function::FunctionObject),
     /// A promise.
     Promise(Rc<RefCell<PromiseState>>),
+    /// A regular expression.
+    RegExp(Rc<browser_js_parser::Regex>),
 }
 
 /// A heap allocated object.
@@ -56,6 +58,7 @@ pub(crate) struct Prototypes {
     pub(crate) boolean: ObjectId,
     pub(crate) error: ObjectId,
     pub(crate) promise: ObjectId,
+    pub(crate) regexp: ObjectId,
 }
 
 impl crate::Runtime {
@@ -100,6 +103,33 @@ impl crate::Runtime {
     pub fn new_array(&mut self, items: Vec<Value>) -> Value {
         let prototype = self.prototypes.array;
         Value::Object(self.alloc_object(ObjectKind::Array(items), Some(prototype)))
+    }
+
+    /// Compile a regular expression and wrap it in a JavaScript object.
+    pub(crate) fn new_regexp_value(&mut self, source: &str, flags: &str) -> Result<Value, JsError> {
+        let regex = browser_js_parser::Regex::new(source, flags)
+            .map_err(|error| JsError::syntax_error(error.message))?;
+        let regex_flags = regex.flags();
+        let prototype = self.prototypes.regexp;
+        let id = self.alloc_object(ObjectKind::RegExp(Rc::new(regex)), Some(prototype));
+        self.define_data_property(id, "source", Value::String(source.to_owned()));
+        self.define_data_property(id, "flags", Value::String(regex_flags.as_string()));
+        self.define_data_property(id, "global", Value::Bool(regex_flags.global));
+        self.define_data_property(id, "ignoreCase", Value::Bool(regex_flags.ignore_case));
+        self.define_data_property(id, "multiline", Value::Bool(regex_flags.multiline));
+        self.define_data_property(id, "lastIndex", Value::Number(0.0));
+        Ok(Value::Object(id))
+    }
+
+    /// The compiled program behind a regular expression value.
+    pub(crate) fn regex_of(&self, value: &Value) -> Option<Rc<browser_js_parser::Regex>> {
+        let Value::Object(id) = value else {
+            return None;
+        };
+        match self.object(*id).map(|object| &object.kind) {
+            Some(ObjectKind::RegExp(regex)) => Some(Rc::clone(regex)),
+            _ => None,
+        }
     }
 
     /// Create an error-like object.
@@ -199,7 +229,7 @@ impl crate::Runtime {
                     ((key == "length" || key == "name") && !overridden)
                         || object.properties.iter().any(|(name, _)| name == key)
                 }
-                ObjectKind::Ordinary | ObjectKind::Promise(_) => {
+                ObjectKind::Ordinary | ObjectKind::Promise(_) | ObjectKind::RegExp(_) => {
                     object.properties.iter().any(|(name, _)| name == key)
                 }
             },
@@ -234,7 +264,7 @@ impl crate::Runtime {
                     }
                 }
             }
-            ObjectKind::Ordinary | ObjectKind::Promise(_) => {}
+            ObjectKind::Ordinary | ObjectKind::Promise(_) | ObjectKind::RegExp(_) => {}
         }
         object
             .properties

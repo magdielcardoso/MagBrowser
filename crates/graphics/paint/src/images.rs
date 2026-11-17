@@ -46,7 +46,7 @@ impl ImageData {
         })
     }
 
-    /// Decodes encoded image bytes (PNG or BMP) into RGBA8.
+    /// Decodes encoded image bytes (PNG, GIF or BMP) into RGBA8.
     ///
     /// See [`crate::decode`] for the supported formats.
     pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
