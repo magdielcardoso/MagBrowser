@@ -1,0 +1,622 @@
+//! Heap objects, properties, arrays and prototype chains.
+
+use std::cell::RefCell;
+use std::rc::Rc;
+
+use crate::errors::JsError;
+use crate::promise::PromiseState;
+use crate::value::{ObjectId, Value};
+
+/// A builtin function implemented as a stateless function pointer.
+pub(crate) type BuiltinFn = fn(&mut crate::Runtime, Value, Vec<Value>) -> Result<Value, JsError>;
+
+/// A host supplied function.
+pub type HostFunction =
+    Box<dyn FnMut(&mut crate::Runtime, Value, Vec<Value>) -> Result<Value, JsError>>;
+
+/// The value stored for an own property.
+#[derive(Clone)]
+pub(crate) enum PropertyData {
+    /// A data property holding a value.
+    Data(Value),
+    /// An accessor property with optional getter and setter functions.
+    Accessor {
+        getter: Option<Value>,
+        setter: Option<Value>,
+    },
+}
+
+/// The kind specific payload of a heap object.
+pub(crate) enum ObjectKind {
+    /// A plain object.
+    Ordinary,
+    /// An array backed by a dense vector of elements.
+    Array(Vec<Value>),
+    /// A callable object.
+    Function(crate::function::FunctionObject),
+    /// A promise.
+    Promise(Rc<RefCell<PromiseState>>),
+}
+
+/// A heap allocated object.
+pub(crate) struct Object {
+    pub(crate) kind: ObjectKind,
+    pub(crate) prototype: Option<ObjectId>,
+    pub(crate) properties: Vec<(String, PropertyData)>,
+    pub(crate) extensible: bool,
+}
+
+/// Well known prototype objects.
+pub(crate) struct Prototypes {
+    pub(crate) object: ObjectId,
+    pub(crate) array: ObjectId,
+    pub(crate) function: ObjectId,
+    pub(crate) string: ObjectId,
+    pub(crate) number: ObjectId,
+    pub(crate) boolean: ObjectId,
+    pub(crate) error: ObjectId,
+    pub(crate) promise: ObjectId,
+}
+
+impl crate::Runtime {
+    pub(crate) fn alloc_object(
+        &mut self,
+        kind: ObjectKind,
+        prototype: Option<ObjectId>,
+    ) -> ObjectId {
+        self.maybe_gc();
+        let object = Object {
+            kind,
+            prototype,
+            properties: Vec::new(),
+            extensible: true,
+        };
+        let id = if let Some(index) = self.heap_free.pop() {
+            self.heap[index] = Some(object);
+            index
+        } else {
+            self.heap.push(Some(object));
+            self.heap.len() - 1
+        };
+        self.allocations_since_gc += 1;
+        ObjectId(id)
+    }
+
+    pub(crate) fn object(&self, id: ObjectId) -> Option<&Object> {
+        self.heap.get(id.0).and_then(Option::as_ref)
+    }
+
+    pub(crate) fn object_mut(&mut self, id: ObjectId) -> Option<&mut Object> {
+        self.heap.get_mut(id.0).and_then(Option::as_mut)
+    }
+
+    /// Create a new plain object.
+    pub fn new_object(&mut self) -> Value {
+        let prototype = self.prototypes.object;
+        Value::Object(self.alloc_object(ObjectKind::Ordinary, Some(prototype)))
+    }
+
+    /// Create a new array with the given elements.
+    pub fn new_array(&mut self, items: Vec<Value>) -> Value {
+        let prototype = self.prototypes.array;
+        Value::Object(self.alloc_object(ObjectKind::Array(items), Some(prototype)))
+    }
+
+    /// Create an error-like object.
+    pub(crate) fn new_error_value(&mut self, name: &str, message: &str) -> Value {
+        let prototype = self.prototypes.error;
+        let object = self.alloc_object(ObjectKind::Ordinary, Some(prototype));
+        self.define_data_property(object, "name", Value::String(name.to_owned()));
+        self.define_data_property(object, "message", Value::String(message.to_owned()));
+        let stack: Vec<&str> = self.call_stack.iter().map(String::as_str).collect();
+        let stack = format!("{name}: {message}\n    at {}", stack.join("\n    at "));
+        self.define_data_property(object, "stack", Value::String(stack));
+        Value::Object(object)
+    }
+
+    /// Define (or overwrite) an own data property.
+    pub(crate) fn define_data_property(&mut self, object: ObjectId, name: &str, value: Value) {
+        self.set_own_property_data(object, name, PropertyData::Data(value));
+    }
+
+    fn set_own_property_data(&mut self, object: ObjectId, name: &str, data: PropertyData) {
+        if let Some(target) = self.object_mut(object) {
+            if let Some((_, existing)) = target.properties.iter_mut().find(|(key, _)| key == name) {
+                *existing = data;
+            } else {
+                target.properties.push((name.to_owned(), data));
+            }
+        }
+    }
+
+    /// Define (or overwrite) an own accessor property from function values.
+    pub(crate) fn define_accessor_property(
+        &mut self,
+        object: ObjectId,
+        name: &str,
+        getter: Option<Value>,
+        setter: Option<Value>,
+    ) {
+        self.set_own_property_data(object, name, PropertyData::Accessor { getter, setter });
+    }
+
+    /// Define a getter/setter pair backed by host functions.
+    ///
+    /// Reading the property calls `getter(runtime, receiver, vec![])`; assigning
+    /// calls `setter(runtime, receiver, vec![value])` and discards its result.
+    /// The receiver is the object the property was read from, which may be an
+    /// object that inherits the accessor from its prototype. Getters and setters
+    /// are traced by the garbage collector as part of the owning object, and a
+    /// later data property with the same name replaces the accessor.
+    pub fn define_accessor(
+        &mut self,
+        object: Value,
+        name: &str,
+        getter: HostFunction,
+        setter: HostFunction,
+    ) {
+        let Value::Object(id) = object else {
+            return;
+        };
+        let mark = self.temp_roots.len();
+        let getter = self.new_native_value(&format!("get {name}"), 0, getter);
+        self.temp_roots.push(getter.clone());
+        let setter = self.new_native_value(&format!("set {name}"), 1, setter);
+        self.temp_roots.truncate(mark);
+        self.define_accessor_property(id, name, Some(getter), Some(setter));
+    }
+
+    /// Define a builtin method on an object.
+    pub(crate) fn define_builtin_method(
+        &mut self,
+        object: ObjectId,
+        name: &str,
+        length: usize,
+        f: BuiltinFn,
+    ) {
+        let function = self.new_builtin_value(name, length, f);
+        self.define_data_property(object, name, function);
+    }
+
+    /// Define a method backed by a host closure on a value.
+    pub fn define_host_method(&mut self, object: Value, name: &str, f: HostFunction) {
+        if let Value::Object(id) = object {
+            let function = self.new_native_value(name, 0, f);
+            self.define_data_property(id, name, function);
+        }
+    }
+
+    pub(crate) fn has_own_property(&self, id: ObjectId, key: &str) -> bool {
+        match self.object(id) {
+            Some(object) => match &object.kind {
+                ObjectKind::Array(items) => {
+                    key == "length"
+                        || array_index(key).is_some_and(|index| index < items.len())
+                        || object.properties.iter().any(|(name, _)| name == key)
+                }
+                ObjectKind::Function(_) => {
+                    let overridden = object.properties.iter().any(|(name, _)| name == key);
+                    ((key == "length" || key == "name") && !overridden)
+                        || object.properties.iter().any(|(name, _)| name == key)
+                }
+                ObjectKind::Ordinary | ObjectKind::Promise(_) => {
+                    object.properties.iter().any(|(name, _)| name == key)
+                }
+            },
+            None => false,
+        }
+    }
+
+    /// Look up an own property descriptor, resolving the built-in array and
+    /// function data properties. Returns `None` when the object does not have
+    /// the property as an own property.
+    fn own_property_descriptor(&self, id: ObjectId, key: &str) -> Option<PropertyData> {
+        let object = self.object(id)?;
+        match &object.kind {
+            ObjectKind::Array(items) => {
+                if key == "length" {
+                    return Some(PropertyData::Data(Value::Number(items.len() as f64)));
+                }
+                if let Some(index) = array_index(key) {
+                    return Some(PropertyData::Data(
+                        items.get(index).cloned().unwrap_or(Value::Undefined),
+                    ));
+                }
+            }
+            ObjectKind::Function(function) => {
+                let overridden = object.properties.iter().any(|(name, _)| name == key);
+                if !overridden {
+                    if key == "length" {
+                        return Some(PropertyData::Data(Value::Number(function.length as f64)));
+                    }
+                    if key == "name" {
+                        return Some(PropertyData::Data(Value::String(function.name.clone())));
+                    }
+                }
+            }
+            ObjectKind::Ordinary | ObjectKind::Promise(_) => {}
+        }
+        object
+            .properties
+            .iter()
+            .find(|(name, _)| name == key)
+            .map(|(_, data)| data.clone())
+    }
+
+    /// Read an own data property. Accessor properties yield `None`.
+    pub(crate) fn get_own_property(&self, id: ObjectId, key: &str) -> Option<Value> {
+        match self.own_property_descriptor(id, key)? {
+            PropertyData::Data(value) => Some(value),
+            PropertyData::Accessor { .. } => None,
+        }
+    }
+
+    /// Read a property starting at `start`, invoking getters with `receiver`.
+    pub(crate) fn lookup_property(
+        &mut self,
+        receiver: &Value,
+        start: ObjectId,
+        key: &str,
+    ) -> Result<Option<Value>, JsError> {
+        let mut current = Some(start);
+        while let Some(id) = current {
+            if let Some(descriptor) = self.own_property_descriptor(id, key) {
+                return match descriptor {
+                    PropertyData::Data(value) => Ok(Some(value)),
+                    PropertyData::Accessor { getter, .. } => {
+                        let Some(getter) = getter else {
+                            return Ok(Some(Value::Undefined));
+                        };
+                        if !self.is_callable(&getter) {
+                            return Ok(Some(Value::Undefined));
+                        }
+                        Ok(Some(self.call_function(
+                            &getter,
+                            receiver.clone(),
+                            Vec::new(),
+                        )?))
+                    }
+                };
+            }
+            current = self.object(id).and_then(|object| object.prototype);
+        }
+        Ok(None)
+    }
+
+    /// Read a property, raising `TypeError` for null or undefined receivers.
+    pub(crate) fn get_property_checked(
+        &mut self,
+        value: &Value,
+        key: &str,
+    ) -> Result<Value, JsError> {
+        match value {
+            Value::Undefined | Value::Null => Err(JsError::type_error(format!(
+                "cannot read property '{key}' of {}",
+                value.to_string_value()
+            ))),
+            Value::String(text) => {
+                if key == "length" {
+                    return Ok(Value::Number(text.chars().count() as f64));
+                }
+                if let Some(index) = array_index(key) {
+                    return Ok(match text.chars().nth(index) {
+                        Some(ch) => Value::String(ch.to_string()),
+                        None => Value::Undefined,
+                    });
+                }
+                let receiver = Value::String(text.clone());
+                Ok(self
+                    .lookup_property(&receiver, self.prototypes.string, key)?
+                    .unwrap_or(Value::Undefined))
+            }
+            Value::Number(_) => Ok(self
+                .lookup_property(value, self.prototypes.number, key)?
+                .unwrap_or(Value::Undefined)),
+            Value::Bool(_) => Ok(self
+                .lookup_property(value, self.prototypes.boolean, key)?
+                .unwrap_or(Value::Undefined)),
+            Value::Object(id) => Ok(self
+                .lookup_property(value, *id, key)?
+                .unwrap_or(Value::Undefined)),
+        }
+    }
+
+    /// Read a property. Missing properties and invalid receivers yield `undefined`.
+    pub fn get_property(&mut self, object: &Value, key: &str) -> Value {
+        self.get_property_checked(object, key)
+            .unwrap_or(Value::Undefined)
+    }
+
+    /// Write a property, raising `TypeError` for null or undefined receivers.
+    pub(crate) fn set_property_checked(
+        &mut self,
+        value: &Value,
+        key: &str,
+        new_value: Value,
+    ) -> Result<(), JsError> {
+        let Value::Object(id) = value else {
+            if matches!(value, Value::Undefined | Value::Null) {
+                return Err(JsError::type_error(format!(
+                    "cannot set property '{key}' of {}",
+                    value.to_string_value()
+                )));
+            }
+            // Assignments to primitive properties are silently ignored in sloppy mode.
+            return Ok(());
+        };
+        let id = *id;
+        let is_array = self
+            .object(id)
+            .is_some_and(|object| matches!(&object.kind, ObjectKind::Array(_)));
+        if is_array {
+            if key == "length" {
+                let length = new_value.to_number();
+                if length.is_nan() || length < 0.0 || length.fract() != 0.0 {
+                    return Err(JsError::range_error("invalid array length"));
+                }
+                let length = length as usize;
+                if let Some(Object {
+                    kind: ObjectKind::Array(items),
+                    ..
+                }) = self.object_mut(id)
+                {
+                    items.resize(length, Value::Undefined);
+                }
+                return Ok(());
+            }
+            if let Some(index) = array_index(key) {
+                if let Some(Object {
+                    kind: ObjectKind::Array(items),
+                    ..
+                }) = self.object_mut(id)
+                {
+                    if index >= items.len() {
+                        items.resize(index + 1, Value::Undefined);
+                    }
+                    items[index] = new_value;
+                }
+                return Ok(());
+            }
+        }
+        // Walk the prototype chain looking for an accessor. The setter runs
+        // with the original receiver as `this`, not the prototype.
+        let mut current = Some(id);
+        'chain: while let Some(cursor) = current {
+            let accessor = match self
+                .object(cursor)
+                .and_then(|object| object.properties.iter().find(|(name, _)| name == key))
+            {
+                Some((_, PropertyData::Accessor { setter, .. })) => Some(setter.clone()),
+                // A data property (own or inherited) is shadowed by a new own
+                // data property on the receiver.
+                Some((_, PropertyData::Data(_))) => break 'chain,
+                None => None,
+            };
+            if let Some(setter) = accessor {
+                let Some(setter) = setter else {
+                    // Accessor without a setter: ignore the write (sloppy mode).
+                    return Ok(());
+                };
+                if !self.is_callable(&setter) {
+                    return Ok(());
+                }
+                self.call_function(&setter, Value::Object(id), vec![new_value])?;
+                return Ok(());
+            }
+            current = self.object(cursor).and_then(|object| object.prototype);
+        }
+        let extensible = self.object(id).is_some_and(|object| object.extensible);
+        let exists = self.has_own_property(id, key);
+        if !extensible && !exists {
+            return Ok(());
+        }
+        self.define_data_property(id, key, new_value);
+        Ok(())
+    }
+
+    /// Write a property, ignoring type errors.
+    pub fn set_property(&mut self, object: Value, key: &str, value: Value) {
+        let _ = self.set_property_checked(&object, key, value);
+    }
+
+    /// Delete an own property. Returns whether the delete succeeded.
+    ///
+    /// Deleting an accessor removes the whole getter/setter pair (property
+    /// attributes are not modelled); deleting an array index leaves a hole
+    /// filled with `undefined` and deleting `length` fails.
+    pub fn delete_property(&mut self, object: Value, key: &str) -> bool {
+        let Value::Object(id) = object else {
+            return true;
+        };
+        let is_array = self
+            .object(id)
+            .is_some_and(|object| matches!(&object.kind, ObjectKind::Array(_)));
+        if is_array {
+            if key == "length" {
+                return false;
+            }
+            if let Some(index) = array_index(key)
+                && let Some(Object {
+                    kind: ObjectKind::Array(items),
+                    ..
+                }) = self.object_mut(id)
+                && index < items.len()
+            {
+                items[index] = Value::Undefined;
+            }
+        }
+        if let Some(object) = self.object_mut(id)
+            && let Some(index) = object.properties.iter().position(|(name, _)| name == key)
+        {
+            object.properties.remove(index);
+        }
+        true
+    }
+
+    /// Enumerable own property keys, array indices first.
+    ///
+    /// Accessor property names are included: attributes are not modelled, so
+    /// every own property is treated as enumerable.
+    pub fn object_keys(&mut self, object: &Value) -> Vec<String> {
+        let Value::Object(id) = object else {
+            return Vec::new();
+        };
+        let Some(heap_object) = self.object(*id) else {
+            return Vec::new();
+        };
+        let mut keys = Vec::new();
+        if let ObjectKind::Array(items) = &heap_object.kind {
+            for index in 0..items.len() {
+                keys.push(index.to_string());
+            }
+        }
+        for (name, _) in &heap_object.properties {
+            if !keys.iter().any(|existing| existing == name) {
+                keys.push(name.clone());
+            }
+        }
+        keys
+    }
+
+    /// Whether a key exists on the object or its prototype chain.
+    pub fn object_has(&mut self, object: &Value, key: &str) -> bool {
+        let Value::Object(id) = object else {
+            return false;
+        };
+        let mut current = Some(*id);
+        while let Some(id) = current {
+            if self.has_own_property(id, key) {
+                return true;
+            }
+            current = self.object(id).and_then(|object| object.prototype);
+        }
+        false
+    }
+
+    /// Whether a value is an array.
+    pub fn object_is_array(&mut self, object: &Value) -> bool {
+        match object {
+            Value::Object(id) => self
+                .object(*id)
+                .is_some_and(|object| matches!(&object.kind, ObjectKind::Array(_))),
+            _ => false,
+        }
+    }
+
+    /// Snapshot the elements of an array.
+    pub fn object_array_items(&mut self, object: &Value) -> Option<Vec<Value>> {
+        let Value::Object(id) = object else {
+            return None;
+        };
+        match self.object(*id).map(|object| &object.kind) {
+            Some(ObjectKind::Array(items)) => Some(items.clone()),
+            _ => None,
+        }
+    }
+
+    /// Replace the elements of an array.
+    pub(crate) fn set_array_items(&mut self, value: &Value, items: Vec<Value>) {
+        if let Value::Object(id) = value
+            && let Some(Object {
+                kind: ObjectKind::Array(existing),
+                ..
+            }) = self.object_mut(*id)
+        {
+            *existing = items;
+        }
+    }
+
+    /// The prototype object of a value, when it has one.
+    pub(crate) fn prototype_of(&self, value: &Value) -> Option<ObjectId> {
+        match value {
+            Value::Object(id) => self.object(*id).and_then(|object| object.prototype),
+            Value::String(_) => Some(self.prototypes.string),
+            Value::Number(_) => Some(self.prototypes.number),
+            Value::Bool(_) => Some(self.prototypes.boolean),
+            Value::Undefined | Value::Null => None,
+        }
+    }
+
+    /// Create an array prototype-less object shell used during bootstrap.
+    pub(crate) fn bootstrap_object(&mut self, prototype: Option<ObjectId>) -> ObjectId {
+        self.alloc_object(ObjectKind::Ordinary, prototype)
+    }
+}
+
+/// Parse a canonical array index. Returns `None` for non-index keys.
+pub(crate) fn array_index(key: &str) -> Option<usize> {
+    if key.is_empty() || !key.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    if key.len() > 1 && key.starts_with('0') {
+        return None;
+    }
+    key.parse::<usize>().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn array_index_recognises_canonical_indices() {
+        assert_eq!(array_index("0"), Some(0));
+        assert_eq!(array_index("12"), Some(12));
+        assert_eq!(array_index("01"), None);
+        assert_eq!(array_index("-1"), None);
+        assert_eq!(array_index("length"), None);
+        assert_eq!(array_index("1.5"), None);
+    }
+
+    #[test]
+    fn arrays_grow_and_truncate_with_length() {
+        let mut runtime = crate::Runtime::new();
+        let array = runtime.new_array(vec![Value::Number(1.0)]);
+        runtime.set_property(array.clone(), "3", Value::Number(4.0));
+        assert_eq!(runtime.get_property(&array, "length"), Value::Number(4.0));
+        assert_eq!(runtime.get_property(&array, "2"), Value::Undefined);
+        runtime.set_property(array.clone(), "length", Value::Number(1.0));
+        assert_eq!(runtime.get_property(&array, "length"), Value::Number(1.0));
+    }
+
+    #[test]
+    fn reading_property_of_undefined_errors_internally() {
+        let mut runtime = crate::Runtime::new();
+        assert!(
+            runtime
+                .get_property_checked(&Value::Undefined, "x")
+                .is_err()
+        );
+        assert_eq!(
+            runtime.get_property(&Value::Undefined, "x"),
+            Value::Undefined
+        );
+    }
+
+    #[test]
+    fn prototype_chain_lookup() {
+        let mut runtime = crate::Runtime::new();
+        let child = runtime.new_object();
+        let parent = runtime.new_object();
+        runtime.set_property(parent.clone(), "inherited", Value::Number(7.0));
+        if let (Value::Object(child_id), Value::Object(parent_id)) = (&child, &parent) {
+            runtime.object_mut(*child_id).expect("child").prototype = Some(*parent_id);
+        }
+        assert_eq!(
+            runtime.get_property(&child, "inherited"),
+            Value::Number(7.0)
+        );
+        assert!(runtime.object_has(&child, "inherited"));
+    }
+
+    #[test]
+    fn string_length_and_indexing() {
+        let mut runtime = crate::Runtime::new();
+        let value = Value::String("abc".to_owned());
+        assert_eq!(runtime.get_property(&value, "length"), Value::Number(3.0));
+        assert_eq!(
+            runtime.get_property(&value, "1"),
+            Value::String("b".to_owned())
+        );
+    }
+}
