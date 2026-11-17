@@ -1,0 +1,12 @@
+[package]
+name = "browser-event-loop"
+description = "Task and microtask queues with a cooperative scheduler"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
