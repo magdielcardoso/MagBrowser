@@ -32,20 +32,19 @@ pub fn parse_with_base(input: &str, base: &Url) -> Result<Url, UrlError> {
         return parse_absolute(base.scheme(), rest, base.is_special());
     }
 
-    if cleaned.is_empty() {
-        let mut url = base.clone();
-        url.set_fragment(None);
-        return Ok(url);
-    }
+    let (before_fragment, fragment) = match cleaned.find('#') {
+        Some(i) => (&cleaned[..i], Some(cleaned[i + 1..].to_string())),
+        None => (cleaned.as_str(), None),
+    };
 
-    if let Some(frag) = cleaned.strip_prefix('#') {
+    if before_fragment.is_empty() {
         let mut url = base.clone();
-        url.set_fragment(Some(encode_query(frag)));
+        url.set_fragment(fragment.map(|f| encode_query(&f)));
         return Ok(url);
     }
 
     // Path (and possibly query) relative reference.
-    let (path_part, query) = split_query(&cleaned);
+    let (path_part, query) = split_query(before_fragment);
     let mut segments: Vec<String> = Vec::new();
     let absolute_path = path_part.starts_with('/');
 
@@ -62,7 +61,10 @@ pub fn parse_with_base(input: &str, base: &Url) -> Result<Url, UrlError> {
         );
     }
 
-    let mut raw: Vec<String> = path_part.split('/').map(ToOwned::to_owned).collect();
+    let mut raw: Vec<String> = path_part
+        .split('/')
+        .map(|s| percent_encode(s, keep_path_byte))
+        .collect();
     if raw.first().is_some_and(String::is_empty) {
         raw.remove(0);
     }
@@ -71,8 +73,8 @@ pub fn parse_with_base(input: &str, base: &Url) -> Result<Url, UrlError> {
 
     let mut url = base.clone();
     url.set_path(path);
-    url.set_query(query.map(|q| encode_query(&q)));
-    url.set_fragment(None);
+    url.set_query(query.map(encode_query));
+    url.set_fragment(fragment.map(|f| encode_query(&f)));
     Ok(url)
 }
 
