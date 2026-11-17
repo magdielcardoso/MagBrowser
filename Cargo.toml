@@ -72,6 +72,7 @@ browser-text = { path = "crates/layout/text" }
 browser-layout = { path = "crates/layout/layout" }
 browser-paint = { path = "crates/graphics/paint" }
 browser-compositor = { path = "crates/graphics/compositor" }
+browser-gpu = { path = "crates/graphics/gpu" }
 browser-js-parser = { path = "crates/javascript/js-parser" }
 browser-js = { path = "crates/javascript/js-runtime" }
 browser-event-loop = { path = "crates/web/event-loop" }
@@ -89,6 +90,12 @@ rustls = { version = "0.23", default-features = false, features = [
 ] }
 webpki-roots = "0.26"
 rustls-pki-types = "1"
+
+# Native window feature (`mag-browser --features window`). Optional, so the
+# default workspace build stays GPU-free and headless.
+winit = "0.30.13"
+wgpu = "30.0.2"
+pollster = "1.0"
 
 [profile.release]
 opt-level = 3

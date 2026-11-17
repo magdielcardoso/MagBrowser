@@ -8,10 +8,22 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[features]
+default = []
+# Native desktop window: winit event loop + wgpu texture presentation.
+window = ["dep:winit", "browser-gpu/wgpu-backend"]
+
 [dependencies]
 browser-core = { workspace = true }
+browser-css = { workspace = true }
 browser-dom = { workspace = true }
+browser-gpu = { workspace = true }
+browser-layout = { workspace = true }
+browser-paint = { workspace = true }
 browser-selectors = { workspace = true }
+browser-style = { workspace = true }
+browser-text = { workspace = true }
+winit = { workspace = true, optional = true }
 
 [lints]
 workspace = true
