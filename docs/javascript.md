@@ -19,11 +19,14 @@ classic `for`, `for…in`, `for…of`, `switch`, `break`/`continue` (with labels
 function declarations/expressions.
 
 Expressions: numbers (decimal, hex, binary, octal, exponent), strings with
-escapes, template literals with `${}` interpolation, booleans, `null`,
-`undefined`, array and object literals (shorthand properties), member access,
-calls, `new`, unary `+ - ! ~ typeof void delete`, binary arithmetic and
-comparison, `**`, `&&`, `||`, `??`, ternary, comma, assignment and compound
-assignment, `++`/`--`, optional chaining is **not** supported.
+escapes, template literals with `${}` interpolation, regular expression literals,
+booleans, `null`, `undefined`, array and object literals (shorthand properties),
+member access, calls, `new`, unary `+ - ! ~ typeof void delete`, binary
+arithmetic/comparison, bit shifts (`<<`, `>>`, `>>>`) with 32-bit semantics,
+`**`, `&&`, `||`, `??`, ternary, comma, assignment and compound assignment,
+`++`/`--`. Destructuring (array/object, nested, defaults, rest, holes) works in
+declarations, parameters and assignment expressions; functions support default
+and rest parameters. Optional chaining is **not** supported.
 
 Semantics: block-scoped `let`/`const` with temporal dead zone, function-scoped
 `var`, hoisting of `var` and function declarations, closures, recursion with a
@@ -39,10 +42,16 @@ map/forEach/filter/reduce`), `String.prototype` (`charAt/charCodeAt/indexOf/
 slice/substring/toUpperCase/toLowerCase/split/trim/replace/includes/startsWith/
 endsWith`), `Array.isArray`, `Promise` with `then`/`catch`, `resolve`, `reject`.
 
-Not supported (documented limitations): regular expression literals, bit shifts,
-destructuring, rest/spread, classes, generators, `async`/`await`, getters and
-setters in object literals, computed keys, default parameters, `eval`, `with`.
-There is no `finally` on promises and no thenable assimilation.
+Regular expressions are compiled to a small backtracking bytecode VM (literals,
+`.`, `\d \w \s`, classes and ranges, `* + ? {n,m}`, lazy quantifiers, anchors,
+alternation, capturing and non-capturing groups, `\b`, escapes; flags `g i m s`)
+and exposed through `RegExp`, `test`, `exec`, `String.prototype.match/split/
+replace` (including `$1`…`$9`, `$&`).
+
+Not supported (documented limitations): classes, generators, `async`/`await`,
+getters/setters inside object literals, computed keys, object/array spread,
+`for`-head destructuring, regex backreferences and lookaround, `u`/`y` flags,
+`eval`, `with`. Promises have no `finally` or thenable assimilation.
 
 ## Object model
 

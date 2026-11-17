@@ -68,8 +68,10 @@ with documented gaps, **planned** = designed but not implemented.
 
 - Lexer, parser, AST, interpreter, values, operators, scopes, closures, objects,
   arrays, prototypes, exceptions, mark-and-sweep GC, microtasks and promises.
+- Regex literals with a backtracking engine, bit shifts (`<< >> >>>`),
+  destructuring with defaults/rest and default/rest parameters.
 - **Not done:** classes, generators, async/await, getters/setters in literals,
-  `eval`; regex literals, bit shifts and destructuring are being added.
+  object spread, `for`-head destructuring, `eval`.
 
 ## Phase 7 — DOM + JavaScript — done
 
