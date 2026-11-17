@@ -1,0 +1,101 @@
+[workspace]
+resolver = "3"
+members = [
+    "apps/browser",
+    "apps/browser-cli",
+    "apps/browser-headless",
+    "crates/network/url",
+    "crates/network/http",
+    "crates/network/resource-loader",
+    "crates/html/dom",
+    "crates/html/html-parser",
+    "crates/html/selectors",
+    "crates/css/css-parser",
+    "crates/css/style",
+    "crates/layout/text",
+    "crates/layout/layout",
+    "crates/graphics/paint",
+    "crates/graphics/compositor",
+    "crates/graphics/gpu",
+    "crates/javascript/js-parser",
+    "crates/javascript/js-runtime",
+    "crates/web/event-loop",
+    "crates/web/web-apis",
+    "crates/web/navigation",
+    "crates/platform/platform",
+    "crates/platform/security",
+    "crates/platform/ipc",
+    "crates/platform/browser-core",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+license = "MIT OR Apache-2.0"
+repository = "https://example.invalid/rust-browser"
+authors = ["Rust Browser Team"]
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_docs = "allow"
+unused_crate_dependencies = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "allow", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+cast_precision_loss = "allow"
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_possible_wrap = "allow"
+too_many_lines = "allow"
+struct_excessive_bools = "allow"
+similar_names = "allow"
+unreadable_literal = "allow"
+many_single_char_names = "allow"
+
+[workspace.dependencies]
+browser-url = { path = "crates/network/url" }
+browser-http = { path = "crates/network/http" }
+browser-resource-loader = { path = "crates/network/resource-loader" }
+browser-dom = { path = "crates/html/dom" }
+browser-html-parser = { path = "crates/html/html-parser" }
+browser-selectors = { path = "crates/html/selectors" }
+browser-css = { path = "crates/css/css-parser" }
+browser-style = { path = "crates/css/style" }
+browser-text = { path = "crates/layout/text" }
+browser-layout = { path = "crates/layout/layout" }
+browser-paint = { path = "crates/graphics/paint" }
+browser-compositor = { path = "crates/graphics/compositor" }
+browser-gpu = { path = "crates/graphics/gpu" }
+browser-js-parser = { path = "crates/javascript/js-parser" }
+browser-js = { path = "crates/javascript/js-runtime" }
+browser-event-loop = { path = "crates/web/event-loop" }
+browser-web-apis = { path = "crates/web/web-apis" }
+browser-navigation = { path = "crates/web/navigation" }
+browser-platform = { path = "crates/platform/platform" }
+browser-security = { path = "crates/platform/security" }
+browser-ipc = { path = "crates/platform/ipc" }
+browser-core = { path = "crates/platform/browser-core" }
+
+# External dependencies. Transport and TLS only; no browser engine is used.
+rustls = { version = "0.23", default-features = false, features = [
+    "std",
+    "ring",
+    "tls12",
+    "logging",
+] }
+webpki-roots = "0.26"
+rustls-pki-types = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
+[profile.dev]
+opt-level = 1

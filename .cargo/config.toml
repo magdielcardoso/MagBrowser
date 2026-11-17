@@ -1,0 +1,6 @@
+[build]
+# Keep build artifacts inside the workspace-independent target dir for CI parity.
+incremental = true
+
+[alias]
+xtask = "run --package browser-cli --"
