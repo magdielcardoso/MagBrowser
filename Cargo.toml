@@ -26,6 +26,7 @@ members = [
     "crates/platform/security",
     "crates/platform/ipc",
     "crates/platform/browser-core",
+    "tests/integration",
 ]
 
 [workspace.package]
@@ -76,9 +77,7 @@ browser-js = { path = "crates/javascript/js-runtime" }
 browser-event-loop = { path = "crates/web/event-loop" }
 browser-web-apis = { path = "crates/web/web-apis" }
 browser-navigation = { path = "crates/web/navigation" }
-browser-platform = { path = "crates/platform/platform" }
 browser-security = { path = "crates/platform/security" }
-browser-ipc = { path = "crates/platform/ipc" }
 browser-core = { path = "crates/platform/browser-core" }
 
 # External dependencies. Transport and TLS only; no browser engine is used.

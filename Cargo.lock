@@ -7,14 +7,21 @@ name = "browser-cli"
 version = "0.1.0"
 dependencies = [
  "browser-core",
+ "browser-dom",
+ "browser-html-parser",
+ "browser-layout",
+ "browser-selectors",
+ "browser-style",
+ "browser-url",
 ]
 
 [[package]]
 name = "browser-compositor"
 version = "0.1.0"
 dependencies = [
+ "browser-dom",
  "browser-layout",
- "browser-paint",
+ "browser-style",
 ]
 
 [[package]]
@@ -27,13 +34,11 @@ dependencies = [
  "browser-event-loop",
  "browser-html-parser",
  "browser-http",
- "browser-ipc",
  "browser-js",
  "browser-js-parser",
  "browser-layout",
  "browser-navigation",
  "browser-paint",
- "browser-platform",
  "browser-resource-loader",
  "browser-security",
  "browser-selectors",
@@ -59,7 +64,8 @@ version = "0.1.0"
 name = "browser-gpu"
 version = "0.1.0"
 dependencies = [
- "browser-compositor",
+ "browser-css",
+ "browser-layout",
  "browser-paint",
 ]
 
@@ -123,6 +129,7 @@ dependencies = [
 name = "browser-paint"
 version = "0.1.0"
 dependencies = [
+ "browser-css",
  "browser-dom",
  "browser-layout",
  "browser-style",
@@ -177,8 +184,9 @@ name = "browser-web-apis"
 version = "0.1.0"
 dependencies = [
  "browser-dom",
- "browser-event-loop",
+ "browser-html-parser",
  "browser-js",
+ "browser-selectors",
  "browser-url",
 ]
 
@@ -232,6 +240,21 @@ name = "mag-browser"
 version = "0.1.0"
 dependencies = [
  "browser-core",
+ "browser-dom",
+ "browser-selectors",
+]
+
+[[package]]
+name = "mag-integration-tests"
+version = "0.1.0"
+dependencies = [
+ "browser-core",
+ "browser-css",
+ "browser-dom",
+ "browser-http",
+ "browser-layout",
+ "browser-paint",
+ "browser-url",
 ]
 
 [[package]]
