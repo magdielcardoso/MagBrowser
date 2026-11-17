@@ -1,0 +1,17 @@
+[package]
+name = "browser-layout"
+description = "Layout tree and block/inline formatting"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+browser-dom = { workspace = true }
+browser-style = { workspace = true }
+browser-text = { workspace = true }
+
+[lints]
+workspace = true
