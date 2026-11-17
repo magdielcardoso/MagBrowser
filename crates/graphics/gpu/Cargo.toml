@@ -8,10 +8,18 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[features]
+# Native `wgpu` presentation backend. Off by default so the workspace stays
+# GPU-free; `mag-browser --features window` turns it on.
+wgpu-backend = ["dep:wgpu", "dep:pollster"]
+
 [dependencies]
 browser-layout = { workspace = true }
 browser-css = { workspace = true }
 browser-paint = { workspace = true }
+browser-text = { workspace = true }
+wgpu = { workspace = true, optional = true }
+pollster = { workspace = true, optional = true }
 
 [lints]
 workspace = true
