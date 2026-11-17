@@ -1,0 +1,17 @@
+[package]
+name = "browser-style"
+description = "Cascade, inheritance, computed values and CSS variables"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+browser-css = { workspace = true }
+browser-dom = { workspace = true }
+browser-selectors = { workspace = true }
+
+[lints]
+workspace = true
