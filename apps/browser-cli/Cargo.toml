@@ -1,0 +1,21 @@
+[package]
+name = "browser-cli"
+description = "Developer CLI: fetch, inspect DOM, style, layout and render"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+browser-core = { workspace = true }
+browser-dom = { workspace = true }
+browser-html-parser = { workspace = true }
+browser-layout = { workspace = true }
+browser-selectors = { workspace = true }
+browser-style = { workspace = true }
+browser-url = { workspace = true }
+
+[lints]
+workspace = true
