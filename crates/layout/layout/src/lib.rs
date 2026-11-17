@@ -38,6 +38,7 @@ pub mod grid;
 pub mod inline;
 pub mod position;
 pub mod scroll;
+pub mod table;
 pub mod tree;
 
 pub use box_model::{Edges, Rect, collapse_margins};

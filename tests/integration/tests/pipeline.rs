@@ -288,3 +288,35 @@ fn location_assignment_navigates_to_another_document() {
     assert!(browser.snapshot().text.contains("second"));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn tables_lay_cells_out_in_columns() {
+    let mut browser = browser();
+    let snapshot = browser.load_html(&fixture("table.html"), None).unwrap();
+    assert!(snapshot.node_count > 10);
+
+    let page = browser.page();
+    let document = page.document.borrow();
+    let cells = document.get_elements_by_tag_name("td");
+    drop(document);
+    assert!(cells.len() >= 6);
+
+    let first = page.layout.find_node(cells[0]).unwrap().rect;
+    let second = page.layout.find_node(cells[1]).unwrap().rect;
+    let third = page.layout.find_node(cells[2]).unwrap().rect;
+    assert_eq!(first.y, second.y, "cells of one row share a line");
+    assert!(second.x >= first.right());
+    assert!(third.x >= second.right());
+    let body_right = {
+        let document = page.document.borrow();
+        let body = document.head_and_body().1.unwrap();
+        drop(document);
+        page.layout.find_node(body).unwrap().content.right()
+    };
+    assert!(
+        (third.right() - body_right).abs() < 8.0,
+        "table fills the body: {} vs {}",
+        third.right(),
+        body_right
+    );
+}

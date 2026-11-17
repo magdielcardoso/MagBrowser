@@ -51,9 +51,10 @@ with documented gaps, **planned** = designed but not implemented.
 - Dependency-free PNG encoder; deterministic screenshots; headless CLI.
 - Compositor: layers, tiles, damage rectangles, clip stack, animation timeline.
 - GPU abstraction with embedded WGSL shaders and a software reference device.
-- Image decoding: PNG (all filters, palette/grey/RGBA, interlaced) and 24/32-bit
-  BMP, wired into `<img>` rendering; GIF/JPEG/WebP are detected but still
-  unsupported.
+- Image decoding wired into `<img>`: PNG (all filters, palette/grey/RGBA, bit
+  depths 1/2/4/8, Adam7 interlacing), GIF (LZW, transparency, interlacing, first
+  frame of animations) and uncompressed 24/32-bit BMP. JPEG and WebP are detected
+  but not decoded yet.
 - Synthetic bold/italic and list markers in the rasterizer.
 - **Planned:** native `wgpu` device + `winit` window in `apps/browser`, damage-based
   partial repaint, real font loading/shaping, GIF/JPEG/WebP decoding.

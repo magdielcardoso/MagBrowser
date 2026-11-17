@@ -341,7 +341,9 @@ pub fn layout_box_with(
     };
 
     let children = tree.boxes[index].children.clone();
-    let auto_content_height = if box_type == BoxType::Flex {
+    let auto_content_height = if box_type == BoxType::Table {
+        crate::table::layout_table(tree, doc, index)
+    } else if box_type == BoxType::Flex {
         flex::layout_flex(tree, doc, index)
     } else if box_type == BoxType::Grid {
         grid::layout_grid(tree, doc, index)
