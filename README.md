@@ -67,12 +67,22 @@ cargo run -p mag-browser -- tests/fixtures/script.html --script
 
 ## Limitations (documented, not hidden)
 
-The native window is feature-gated (default build stays GPU-free), there is no
-process isolation yet, and JavaScript still lacks classes, generators and
-`async`/`await`. On the CSS side there is no full grid (only a row-major subset),
-no transforms, no real filters, and no CSS-driven rounded corners, shadows or
-gradients yet; JPEG/WebP images are detected but not decoded. See
-`docs/roadmap.md` for the full list and `docs/security.md` for the threat model.
+The native window is feature-gated (default build stays GPU-free) and there is
+no process isolation yet. Modern CSS largely works — `calc()`/`min()`/`max()`/
+`clamp()`, flexbox with wrapping and intrinsic sizing, grid placement,
+`border-radius`, shadows, gradients, transforms and filters are implemented —
+but it is not a full Chrome-equivalent engine; complex sites may still render
+imperfectly. JavaScript supports classes, generators, async/await, modules and
+`fetch`, but lacks the full standard library. WebP decoding is still in
+progress; PNG/JPEG/GIF/BMP/SVG are supported. See `docs/roadmap.md` for the
+full list and `docs/security.md` for the threat model.
+
+## License
+
+MagBrowser is free software licensed under the GNU Affero General Public
+License, version 3 or (at your option) any later version (`AGPL-3.0-or-later`).
+See [LICENSE](LICENSE) for the full text and [NOTICE](NOTICE) for third-party
+component licenses (including the Inter font under the SIL Open Font License).
 
 ## Layout
 

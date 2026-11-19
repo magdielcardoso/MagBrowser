@@ -1,0 +1,24 @@
+MagBrowser
+Copyright (C) 2026 Magdiel Cardoso and contributors
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU Affero General Public License as published by the Free
+Software Foundation, either version 3 of the License, or (at your option) any
+later version. See the LICENSE file for the full license text.
+
+Third-party components
+----------------------
+
+This repository contains third-party components that are licensed separately
+and are not relicensed by the AGPL notice above:
+
+  - crates/layout/text/fonts/Inter-Regular.ttf
+    Inter by Rasmus Andersson, licensed under the SIL Open Font License 1.1.
+    See crates/layout/text/fonts/Inter-LICENSE.txt.
+
+  - Rust crates listed in Cargo.toml / Cargo.lock are governed by their own
+    licenses as declared in their respective packages.
+
+If you convey a modified version of this program, you must comply with the
+AGPL (including section 5 and, where applicable, section 13) and keep the
+notices above and the separate licenses of third-party components intact.
