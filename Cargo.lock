@@ -346,8 +346,10 @@ name = "browser-web-apis"
 version = "0.1.0"
 dependencies = [
  "browser-dom",
+ "browser-event-loop",
  "browser-html-parser",
  "browser-js",
+ "browser-navigation",
  "browser-selectors",
  "browser-url",
 ]

@@ -27,6 +27,9 @@ pub use animations::{
     AnimatedValue, Animation, AnimationClock, AnimationDirection, AnimationTimeline, Easing,
     FillMode, IterationCount, Keyframe, KeyframeAnimation, PlayState, RgbaColor, StepPosition,
 };
+/// Re-exported so paint can ask which properties a style is currently animating
+/// without depending on `browser-style` directly.
+pub use browser_style::animated_properties;
 pub use clipping::ClipStack;
 pub use damage::Damage;
 pub use layers::{Layer, LayerComposite, LayerId, LayerTree};

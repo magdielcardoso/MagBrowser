@@ -42,6 +42,10 @@ pub fn ensure_runtime(page: &mut Page) -> bool {
     let mut runtime = Runtime::new();
     let url = page.url.as_ref().map(|url| url.as_str());
     let host = browser_web_apis::install(&mut runtime, page.document.clone(), url);
+    // Host-side transports and worker bridge. The web-apis globals default to
+    // in-memory/no-interception behaviour; the page supplies the real halves.
+    crate::websocket::install_tcp_transport(&host);
+    crate::service_workers::install_bridge(&host, &page.service_workers);
     // Bridge `getComputedStyle` to the style engine. The computed tree is
     // cloned so the JS resolver can outlive mutable borrows of the page.
     let styles = page.styles.clone();
@@ -54,7 +58,12 @@ pub fn ensure_runtime(page: &mut Page) -> bool {
     // navigation budget can replace it by calling `install_fetch_bridge` again.
     let loader = ResourceLoader::default();
     let deadline = NavigationDeadline::new(loader.timeout());
-    install_fetch_bridge(&host, loader, deadline);
+    install_fetch_bridge_with_workers(
+        &host,
+        loader,
+        deadline,
+        Some(page.service_workers.registry()),
+    );
     page.runtime = Some(runtime);
     page.host = Some(host);
     true
@@ -75,6 +84,20 @@ pub fn install_fetch_bridge(
     loader: ResourceLoader,
     deadline: NavigationDeadline,
 ) {
+    install_fetch_bridge_with_workers(host, loader, deadline, None);
+}
+
+/// Installs the host fetch bridge with an optional service worker registry.
+///
+/// When a registry is supplied, eligible (secure-context) requests are offered
+/// to an active worker through `handle_fetch` *before* the network is touched.
+/// A synthesized response is converted straight into the `fetch()` response.
+pub fn install_fetch_bridge_with_workers(
+    host: &Rc<RefCell<HostState>>,
+    loader: ResourceLoader,
+    deadline: NavigationDeadline,
+    workers: Option<Arc<Mutex<browser_event_loop::ServiceWorkerRegistry>>>,
+) {
     let loader = Arc::new(Mutex::new(loader));
     let handler: FetchHandler = Arc::new(
         move |request: FetchRequest| -> Result<FetchResponse, FetchError> {
@@ -83,6 +106,18 @@ pub fn install_fetch_bridge(
             }
             let url = Url::parse(&request.url)
                 .map_err(|error| FetchError::new(format!("invalid URL: {error}")))?;
+            if let Some(workers) = &workers
+                && crate::service_workers::is_secure_context(&request.url)
+                && let Ok(mut registry) = workers.lock()
+                && let Some(response) = registry.handle_fetch(&request.url)
+            {
+                return Ok(FetchResponse::new(
+                    response.status,
+                    response.status_text,
+                    response.headers,
+                    response.body,
+                ));
+            }
             let mut headers = Headers::new();
             for (name, value) in &request.headers {
                 headers.append(name, value);
@@ -143,7 +178,7 @@ pub fn execute_in_page(page: &mut Page) -> (usize, Vec<String>) {
 }
 
 /// Gives the observer host a snapshot of the current layout geometry.
-fn install_observer_layout(page: &Page, host: &Rc<RefCell<HostState>>) {
+pub(crate) fn install_observer_layout(page: &Page, host: &Rc<RefCell<HostState>>) {
     let mut boxes = HashMap::new();
     for b in &page.layout.boxes {
         if let Some(node) = b.node {
@@ -172,6 +207,28 @@ pub fn notify_observers(page: &Page, host: &Rc<RefCell<HostState>>) {
     );
     let document = page.document.borrow();
     browser_web_apis::notify_observers(host, viewport, &document);
+}
+
+/// Delivers every queued observer callback and drains the microtasks they queue.
+pub(crate) fn deliver_observers(runtime: &mut browser_js::Runtime, host: &Rc<RefCell<HostState>>) {
+    browser_web_apis::deliver_observer_callbacks(runtime, host);
+    let _ = runtime.run_microtasks();
+}
+
+/// Refreshes layout-derived observer state after a new layout tree is produced.
+///
+/// Called by [`Page::recompute`] so every navigation, stylesheet load, resize
+/// and script-driven relayout gives IntersectionObserver and ResizeObserver a
+/// fresh geometry snapshot and delivers their queued callbacks.
+pub(crate) fn refresh_observers(page: &mut Page) {
+    let Some(host) = page.host.clone() else {
+        return;
+    };
+    install_observer_layout(page, &host);
+    notify_observers(page, &host);
+    if let Some(runtime) = page.runtime.as_mut() {
+        deliver_observers(runtime, &host);
+    }
 }
 
 /// Executes the given scripts in order, returning how many ran and console output.
@@ -203,12 +260,15 @@ pub fn execute_scripts(page: &mut Page, scripts: &[String]) -> (usize, Vec<Strin
     browser_web_apis::drain_timers_now(&mut runtime, &host);
     let _ = runtime.run_microtasks();
 
+    // Mirror workers registered through the JS globals so later fetches can be
+    // intercepted before the network (the fetch bridge holds a separate handle).
+    page.service_workers.sync(&host.borrow());
+
     // Give IntersectionObserver/ResizeObserver their first snapshot after the
     // initial layout, then deliver the queued callbacks.
     install_observer_layout(page, &host);
     notify_observers(page, &host);
-    browser_web_apis::deliver_observer_callbacks(&mut runtime, &host);
-    let _ = runtime.run_microtasks();
+    deliver_observers(&mut runtime, &host);
 
     page.runtime = Some(runtime);
     let output = host.borrow_mut().take_console();

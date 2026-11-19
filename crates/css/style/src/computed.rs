@@ -1,6 +1,6 @@
 //! Computed style values and the typed accessors used by layout and paint.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use browser_css::Color;
 
@@ -574,6 +574,12 @@ impl ComputedValue {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ComputedStyle {
     values: BTreeMap<Property, ComputedValue>,
+    /// Properties currently overridden by an animation or transition.
+    ///
+    /// Empty for styles produced by the plain cascade, so this field does not
+    /// affect equality (or any other observable behaviour) of un-animated
+    /// computed styles.
+    animated: BTreeSet<Property>,
 }
 
 impl ComputedStyle {
@@ -596,6 +602,26 @@ impl ComputedStyle {
     /// Writes a computed value.
     pub fn set(&mut self, property: Property, value: ComputedValue) {
         self.values.insert(property, value);
+    }
+
+    /// Marks a property as currently driven by an animation or transition.
+    pub(crate) fn mark_animated(&mut self, property: Property) {
+        self.animated.insert(property);
+    }
+
+    /// Removes every animated-property marker.
+    pub(crate) fn clear_animated(&mut self) {
+        self.animated.clear();
+    }
+
+    /// The properties currently driven by an animation or transition, in
+    /// canonical order.
+    ///
+    /// Paint can use this to decide which properties need to be re-rasterized
+    /// on each frame. Always empty for styles from [`crate::StyleEngine::compute`].
+    #[must_use]
+    pub fn animated_properties(&self) -> Vec<Property> {
+        self.animated.iter().copied().collect()
     }
 
     /// Copies a property from another style.

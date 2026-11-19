@@ -14,6 +14,60 @@ use browser_paint::{DisplayList, ImageBuffer, ImageData};
 use browser_style::{StyleEngine, StyledTree};
 use browser_url::Url;
 
+use crate::service_workers::ServiceWorkerMirror;
+
+fn raw_text(value: Option<&browser_style::ComputedValue>) -> Option<String> {
+    use browser_style::ComputedValue;
+    match value? {
+        ComputedValue::Str(text) => Some(text.to_string()),
+        ComputedValue::Keyword(keyword) => Some(keyword.to_string()),
+        ComputedValue::Px(px) => Some(format!("{px}px")),
+        ComputedValue::Dim(browser_style::Dim::Px(px)) => Some(format!("{px}px")),
+        ComputedValue::Dim(browser_style::Dim::Percent(p)) => Some(format!("{p}%")),
+        _ => None,
+    }
+}
+
+/// Collects the raw effect declarations that the style engine does not model
+/// as typed properties, for the paint crate's effect bridge.
+fn collect_raw_effects(layout: &LayoutTree) -> HashMap<NodeId, browser_paint::effects::RawEffects> {
+    use browser_style::Property;
+    let properties = [
+        ("clip-path", 0usize),
+        ("mask-image", 1),
+        ("-webkit-mask-image", 2),
+        ("mix-blend-mode", 3),
+        ("backdrop-filter", 4),
+        ("border-image", 5),
+        ("outline", 6),
+        ("outline-offset", 7),
+    ];
+    let mut out = HashMap::new();
+    for box_ref in &layout.boxes {
+        let Some(node) = box_ref.node else { continue };
+        let mut raw = browser_paint::effects::RawEffects::default();
+        for (name, index) in properties {
+            let text = Property::from_name(name)
+                .and_then(|property| raw_text(box_ref.style.get(property)));
+            match index {
+                0 => raw.clip_path = text,
+                1 => raw.mask_image = text,
+                2 => raw.webkit_mask_image = text,
+                3 => raw.mix_blend_mode = text,
+                4 => raw.backdrop_filter = text,
+                5 => raw.border_image = text,
+                6 => raw.outline = text,
+                7 => raw.outline_offset = text,
+                _ => {}
+            }
+        }
+        if raw != browser_paint::effects::RawEffects::default() {
+            out.insert(node, raw);
+        }
+    }
+    out
+}
+
 /// Lifecycle state of a page.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PageState {
@@ -51,6 +105,9 @@ pub struct Page {
     pub host: Option<Rc<RefCell<browser_web_apis::HostState>>>,
     /// True once the document's inline scripts have executed.
     pub scripts_executed: bool,
+    /// Host-owned service worker mirror, shared with the fetch bridge. Kept
+    /// across navigations so registrations survive like a real service worker.
+    pub service_workers: ServiceWorkerMirror,
     viewport: Size,
     prefers_color_scheme: String,
     background: Color,
@@ -72,6 +129,7 @@ impl Page {
             runtime: None,
             host: None,
             scripts_executed: false,
+            service_workers: ServiceWorkerMirror::new(),
             viewport,
             prefers_color_scheme: "light".to_string(),
             background: Color::rgb(255, 255, 255),
@@ -161,11 +219,19 @@ impl Page {
         for css in &self.author_css {
             engine.add_css(css, Origin::Author);
         }
-        let document = self.document.borrow();
-        self.styles = engine.compute(&document);
-        self.layout = browser_layout::layout(&document, &self.styles, self.viewport);
-        self.display_list = browser_paint::build_with_images(&self.layout, &self.images);
+        {
+            let document = self.document.borrow();
+            self.styles = engine.compute(&document);
+            self.layout = browser_layout::layout(&document, &self.styles, self.viewport);
+        }
+        let raw_effects = collect_raw_effects(&self.layout);
+        self.display_list =
+            browser_paint::build_with_effects(&self.layout, &self.images, &raw_effects).0;
         self.layers = LayerTree::build(&self.layout, self.viewport);
+        // A fresh layout tree invalidates layout-derived observer state. The
+        // document borrow is released above: observer callbacks may mutate the
+        // DOM through the web-apis bindings.
+        crate::script::refresh_observers(self);
     }
 
     /// Damage accumulated since the last call (for incremental rendering).
@@ -244,7 +310,9 @@ impl Page {
             return false;
         };
         if browser_layout::scroll::scroll_by(&mut self.layout, container, dx, dy) {
-            self.display_list = browser_paint::build_with_images(&self.layout, &self.images);
+            let raw_effects = collect_raw_effects(&self.layout);
+            self.display_list =
+                browser_paint::build_with_effects(&self.layout, &self.images, &raw_effects).0;
             true
         } else {
             false

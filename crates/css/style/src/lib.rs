@@ -24,6 +24,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod animation;
 pub mod cascade;
 pub mod computed;
 pub mod conditions;
@@ -35,6 +36,7 @@ pub mod specificity;
 pub mod ua;
 pub mod variables;
 
+mod animation_bridge;
 mod nesting;
 mod selector_index;
 
@@ -50,6 +52,11 @@ use cascade::{NO_SCOPE, UNLAYERED, pack_order};
 use selector_index::{NodeKeys, RuleKind, SelectorIndex};
 use variables::{PropertyRegistry, substitute_with_registry};
 
+pub use animation::{
+    AnimatedValue, Animation, AnimationClock, AnimationDirection, AnimationTimeline, Easing,
+    FillMode, IterationCount, Keyframe, KeyframeAnimation, PlayState, RgbaColor, StepPosition,
+};
+pub use animation_bridge::animated_properties;
 pub use browser_css::{Color, Origin};
 pub use cascade::Candidate;
 pub use computed::{
@@ -211,6 +218,15 @@ impl StyledTree {
             .get(&id)
             .cloned()
             .unwrap_or_else(ComputedStyle::initial)
+    }
+
+    /// Properties currently driven by an animation or transition on `id`.
+    ///
+    /// Convenience wrapper around [`animated_properties`] for callers that hold
+    /// a whole tree (for example the paint pipeline).
+    pub fn animated_properties(&self, id: NodeId) -> Vec<Property> {
+        self.get(id)
+            .map_or_else(Vec::new, ComputedStyle::animated_properties)
     }
 
     /// Custom properties declared on a node.
@@ -392,6 +408,11 @@ pub struct StyleEngine {
     index: SelectorIndex,
     /// Custom properties registered with `@property`.
     property_registry: PropertyRegistry,
+    /// Elapsed time at which each paused animation was first observed.
+    ///
+    /// Lets a paused animation stay frozen even when the caller keeps
+    /// advancing `elapsed`. Keyed by `(element, animated property)`.
+    paused_animations: HashMap<(NodeId, String), std::time::Duration>,
 }
 
 impl StyleEngine {
@@ -410,6 +431,7 @@ impl StyleEngine {
             diagnostics: Vec::new(),
             index,
             property_registry: PropertyRegistry::new(),
+            paused_animations: HashMap::new(),
         }
     }
 
@@ -419,6 +441,9 @@ impl StyleEngine {
         self.index = SelectorIndex::build(&self.user_agent, &self.user, &self.author);
         self.property_registry =
             collect_property_registrations(&self.user_agent, &self.user, &self.author);
+        // A stylesheet change can add, remove or rename animations, so any
+        // recorded pause position is no longer meaningful.
+        self.paused_animations.clear();
     }
 
     /// Updates the viewport used for media queries and viewport units.

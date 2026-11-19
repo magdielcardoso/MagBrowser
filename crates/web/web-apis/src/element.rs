@@ -38,6 +38,7 @@ pub fn wrap(runtime: &mut Runtime, state: &Rc<RefCell<HostState>>, node: NodeId)
     runtime.set_property(object.clone(), "__node", Value::Number(node.0 as f64));
     runtime.set_property(object.clone(), "nodeType", Value::Number(node_type as f64));
     define_element_members(runtime, state, object.clone());
+    crate::shadow::install_element_shadow(runtime, state, object.clone());
     crate::cssom::install_element_cssom(runtime, state, object.clone(), node);
     state.borrow_mut().elements.insert(node.0, object.clone());
     object
@@ -252,6 +253,46 @@ fn define_element_members(runtime: &mut Runtime, state: &Rc<RefCell<HostState>>,
                 .map(|node| wrap(runtime, &state, node))
                 .collect();
             Ok(runtime.new_array(items))
+        })
+    });
+
+    runtime.define_host_method(object.clone(), "matches", {
+        let state = state.clone();
+        Box::new(move |runtime, this, args| {
+            let node = require_node(runtime, &this)?;
+            let selector = args
+                .first()
+                .map(Value::to_string_value)
+                .ok_or_else(|| JsError::type_error("matches needs a selector"))?;
+            let document = document_of(&state);
+            let matched = {
+                let document = document.borrow();
+                match browser_selectors::parse_selector(&selector) {
+                    Ok(parsed) => browser_selectors::matches(&document, node, &parsed),
+                    Err(error) => return Err(JsError::new(error.to_string())),
+                }
+            };
+            Ok(Value::Bool(matched))
+        })
+    });
+
+    runtime.define_host_method(object.clone(), "matchesSlotted", {
+        let state = state.clone();
+        Box::new(move |runtime, this, args| {
+            let node = require_node(runtime, &this)?;
+            let selector = args
+                .first()
+                .map(Value::to_string_value)
+                .ok_or_else(|| JsError::type_error("matchesSlotted needs a selector"))?;
+            let document = document_of(&state);
+            let matched = {
+                let document = document.borrow();
+                match browser_selectors::parse_selector(&selector) {
+                    Ok(parsed) => browser_selectors::matches_slotted(&document, node, &parsed),
+                    Err(error) => return Err(JsError::new(error.to_string())),
+                }
+            };
+            Ok(Value::Bool(matched))
         })
     });
 

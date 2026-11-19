@@ -19,7 +19,7 @@ pub mod frame_pipeline;
 
 // Public API re-exported for the native window wiring in `window_app.rs`.
 #[allow(unused_imports)]
-pub use frame_pipeline::{FramePipeline, PageRenderJob};
+pub use frame_pipeline::{FramePipeline, LayerView, PageRenderJob, as_layer_frames, plan_layers};
 
 use std::sync::{Mutex, OnceLock};
 
@@ -52,6 +52,115 @@ const ICON_SUB: usize = 4;
 const FIND_CURRENT: Color = Color::rgba(255, 193, 7, 190);
 /// Translucent yellow used for the other find-in-page matches.
 const FIND_MATCH: Color = Color::rgba(255, 224, 94, 130);
+/// Track (gutter) of a painted page scrollbar.
+const SCROLLBAR_TRACK: Color = Color::rgba(120, 120, 130, 42);
+/// Draggable thumb of a painted page scrollbar.
+const SCROLLBAR_THUMB: Color = Color::rgba(88, 88, 98, 170);
+/// Shortest useful thumb, in CSS pixels, before it fills the whole track.
+const MIN_THUMB: f32 = 24.0;
+
+/// Which axis of a page scrollbar a hit belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScrollbarAxis {
+    /// Vertical bar on the right edge of a scroll container.
+    Vertical,
+    /// Horizontal bar on the bottom edge of a scroll container.
+    Horizontal,
+}
+
+/// Geometry of one scrollbar, in document (CSS) coordinates.
+///
+/// Produced from the active page's layout tree so both painting and pointer
+/// hit testing read exactly the same rectangles. `max_scroll` is the vertical
+/// scroll range; the engine has no horizontal scrolling yet, so it is zero for
+/// [`ScrollbarAxis::Horizontal`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ScrollbarGeometry {
+    /// Layout box that owns the bar.
+    pub box_index: usize,
+    /// Orientation of the bar.
+    pub axis: ScrollbarAxis,
+    /// Full gutter rectangle (document coordinates).
+    pub track: Rect,
+    /// Draggable portion of the track (document coordinates).
+    pub thumb: Rect,
+    /// Largest scroll offset the thumb can reach, in CSS pixels.
+    pub max_scroll: f32,
+}
+
+/// Computes every scrollbar of the active page from its layout tree.
+///
+/// The layout engine stores the track inside the scroller's padding box and
+/// exposes it as [`browser_layout::LayoutBox::scrollbar`] /
+/// [`browser_layout::LayoutBox::horizontal_scrollbar`]. The thumb is derived
+/// from the visible fraction of the scrollable content; both the painter and
+/// the window's drag handler call this function, so they cannot disagree.
+pub fn scrollbars(browser: &Browser) -> Vec<ScrollbarGeometry> {
+    let mut bars = Vec::new();
+    for (box_index, b) in browser.page().layout.boxes.iter().enumerate() {
+        if let Some(track) = b.scrollbar
+            && !track.is_empty()
+        {
+            let viewport = b.content.height.max(0.0);
+            let total = b.scroll_height.max(viewport);
+            let thumb_len = if total > 0.0 {
+                (track.height * viewport / total).clamp(MIN_THUMB.min(track.height), track.height)
+            } else {
+                track.height
+            };
+            let max_scroll = (total - viewport).max(0.0);
+            let progress = if max_scroll > 0.0 {
+                b.scroll_offset.1.clamp(0.0, max_scroll) / max_scroll
+            } else {
+                0.0
+            };
+            let thumb = Rect::new(
+                track.x,
+                track.y + progress * (track.height - thumb_len),
+                track.width,
+                thumb_len,
+            );
+            bars.push(ScrollbarGeometry {
+                box_index,
+                axis: ScrollbarAxis::Vertical,
+                track,
+                thumb,
+                max_scroll,
+            });
+        }
+        if let Some(track) = b.horizontal_scrollbar
+            && !track.is_empty()
+        {
+            // The engine currently scrolls only the vertical axis, so the
+            // horizontal thumb spans its whole track.
+            bars.push(ScrollbarGeometry {
+                box_index,
+                axis: ScrollbarAxis::Horizontal,
+                track,
+                thumb: track,
+                max_scroll: 0.0,
+            });
+        }
+    }
+    bars
+}
+
+/// Finds the scrollbar under a document-coordinate point, thumb first.
+///
+/// When the point lands on the track but not the thumb, the geometry is still
+/// returned so the window can jump the thumb to the click, like a browser does.
+#[allow(dead_code)] // Wired into `window_app.rs` by the native-window integration.
+pub fn scrollbar_at(browser: &Browser, doc_x: f32, doc_y: f32) -> Option<ScrollbarGeometry> {
+    let bars = scrollbars(browser);
+    bars.iter()
+        .find(|bar| bar.thumb.contains(doc_x, doc_y))
+        .copied()
+        .or_else(|| {
+            bars.iter()
+                .find(|bar| bar.track.contains(doc_x, doc_y))
+                .copied()
+        })
+}
 
 /// A shared text painter; glyph coverage is cached inside `browser-text`.
 fn atlas() -> &'static GlyphAtlas {
@@ -417,6 +526,7 @@ impl ChromeCache {
         {
             composite_page(&mut image, page, chrome.page, device);
         }
+        paint_scrollbars(&mut image, browser, chrome, device, zoom);
         paint_find_highlights(&mut image, ui, chrome, device, zoom);
         paint_icons(&mut image, ui, chrome, device);
         let (titles, active) = ui.tab_titles(browser);
@@ -897,6 +1007,60 @@ fn paint_text(
         MUTED_INK,
         Some((chrome.status.width - 2.0 * PADDING) * scale),
     );
+}
+
+/// Paints the page's scrollbar gutters and thumbs over the composed page.
+///
+/// Scrollbars are a per-frame layer (not part of the cached chrome base) because
+/// they move with the page's scroll offset. They use the same document→page
+/// transform as the find highlights, so they stay registered with the zoomed
+/// content. Both the track and the thumb are anti-aliased polygons.
+fn paint_scrollbars(
+    image: &mut ImageBuffer,
+    browser: &Browser,
+    chrome: &ChromeLayout,
+    device: f32,
+    zoom: f32,
+) {
+    if zoom <= 0.0 || chrome.page.is_empty() {
+        return;
+    }
+    let clip = scaled_rect(chrome.page, device);
+    for bar in scrollbars(browser) {
+        let to_device = |rect: Rect| {
+            Rect::new(
+                (chrome.page.x + rect.x * zoom) * device,
+                (chrome.page.y + rect.y * zoom) * device,
+                (rect.width * zoom * device).max(0.0),
+                (rect.height * zoom * device).max(0.0),
+            )
+        };
+        let track = clamp_rect(to_device(bar.track), clip);
+        let thumb = clamp_rect(to_device(bar.thumb), clip);
+        if track.is_empty() || thumb.is_empty() {
+            continue;
+        }
+        let radius = (track.width.min(track.height) / 2.0).min(6.0 * device);
+        fill_polygons(
+            image,
+            &[rounded_rect_polygon(track, radius, 4)],
+            SCROLLBAR_TRACK,
+        );
+        fill_polygons(
+            image,
+            &[rounded_rect_polygon(thumb, radius, 4)],
+            SCROLLBAR_THUMB,
+        );
+    }
+}
+
+/// Clips `rect` to `clip`, returning an empty rectangle when they do not overlap.
+fn clamp_rect(rect: Rect, clip: Rect) -> Rect {
+    let x = rect.x.max(clip.x);
+    let y = rect.y.max(clip.y);
+    let right = rect.right().min(clip.right());
+    let bottom = rect.bottom().min(clip.bottom());
+    Rect::new(x, y, (right - x).max(0.0), (bottom - y).max(0.0))
 }
 
 /// Paints approximate rectangles for every find-in-page match over the page.
@@ -1425,6 +1589,61 @@ mod tests {
         let fitted = fit_text("a-very-long-title", 30.0, font, FONT_SIZE);
         assert!(fitted.ends_with('\u{2026}'));
         assert!(font.measure(&fitted, FONT_SIZE) <= 30.0 + 0.01);
+    }
+
+    fn scrollable_browser() -> Browser {
+        let mut browser = browser();
+        browser
+            .load_html(
+                "<html><body style='margin:0'><div id='s' \
+                 style='width:200px;height:100px;overflow-y:scroll'>\
+                 <div style='height:400px'></div></div></body></html>",
+                None,
+            )
+            .unwrap();
+        browser
+    }
+
+    fn vertical_bar(browser: &Browser) -> ScrollbarGeometry {
+        scrollbars(browser)
+            .into_iter()
+            .find(|bar| bar.axis == ScrollbarAxis::Vertical)
+            .expect("the overflowing div needs a vertical scrollbar")
+    }
+
+    #[test]
+    fn scrollbar_thumb_tracks_the_scroll_offset() {
+        let mut browser = scrollable_browser();
+        let initial = vertical_bar(&browser);
+        assert!(initial.max_scroll > 0.0);
+        assert!(initial.thumb.height < initial.track.height);
+        assert!(initial.thumb.y >= initial.track.y);
+        // Both the thumb and the track are hittable in document coordinates.
+        assert!(scrollbar_at(&browser, initial.thumb.x + 2.0, initial.thumb.y + 2.0).is_some());
+
+        // The gutter is outside the scroller's border box, so scroll from a
+        // point just inside the container, not from the track itself.
+        browser.scroll_at(initial.track.x - 2.0, initial.track.y + 2.0, 100.0);
+        let scrolled = vertical_bar(&browser);
+        assert!(
+            scrolled.thumb.y > initial.thumb.y,
+            "thumb must move down as the content scrolls"
+        );
+    }
+
+    #[test]
+    fn scrollbars_are_painted_over_the_page() {
+        let browser = scrollable_browser();
+        let bar = vertical_bar(&browser);
+        let chrome = chrome();
+        let image = render_window(&browser, &UiState::new(), &chrome, 1.0);
+        let x = (chrome.page.x + bar.thumb.x + bar.thumb.width / 2.0) as u32;
+        let y = (chrome.page.y + bar.thumb.y + bar.thumb.height / 2.0) as u32;
+        let pixel = image.pixel(x, y);
+        assert!(
+            pixel[0] < 220 && pixel[3] == 255,
+            "the thumb should be a visible grey over the page: {pixel:?}"
+        );
     }
 
     fn chrome_for(status: LoadStatus) -> ChromeLayout {

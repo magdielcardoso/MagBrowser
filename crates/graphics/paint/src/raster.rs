@@ -14,6 +14,10 @@ use browser_style::BorderStyle;
 use browser_text::RasterGlyph;
 
 use crate::display_list::{DisplayCommand, DisplayFilter, DisplayList};
+use crate::effects::{
+    BlendMode, BorderImageData, BorderImageRepeat, ClipPath, ConicGradient, MaskData,
+    RadialGradient, rasterize_clip_path, sample_conic, sample_radial,
+};
 use crate::images::{ImageData, clamp_dimension};
 use crate::png;
 
@@ -167,10 +171,17 @@ enum ProfileKind {
     DrawLinearGradient,
     DrawTransformed,
     DrawFiltered,
+    DrawMasked,
+    DrawClipped,
+    DrawBlended,
+    DrawRadialGradient,
+    DrawConicGradient,
+    DrawImageWithRendering,
+    DrawBorderImage,
 }
 
 impl ProfileKind {
-    const COUNT: usize = 11;
+    const COUNT: usize = 18;
 
     const NAMES: [&'static str; Self::COUNT] = [
         "PushClip",
@@ -184,6 +195,13 @@ impl ProfileKind {
         "DrawLinearGradient",
         "DrawTransformed",
         "DrawFiltered",
+        "DrawMasked",
+        "DrawClipped",
+        "DrawBlended",
+        "DrawRadialGradient",
+        "DrawConicGradient",
+        "DrawImageWithRendering",
+        "DrawBorderImage",
     ];
 
     fn of(command: &DisplayCommand) -> Self {
@@ -199,6 +217,13 @@ impl ProfileKind {
             DisplayCommand::DrawLinearGradient { .. } => Self::DrawLinearGradient,
             DisplayCommand::DrawTransformed { .. } => Self::DrawTransformed,
             DisplayCommand::DrawFiltered { .. } => Self::DrawFiltered,
+            DisplayCommand::DrawMasked { .. } => Self::DrawMasked,
+            DisplayCommand::DrawClipped { .. } => Self::DrawClipped,
+            DisplayCommand::DrawBlended { .. } => Self::DrawBlended,
+            DisplayCommand::DrawRadialGradient { .. } => Self::DrawRadialGradient,
+            DisplayCommand::DrawConicGradient { .. } => Self::DrawConicGradient,
+            DisplayCommand::DrawImageWithRendering { .. } => Self::DrawImageWithRendering,
+            DisplayCommand::DrawBorderImage { .. } => Self::DrawBorderImage,
         }
     }
 }
@@ -885,7 +910,8 @@ impl Rasterizer {
             ),
             DisplayCommand::DrawImage { rect, image } => {
                 if let Some(image) = images.get(*image) {
-                    self.draw_image(self.scaled_rect(*rect), image);
+                    // Legacy DrawImage is nearest-neighbour; keep its bytes identical.
+                    self.draw_image(self.scaled_rect(*rect), image, false);
                 }
             }
             DisplayCommand::DrawRoundedRect {
@@ -947,6 +973,65 @@ impl Rasterizer {
                 child_commands,
                 filters,
             } => self.draw_filtered(child_commands, filters, images),
+            DisplayCommand::DrawMasked {
+                rect,
+                child_commands,
+                mask,
+            } => self.draw_masked(self.scaled_rect(*rect), child_commands, mask, images),
+            DisplayCommand::DrawClipped {
+                child_commands,
+                clip,
+                rect,
+            } => self.draw_clipped(child_commands, clip, *rect, images),
+            DisplayCommand::DrawBlended {
+                child_commands,
+                blend_mode,
+                backdrop,
+            } => self.draw_blended(child_commands, *blend_mode, backdrop, images),
+            DisplayCommand::DrawRadialGradient {
+                rect,
+                gradient,
+                radius,
+            } => {
+                let radius = [
+                    radius[0] * self.scale,
+                    radius[1] * self.scale,
+                    radius[2] * self.scale,
+                    radius[3] * self.scale,
+                ];
+                self.draw_radial_gradient(self.scaled_rect(*rect), gradient, radius);
+            }
+            DisplayCommand::DrawConicGradient {
+                rect,
+                gradient,
+                radius,
+            } => {
+                let radius = [
+                    radius[0] * self.scale,
+                    radius[1] * self.scale,
+                    radius[2] * self.scale,
+                    radius[3] * self.scale,
+                ];
+                self.draw_conic_gradient(self.scaled_rect(*rect), gradient, radius);
+            }
+            DisplayCommand::DrawImageWithRendering {
+                rect,
+                image,
+                rendering,
+            } => {
+                if let Some(image) = images.get(*image) {
+                    self.draw_image(self.scaled_rect(*rect), image, !rendering.is_pixelated());
+                }
+            }
+            DisplayCommand::DrawBorderImage {
+                rect,
+                border_image,
+                image,
+            } => {
+                if let Some(source) = images.get(*image) {
+                    self.draw_border_image(self.scaled_rect(*rect), border_image, source);
+                }
+            }
         }
         if let Some(started) = timer {
             let elapsed = started.elapsed().as_nanos() as u64;
@@ -1323,7 +1408,14 @@ impl Rasterizer {
         }
     }
 
-    fn draw_image(&mut self, rect: Rect, image: &ImageData) {
+    /// Draws an image scaled into `rect`.
+    ///
+    /// `bilinear = false` uses [`ImageData::sample`] (nearest neighbour) and is
+    /// byte-identical to the legacy [`DisplayCommand::DrawImage`] path. `true`
+    /// bilinearly interpolates the four neighbouring source texels, which is the
+    /// `image-rendering: auto`/`smooth` behaviour of
+    /// [`DisplayCommand::DrawImageWithRendering`].
+    fn draw_image(&mut self, rect: Rect, image: &ImageData, bilinear: bool) {
         if image.width == 0 || image.height == 0 {
             return;
         }
@@ -1337,7 +1429,11 @@ impl Rasterizer {
             let v = (y as f32 - rect.y) * inv_height;
             for x in x0..x1 {
                 let u = (x as f32 - rect.x) * inv_width;
-                let [r, g, b, a] = image.sample(u, v);
+                let [r, g, b, a] = if bilinear {
+                    sample_image_bilinear(image, u, v)
+                } else {
+                    image.sample(u, v)
+                };
                 if a == 0 {
                     continue;
                 }
@@ -1945,6 +2041,485 @@ impl Rasterizer {
             self.composite_temp(&temp.canvas, factor, (x0, y0, x1, y1), Some(&matrix));
         }
     }
+
+    /// Fills an anti-aliased rounded rectangle with a radial gradient, sampling
+    /// [`sample_radial`] at each covered pixel's centre.
+    fn draw_radial_gradient(&mut self, rect: Rect, gradient: &RadialGradient, radius: [f32; 4]) {
+        if rect.is_empty() || gradient.stops.is_empty() {
+            return;
+        }
+        let Some((x0, y0, x1, y1)) = self.clipped_pixel_bounds(rect) else {
+            return;
+        };
+        let radius = normalized_radii(rect, radius);
+        let mut covered = 0_u64;
+        let count = self.profile_enabled;
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let coverage = rounded_rect_coverage(rect, radius, x, y);
+                if coverage <= 0.0 {
+                    continue;
+                }
+                if count {
+                    covered += 1;
+                }
+                let color = sample_radial(gradient, rect, x as f32 + 0.5, y as f32 + 0.5);
+                self.blend_covered(x, y, color, coverage);
+            }
+        }
+        self.count_pixels(covered);
+    }
+
+    /// Fills an anti-aliased rounded rectangle with a conic gradient, sampling
+    /// [`sample_conic`] at each covered pixel's centre.
+    fn draw_conic_gradient(&mut self, rect: Rect, gradient: &ConicGradient, radius: [f32; 4]) {
+        if rect.is_empty() || gradient.stops.is_empty() {
+            return;
+        }
+        let Some((x0, y0, x1, y1)) = self.clipped_pixel_bounds(rect) else {
+            return;
+        };
+        let radius = normalized_radii(rect, radius);
+        let mut covered = 0_u64;
+        let count = self.profile_enabled;
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let coverage = rounded_rect_coverage(rect, radius, x, y);
+                if coverage <= 0.0 {
+                    continue;
+                }
+                if count {
+                    covered += 1;
+                }
+                let color = sample_conic(gradient, rect, x as f32 + 0.5, y as f32 + 0.5);
+                self.blend_covered(x, y, color, coverage);
+            }
+        }
+        self.count_pixels(covered);
+    }
+
+    /// Paints children into a transparent buffer and multiplies each pixel by a
+    /// coverage mask. Alpha and luminance masks share the same single-channel
+    /// path (the style layer pre-reduces both into a [`CoverageMask`]).
+    fn draw_masked(
+        &mut self,
+        rect: Rect,
+        commands: &[DisplayCommand],
+        mask: &MaskData,
+        images: &[ImageData],
+    ) {
+        if commands.is_empty() {
+            return;
+        }
+        match mask {
+            MaskData::None => {
+                self.execute_commands(commands, images);
+                return;
+            }
+            MaskData::Url(_) => {
+                // A URL mask needs a decoded image resolved by the compositor;
+                // the software rasterizer has no URL -> image lookup, so nothing
+                // is painted. This is the one remaining data-only mask gap.
+                return;
+            }
+            MaskData::Alpha(_) | MaskData::Luminance(_) => {}
+        }
+        if rect.is_empty() {
+            return;
+        }
+        let Some(bounds) = command_bounds(commands) else {
+            return;
+        };
+        let bounds = self.scaled_rect(bounds).intersect(&rect);
+        let Some((x0, y0, x1, y1)) = self.clipped_pixel_bounds(bounds) else {
+            return;
+        };
+        let region_px = (x1 - x0) as u64 * (y1 - y0) as u64;
+        if region_px == 0 {
+            return;
+        }
+        self.count_pixels(region_px);
+        if !self.work_budget.try_consume(region_px) {
+            return;
+        }
+
+        let mut temp = self.temp_rasterizer();
+        temp.execute_commands(commands, images);
+        let source = &temp.canvas;
+        let coverage = match mask {
+            MaskData::Alpha(m) | MaskData::Luminance(m) => m,
+            _ => unreachable!("None/Url masks returned above"),
+        };
+        let inv_w = if rect.width > 0.0 {
+            1.0 / rect.width
+        } else {
+            0.0
+        };
+        let inv_h = if rect.height > 0.0 {
+            1.0 / rect.height
+        } else {
+            0.0
+        };
+        for y in y0..y1 {
+            let my = ((y as f32 + 0.5 - rect.y) * inv_h * coverage.height as f32) as u32;
+            for x in x0..x1 {
+                let mx = ((x as f32 + 0.5 - rect.x) * inv_w * coverage.width as f32) as u32;
+                let opacity = coverage.coverage_at(mx, my);
+                if opacity <= 0.0 {
+                    continue;
+                }
+                let index = ((y as usize) * source.width as usize + x as usize) * 4;
+                let a = source.pixels[index + 3];
+                if a == 0 {
+                    continue;
+                }
+                self.blend_components(
+                    x,
+                    y,
+                    source.pixels[index],
+                    source.pixels[index + 1],
+                    source.pixels[index + 2],
+                    (a as f32 / 255.0) * opacity,
+                );
+            }
+        }
+    }
+
+    /// Paints children into a transparent buffer and clips them with the 4x4
+    /// anti-aliased coverage mask produced by [`rasterize_clip_path`].
+    fn draw_clipped(
+        &mut self,
+        commands: &[DisplayCommand],
+        clip: &ClipPath,
+        rect: Rect,
+        images: &[ImageData],
+    ) {
+        if commands.is_empty() {
+            return;
+        }
+        let rect = self.scaled_rect(rect);
+        if rect.is_empty() {
+            return;
+        }
+        let Some(bounds) = command_bounds(commands) else {
+            return;
+        };
+        let bounds = self.scaled_rect(bounds).intersect(&rect);
+        let Some((x0, y0, x1, y1)) = self.clipped_pixel_bounds(bounds) else {
+            return;
+        };
+        let region_px = (x1 - x0) as u64 * (y1 - y0) as u64;
+        if region_px == 0 {
+            return;
+        }
+        self.count_pixels(region_px);
+        if !self.work_budget.try_consume(region_px) {
+            return;
+        }
+
+        // Rasterize the clip in local (origin-zero) device-pixel coordinates.
+        let mask_w = rect.width.ceil().max(1.0) as u32;
+        let mask_h = rect.height.ceil().max(1.0) as u32;
+        let local = Rect::new(0.0, 0.0, rect.width, rect.height);
+        let coverage = rasterize_clip_path(clip, local, mask_w, mask_h);
+
+        let mut temp = self.temp_rasterizer();
+        temp.execute_commands(commands, images);
+        let source = &temp.canvas;
+        let inv_w = if rect.width > 0.0 {
+            1.0 / rect.width
+        } else {
+            0.0
+        };
+        let inv_h = if rect.height > 0.0 {
+            1.0 / rect.height
+        } else {
+            0.0
+        };
+        for y in y0..y1 {
+            let my = ((y as f32 + 0.5 - rect.y) * inv_h * coverage.height as f32) as u32;
+            for x in x0..x1 {
+                let mx = ((x as f32 + 0.5 - rect.x) * inv_w * coverage.width as f32) as u32;
+                let clip_coverage = coverage.coverage_at(mx, my);
+                if clip_coverage <= 0.0 {
+                    continue;
+                }
+                let index = ((y as usize) * source.width as usize + x as usize) * 4;
+                let a = source.pixels[index + 3];
+                if a == 0 {
+                    continue;
+                }
+                self.blend_components(
+                    x,
+                    y,
+                    source.pixels[index],
+                    source.pixels[index + 1],
+                    source.pixels[index + 2],
+                    (a as f32 / 255.0) * clip_coverage,
+                );
+            }
+        }
+    }
+
+    /// Blends a group with its backdrop using the W3C compositing formula on
+    /// premultiplied channels, optionally filtering the backdrop first.
+    fn draw_blended(
+        &mut self,
+        commands: &[DisplayCommand],
+        mode: BlendMode,
+        backdrop: &crate::effects::BackdropFilters,
+        images: &[ImageData],
+    ) {
+        if commands.is_empty() {
+            return;
+        }
+        let Some(bounds) = command_bounds(commands) else {
+            return;
+        };
+        let Some((x0, y0, x1, y1)) = self.clipped_pixel_bounds(self.scaled_rect(bounds)) else {
+            return;
+        };
+        let region_px = (x1 - x0) as u64 * (y1 - y0) as u64;
+        if region_px == 0 {
+            return;
+        }
+        self.count_pixels(region_px);
+        if !self.work_budget.try_consume(region_px) {
+            // Budget exhaustion degrades to a plain source-over replay.
+            self.execute_commands(commands, images);
+            return;
+        }
+
+        let mut temp = self.temp_rasterizer();
+        temp.execute_commands(commands, images);
+        let source = &temp.canvas;
+
+        // Snapshot the backdrop (the current canvas) over the affected region.
+        let bw = (x1 - x0) as u32;
+        let bh = (y1 - y0) as u32;
+        let mut backdrop_buf = ImageBuffer::new(bw, bh);
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let src = ((y as usize) * self.canvas.width as usize + x as usize) * 4;
+                let dst = (((y - y0) as usize) * bw as usize + (x - x0) as usize) * 4;
+                backdrop_buf.pixels[dst..dst + 4]
+                    .copy_from_slice(&self.canvas.pixels[src..src + 4]);
+            }
+        }
+        if !backdrop.is_empty() {
+            apply_filters(&mut backdrop_buf.pixels, bw, bh, &backdrop.0, 1.0);
+        }
+
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let s = ((y as usize) * source.width as usize + x as usize) * 4;
+                let sa = source.pixels[s + 3];
+                if sa == 0 {
+                    continue;
+                }
+                let b = (((y - y0) as usize) * bw as usize + (x - x0) as usize) * 4;
+                let (sr, sg, sb) = (source.pixels[s], source.pixels[s + 1], source.pixels[s + 2]);
+                let (br, bg, bb, ba) = (
+                    backdrop_buf.pixels[b],
+                    backdrop_buf.pixels[b + 1],
+                    backdrop_buf.pixels[b + 2],
+                    backdrop_buf.pixels[b + 3],
+                );
+                let alpha_s = sa as f32 / 255.0;
+                let alpha_b = ba as f32 / 255.0;
+                let alpha_out = alpha_s + alpha_b * (1.0 - alpha_s);
+                if alpha_out <= 0.0 {
+                    continue;
+                }
+                // W3C: Co = as*(1-ab)*Cs + as*ab*B(Cb,Cs) + (1-as)*ab*Cb, all over ao.
+                let composite = |cb: u8, cs: u8| -> f32 {
+                    let cb = cb as f32 / 255.0;
+                    let cs = cs as f32 / 255.0;
+                    (alpha_s * (1.0 - alpha_b) * cs
+                        + alpha_s * alpha_b * w3c_blend_channel(mode, cb, cs)
+                        + (1.0 - alpha_s) * alpha_b * cb)
+                        / alpha_out
+                };
+                let index = ((y as usize) * self.canvas.width as usize + x as usize) * 4;
+                self.canvas.pixels[index] =
+                    (composite(br, sr).clamp(0.0, 1.0) * 255.0).round() as u8;
+                self.canvas.pixels[index + 1] =
+                    (composite(bg, sg).clamp(0.0, 1.0) * 255.0).round() as u8;
+                self.canvas.pixels[index + 2] =
+                    (composite(bb, sb).clamp(0.0, 1.0) * 255.0).round() as u8;
+                self.canvas.pixels[index + 3] = (alpha_out.clamp(0.0, 1.0) * 255.0).round() as u8;
+            }
+        }
+    }
+
+    /// Draws a nine-slice (`border-image`) scaling of `source` into `rect`.
+    ///
+    /// The source is split into nine regions by `border_image.slice`; the four
+    /// corners keep their size, the four edges and the centre are stretched (or
+    /// tiled for `repeat`/`round`) into the corresponding destination cells.
+    fn draw_border_image(&mut self, rect: Rect, data: &BorderImageData, source: &ImageData) {
+        if rect.is_empty() || source.width == 0 || source.height == 0 {
+            return;
+        }
+        // border-image-outset expands the area the nine slices are painted into.
+        let (out_top, out_right, out_bottom, out_left) = (
+            data.outset[0].resolve(rect.height).max(0.0),
+            data.outset[1].resolve(rect.width).max(0.0),
+            data.outset[2].resolve(rect.height).max(0.0),
+            data.outset[3].resolve(rect.width).max(0.0),
+        );
+        let area = Rect::new(
+            rect.x - out_left,
+            rect.y - out_top,
+            rect.width + out_left + out_right,
+            rect.height + out_top + out_bottom,
+        );
+        let Some((x0, y0, x1, y1)) = self.solid_pixel_bounds(area) else {
+            return;
+        };
+        let region_px = (x1 - x0) as u64 * (y1 - y0) as u64;
+        self.count_pixels(region_px);
+        if !self.work_budget.try_consume(region_px) {
+            return;
+        }
+
+        let image_w = source.width as f32;
+        let image_h = source.height as f32;
+        // Source slice widths in source pixels; destination slice widths in device px.
+        let mut src_slice = [
+            data.slice[0].resolve(image_h).max(0.0),
+            data.slice[1].resolve(image_w).max(0.0),
+            data.slice[2].resolve(image_h).max(0.0),
+            data.slice[3].resolve(image_w).max(0.0),
+        ];
+        let mut dest_slice = [
+            data.width[0].resolve(rect.height).max(0.0),
+            data.width[1].resolve(rect.width).max(0.0),
+            data.width[2].resolve(rect.height).max(0.0),
+            data.width[3].resolve(rect.width).max(0.0),
+        ];
+        // Opposite slices must not overlap; scale both down if they do.
+        let src_y = src_slice[0] + src_slice[2];
+        if src_y > image_h {
+            let factor = image_h / src_y;
+            src_slice[0] *= factor;
+            src_slice[2] *= factor;
+        }
+        let src_x = src_slice[1] + src_slice[3];
+        if src_x > image_w {
+            let factor = image_w / src_x;
+            src_slice[1] *= factor;
+            src_slice[3] *= factor;
+        }
+        let dest_y = dest_slice[0] + dest_slice[2];
+        if dest_y > rect.height && dest_y > 0.0 {
+            let factor = rect.height / dest_y;
+            dest_slice[0] *= factor;
+            dest_slice[2] *= factor;
+        }
+        let dest_x = dest_slice[1] + dest_slice[3];
+        if dest_x > rect.width && dest_x > 0.0 {
+            let factor = rect.width / dest_x;
+            dest_slice[1] *= factor;
+            dest_slice[3] *= factor;
+        }
+
+        let repeat_x = data.repeat[0];
+        let repeat_y = data.repeat[1];
+        for y in y0..y1 {
+            let py = y as f32 + 0.5 - area.y;
+            let sy = nine_slice_axis(
+                py,
+                area.height,
+                (dest_slice[0], dest_slice[2]),
+                (src_slice[0], src_slice[2], image_h),
+                repeat_y,
+            );
+            for x in x0..x1 {
+                let px = x as f32 + 0.5 - area.x;
+                let sx = nine_slice_axis(
+                    px,
+                    area.width,
+                    (dest_slice[3], dest_slice[1]),
+                    (src_slice[3], src_slice[1], image_w),
+                    repeat_x,
+                );
+                let tx = sx.clamp(0.0, image_w - 1.0) as u32;
+                let ty = sy.clamp(0.0, image_h - 1.0) as u32;
+                let [r, g, b, a] = source.get(tx, ty);
+                if a == 0 {
+                    continue;
+                }
+                self.blend_components(x, y, r, g, b, a as f32 / 255.0);
+            }
+        }
+    }
+}
+
+/// Maps a position along one axis of a nine-slice to a source-image coordinate.
+///
+/// `dest` is `(leading, trailing)` destination slice thickness; `src` is
+/// `(leading, trailing, total)` source sizes. The middle band stretches or
+/// tiles according to `mode`.
+fn nine_slice_axis(
+    position: f32,
+    length: f32,
+    dest: (f32, f32),
+    src: (f32, f32, f32),
+    mode: BorderImageRepeat,
+) -> f32 {
+    let (before, after) = dest;
+    let (src_before, src_after, src_length) = src;
+    let (offset, dst_span, src_start, src_span) = if position < before {
+        (position, before, 0.0, src_before)
+    } else if position >= length - after {
+        (
+            position - (length - after),
+            after,
+            src_length - src_after,
+            src_after,
+        )
+    } else {
+        (
+            position - before,
+            length - before - after,
+            src_before,
+            src_length - src_before - src_after,
+        )
+    };
+    if dst_span <= 0.0 || src_span <= 0.0 {
+        return src_start;
+    }
+    match mode {
+        BorderImageRepeat::Stretch | BorderImageRepeat::Space => {
+            src_start + (offset / dst_span) * src_span
+        }
+        BorderImageRepeat::Repeat => src_start + (offset % src_span),
+        BorderImageRepeat::Round => {
+            let count = (dst_span / src_span).round().max(1.0);
+            src_start + ((offset / dst_span * count).fract()) * src_span
+        }
+    }
+}
+
+/// W3C separable blend function for premultiplied compositing. Non-separable
+/// modes fall back to the channel-wise implementation in [`BlendMode::blend`].
+fn w3c_blend_channel(mode: BlendMode, cb: f32, cs: f32) -> f32 {
+    match mode {
+        BlendMode::Normal => cs,
+        BlendMode::Multiply => cb * cs,
+        BlendMode::Screen => cb + cs - cb * cs,
+        BlendMode::Overlay => {
+            if cb <= 0.5 {
+                2.0 * cb * cs
+            } else {
+                1.0 - 2.0 * (1.0 - cb) * (1.0 - cs)
+            }
+        }
+        other => {
+            f32::from(other.blend((cb * 255.0).round() as u8, (cs * 255.0).round() as u8)) / 255.0
+        }
+    }
 }
 
 /// A 4x5 colour matrix. Each row maps `[r, g, b, a, 1]` to an output channel.
@@ -2050,7 +2625,30 @@ fn command_bounds(commands: &[DisplayCommand]) -> Option<Rect> {
                     Rect::new(*x - px, *baseline - 2.0 * px, width + 2.0 * px, 4.0 * px),
                 );
             }
-            DisplayCommand::DrawLinearGradient { rect, .. } => union(&mut bounds, *rect),
+            DisplayCommand::DrawLinearGradient { rect, .. }
+            | DisplayCommand::DrawRadialGradient { rect, .. }
+            | DisplayCommand::DrawConicGradient { rect, .. }
+            | DisplayCommand::DrawImageWithRendering { rect, .. }
+            | DisplayCommand::DrawBorderImage { rect, .. } => union(&mut bounds, *rect),
+            DisplayCommand::DrawMasked {
+                rect,
+                child_commands,
+                ..
+            }
+            | DisplayCommand::DrawClipped {
+                rect,
+                child_commands,
+                ..
+            } => {
+                if let Some(child) = command_bounds(child_commands) {
+                    union(&mut bounds, child.intersect(rect));
+                }
+            }
+            DisplayCommand::DrawBlended { child_commands, .. } => {
+                if let Some(child) = command_bounds(child_commands) {
+                    union(&mut bounds, child);
+                }
+            }
             DisplayCommand::DrawTransformed {
                 child_commands,
                 matrix,
@@ -2450,6 +3048,36 @@ fn sample_rgba_bilinear(image: &ImageBuffer, fx: f32, fy: f32) -> [u8; 4] {
     out
 }
 
+/// Bilinearly samples a decoded image at normalized `(u, v)` coordinates.
+///
+/// Texel centres sit at `(i + 0.5) / dimension`, so the continuous source
+/// coordinate is `u * width - 0.5` (clamped to the edge texels). This mirrors
+/// [`sample_rgba_bilinear`] but works on [`ImageData`] directly.
+fn sample_image_bilinear(image: &ImageData, u: f32, v: f32) -> [u8; 4] {
+    let width = image.width as usize;
+    let height = image.height as usize;
+    if width == 0 || height == 0 {
+        return [0, 0, 0, 0];
+    }
+    let x = (u.clamp(0.0, 1.0) * image.width as f32 - 0.5).clamp(0.0, (width - 1) as f32);
+    let y = (v.clamp(0.0, 1.0) * image.height as f32 - 0.5).clamp(0.0, (height - 1) as f32);
+    let x0 = x.floor() as usize;
+    let y0 = y.floor() as usize;
+    let x1 = (x0 + 1).min(width - 1);
+    let y1 = (y0 + 1).min(height - 1);
+    let tx = x - x0 as f32;
+    let ty = y - y0 as f32;
+    let mut out = [0_u8; 4];
+    for channel in 0..4 {
+        let top = f32::from(image.pixels[(y0 * width + x0) * 4 + channel]) * (1.0 - tx)
+            + f32::from(image.pixels[(y0 * width + x1) * 4 + channel]) * tx;
+        let bottom = f32::from(image.pixels[(y1 * width + x0) * 4 + channel]) * (1.0 - tx)
+            + f32::from(image.pixels[(y1 * width + x1) * 4 + channel]) * tx;
+        out[channel] = (top * (1.0 - ty) + bottom * ty).round() as u8;
+    }
+    out
+}
+
 /// Renders a display list into an RGBA buffer.
 pub fn render(list: &DisplayList, viewport: Size, background: Color) -> ImageBuffer {
     Rasterizer::new(viewport, background).execute(list)
@@ -2652,6 +3280,7 @@ pub fn clear_render_cache() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::effects::{CoverageMask, ImageRendering};
     use std::time::{Duration, Instant};
 
     fn viewport() -> Size {
@@ -3448,6 +4077,256 @@ mod tests {
             cold.as_secs_f64() / warm.as_secs_f64().max(1e-9),
             cache.hits(),
             cache.misses()
+        );
+    }
+
+    // --- executable paint effects -------------------------------------------
+
+    fn filled(rect: Rect, color: Color) -> DisplayCommand {
+        DisplayCommand::FillRect { rect, color }
+    }
+
+    #[test]
+    fn masks_change_pixels() {
+        let mut mask = CoverageMask::new(16, 16);
+        for y in 0..16 {
+            for x in 0..16 {
+                mask.samples[y * 16 + x] = if x < 8 { 255 } else { 0 };
+            }
+        }
+        let build = |mask| {
+            let mut list = DisplayList::new();
+            list.push(DisplayCommand::DrawMasked {
+                rect: Rect::new(0.0, 0.0, 16.0, 16.0),
+                child_commands: vec![filled(
+                    Rect::new(0.0, 0.0, 16.0, 16.0),
+                    Color::rgb(255, 0, 0),
+                )],
+                mask,
+            });
+            render(&list, viewport(), Color::WHITE)
+        };
+        let alpha = build(MaskData::Alpha(mask.clone()));
+        assert_eq!(alpha.pixel(4, 8), [255, 0, 0, 255], "unmasked half paints");
+        assert_eq!(
+            alpha.pixel(12, 8),
+            [255, 255, 255, 255],
+            "masked half stays blank"
+        );
+        // The pre-reduced luminance channel uses the same coverage path.
+        let luminance = build(MaskData::Luminance(mask));
+        assert_eq!(luminance.pixel(4, 8), alpha.pixel(4, 8));
+        assert_eq!(luminance.pixel(12, 8), alpha.pixel(12, 8));
+        // A URL mask cannot be resolved by the software rasterizer yet.
+        let url = build(MaskData::Url("mask.png".into()));
+        assert_eq!(url, render(&DisplayList::new(), viewport(), Color::WHITE));
+    }
+
+    #[test]
+    fn clipped_group_respects_shape_coverage() {
+        let mut list = DisplayList::new();
+        list.push(DisplayCommand::DrawClipped {
+            child_commands: vec![filled(
+                Rect::new(0.0, 0.0, 32.0, 32.0),
+                Color::rgb(255, 0, 0),
+            )],
+            clip: ClipPath::parse("circle(50% at 50% 50%)").expect("circle clip"),
+            rect: Rect::new(0.0, 0.0, 32.0, 32.0),
+        });
+        let image = render(&list, viewport(), Color::WHITE);
+        assert_eq!(image.pixel(16, 16), [255, 0, 0, 255], "centre survives");
+        assert_eq!(
+            image.pixel(1, 1),
+            [255, 255, 255, 255],
+            "corner is clipped away"
+        );
+    }
+
+    #[test]
+    fn blend_mode_differs_from_normal() {
+        let build = |mode, filters: crate::effects::BackdropFilters| {
+            let mut list = DisplayList::new();
+            list.push(filled(
+                Rect::new(0.0, 0.0, 40.0, 40.0),
+                Color::rgb(200, 100, 50),
+            ));
+            list.push(DisplayCommand::DrawBlended {
+                child_commands: vec![filled(
+                    Rect::new(16.0, 16.0, 16.0, 16.0),
+                    Color::rgb(100, 200, 255),
+                )],
+                blend_mode: mode,
+                backdrop: filters,
+            });
+            render(&list, viewport(), Color::WHITE)
+        };
+        let normal = build(BlendMode::Normal, Default::default());
+        let multiply = build(BlendMode::Multiply, Default::default());
+        let overlay = build(BlendMode::Overlay, Default::default());
+        assert_eq!(normal.pixel(24, 24), [100, 200, 255, 255]);
+        assert_ne!(
+            multiply.pixel(24, 24),
+            normal.pixel(24, 24),
+            "multiply blends"
+        );
+        assert_ne!(
+            overlay.pixel(24, 24),
+            normal.pixel(24, 24),
+            "overlay blends"
+        );
+        assert!(
+            multiply.pixel(24, 24)[0] < normal.pixel(24, 24)[0],
+            "multiply darkens red over a bright backdrop"
+        );
+
+        // Backdrop filters change the pixels the blend operates on.
+        let filtered = build(
+            BlendMode::Multiply,
+            crate::effects::BackdropFilters::parse("brightness(0.5)"),
+        );
+        assert_ne!(filtered.pixel(24, 24), multiply.pixel(24, 24));
+    }
+
+    #[test]
+    fn radial_gradient_hits_center_and_last_stop() {
+        let gradient =
+            RadialGradient::parse("radial-gradient(circle at 50% 50%, red 0%, blue 100%)")
+                .expect("radial gradient");
+        let mut list = DisplayList::new();
+        list.push(DisplayCommand::DrawRadialGradient {
+            // Pixel (16, 16) has centre (16.5, 16.5), exactly the gradient centre.
+            rect: Rect::new(0.5, 0.5, 32.0, 32.0),
+            gradient,
+            radius: [0.0; 4],
+        });
+        let image = render(&list, viewport(), Color::WHITE);
+        assert_eq!(image.pixel(16, 16), [255, 0, 0, 255], "centre is stop 0");
+        assert!(
+            image.pixel(1, 1)[2] > 200,
+            "far corner approaches the last stop"
+        );
+        assert_eq!(image.pixel(63, 63), [255, 255, 255, 255], "outside the box");
+    }
+
+    #[test]
+    fn conic_gradient_hits_stops() {
+        let gradient =
+            ConicGradient::parse("conic-gradient(from 0deg at 50% 50%, red 0%, blue 100%)")
+                .expect("conic gradient");
+        let mut list = DisplayList::new();
+        list.push(DisplayCommand::DrawConicGradient {
+            rect: Rect::new(0.5, 0.5, 32.0, 32.0),
+            gradient,
+            radius: [0.0; 4],
+        });
+        let image = render(&list, viewport(), Color::WHITE);
+        assert_eq!(image.pixel(16, 1), [255, 0, 0, 255], "12 o'clock is t=0");
+        assert!(
+            image.pixel(32, 16)[2] > 0,
+            "3 o'clock is a quarter of the way to blue"
+        );
+        assert_eq!(image.pixel(63, 63), [255, 255, 255, 255], "outside the box");
+    }
+
+    #[test]
+    fn border_image_scales_nine_slices() {
+        use crate::effects::{BorderImageData, CssLength};
+
+        let mut source = ImageData::new(3, 3);
+        // Row-major: three corners, three edge centres, three corners.
+        let colors: [[u8; 3]; 9] = [
+            [255, 0, 0],
+            [0, 255, 0],
+            [0, 0, 255],
+            [255, 255, 0],
+            [0, 0, 0],
+            [255, 0, 255],
+            [0, 255, 255],
+            [128, 128, 128],
+            [255, 255, 255],
+        ];
+        for (index, rgb) in colors.iter().enumerate() {
+            source.set(
+                (index % 3) as u32,
+                (index / 3) as u32,
+                rgb[0],
+                rgb[1],
+                rgb[2],
+                255,
+            );
+        }
+        let border_image = BorderImageData {
+            source: "url(border.png)".into(),
+            slice: [CssLength::Px(1.0); 4],
+            width: [CssLength::Px(4.0); 4],
+            outset: [CssLength::Px(0.0); 4],
+            repeat: [BorderImageRepeat::Stretch; 2],
+        };
+        let mut list = DisplayList::new();
+        let index = list.add_image(source.clone());
+        list.push(DisplayCommand::DrawBorderImage {
+            rect: Rect::new(0.0, 0.0, 12.0, 12.0),
+            border_image: border_image.clone(),
+            image: index,
+        });
+        let image = render(&list, viewport(), Color::WHITE);
+        assert_eq!(image.pixel(2, 2), [255, 0, 0, 255], "top-left corner");
+        assert_eq!(image.pixel(10, 2), [0, 0, 255, 255], "top-right corner");
+        assert_eq!(image.pixel(2, 10), [0, 255, 255, 255], "bottom-left corner");
+        assert_eq!(image.pixel(6, 6), [0, 0, 0, 255], "stretched centre");
+
+        // border-image-outset paints outside the original border box.
+        let mut outset = border_image;
+        outset.outset = [CssLength::Px(2.0); 4];
+        let mut list = DisplayList::new();
+        let index = list.add_image(source.clone());
+        list.push(DisplayCommand::DrawBorderImage {
+            rect: Rect::new(0.0, 0.0, 12.0, 12.0),
+            border_image: outset,
+            image: index,
+        });
+        let painted = render(&list, viewport(), Color::WHITE);
+        assert_eq!(
+            painted.pixel(0, 0),
+            [255, 0, 0, 255],
+            "outset corner is painted outside the box"
+        );
+    }
+
+    #[test]
+    fn image_rendering_nearest_matches_legacy_and_smooth_interpolates() {
+        let mut source = ImageData::new(2, 2);
+        source.set(0, 0, 255, 0, 0, 255);
+        source.set(1, 0, 0, 255, 0, 255);
+        source.set(0, 1, 0, 0, 255, 255);
+        source.set(1, 1, 255, 255, 255, 255);
+        let build = |command: fn(usize) -> DisplayCommand| {
+            let mut list = DisplayList::new();
+            let index = list.add_image(source.clone());
+            list.push(command(index));
+            render(&list, viewport(), Color::WHITE)
+        };
+        let legacy = build(|image| DisplayCommand::DrawImage {
+            rect: Rect::new(0.0, 0.0, 20.0, 20.0),
+            image,
+        });
+        let nearest = build(|image| DisplayCommand::DrawImageWithRendering {
+            rect: Rect::new(0.0, 0.0, 20.0, 20.0),
+            image,
+            rendering: ImageRendering::Pixelated,
+        });
+        assert_eq!(legacy, nearest, "pixelated is byte-identical to DrawImage");
+        assert_eq!(nearest.pixel(5, 5), [255, 0, 0, 255], "crisp texel");
+
+        let smooth = build(|image| DisplayCommand::DrawImageWithRendering {
+            rect: Rect::new(0.0, 0.0, 20.0, 20.0),
+            image,
+            rendering: ImageRendering::Smooth,
+        });
+        assert_ne!(
+            smooth.pixel(8, 8),
+            nearest.pixel(8, 8),
+            "bilinear blends neighbouring texels"
         );
     }
 }

@@ -10,8 +10,9 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use browser_dom::{Document, NodeId, escape_text};
+use browser_event_loop::{Registration, ServiceWorkerEvent};
 use browser_http::{Client, ClientConfig, HttpError, Method, Request};
-use browser_navigation::{NavigationAction, NavigationBudget, Truncation};
+use browser_navigation::{IdbDatabase, NavigationAction, NavigationBudget, Truncation};
 use browser_paint::ImageBuffer;
 use browser_resource_loader::ResourceLoader;
 use browser_security::CspList;
@@ -588,8 +589,7 @@ impl Browser {
             if let Some(host) = host {
                 crate::script::notify_observers(self.page(), &host);
                 if let Some(runtime) = self.tab_mut().page.runtime.as_mut() {
-                    browser_web_apis::deliver_observer_callbacks(runtime, &host);
-                    let _ = runtime.run_microtasks();
+                    crate::script::deliver_observers(runtime, &host);
                 }
             }
         }
@@ -1088,6 +1088,120 @@ impl Browser {
             }
         }
         count
+    }
+
+    // ---- Service workers -------------------------------------------------
+
+    /// The page's host-side service worker mirror.
+    pub fn service_workers(&self) -> &crate::service_workers::ServiceWorkerMirror {
+        &self.page().service_workers
+    }
+
+    /// Registers a service worker for `scope`.
+    ///
+    /// `script_url` and the resolved scope must be secure contexts (HTTPS, or
+    /// loopback HTTP for local tests). `source`, when supplied, is the worker
+    /// script body evaluated for `install`, `activate` and `fetch` listeners.
+    pub fn register_service_worker(
+        &mut self,
+        scope: &str,
+        script_url: &str,
+        source: Option<&str>,
+    ) -> Result<(), String> {
+        let base = self.page().url.clone();
+        self.tab_mut()
+            .page
+            .service_workers
+            .register(scope, script_url, source, base.as_ref())
+    }
+
+    /// Activates the worker registered for `scope`.
+    pub fn activate_service_worker(&mut self, scope: &str) -> Result<(), String> {
+        self.tab_mut().page.service_workers.activate(scope)
+    }
+
+    /// Removes the worker registered for `scope`.
+    pub fn unregister_service_worker(&mut self, scope: &str) -> bool {
+        self.tab_mut().page.service_workers.unregister(scope)
+    }
+
+    /// Snapshot of current registrations (including redundant ones).
+    pub fn service_worker_registrations(&self) -> Vec<Registration> {
+        self.page().service_workers.registrations()
+    }
+
+    /// Events recorded by the worker script handler, awaiting JS dispatch.
+    pub fn take_service_worker_events(&mut self) -> Vec<ServiceWorkerEvent> {
+        self.tab_mut().page.service_workers.take_events()
+    }
+
+    /// Delivers recorded worker events to the page's JS listeners.
+    pub fn run_service_worker_events(&mut self) -> usize {
+        let Some(host) = self.page().host.clone() else {
+            return 0;
+        };
+        let Some(runtime) = self.tab_mut().page.runtime.as_mut() else {
+            return 0;
+        };
+        let delivered = browser_web_apis::run_service_worker_events(runtime, &host);
+        let _ = runtime.run_microtasks();
+        delivered
+    }
+
+    // ---- WebSocket -------------------------------------------------------
+
+    /// Polls the TCP WebSocket transport and dispatches events to JS handlers.
+    pub fn pump_websockets(&mut self) -> usize {
+        let Some(host) = self.page().host.clone() else {
+            return 0;
+        };
+        let Some(runtime) = self.tab_mut().page.runtime.as_mut() else {
+            return 0;
+        };
+        let applied = browser_web_apis::pump_websockets(runtime, &host);
+        let _ = runtime.run_microtasks();
+        applied
+    }
+
+    // ---- IndexedDB -------------------------------------------------------
+
+    /// True when a database with `name` has been opened on this page.
+    pub fn has_indexed_db(&self, name: &str) -> bool {
+        self.page()
+            .host
+            .as_ref()
+            .is_some_and(|host| host.borrow().indexed_db.databases.contains_key(name))
+    }
+
+    /// Names of every database opened through the page's `indexedDB` global.
+    pub fn indexed_db_names(&self) -> Vec<String> {
+        self.page().host.as_ref().map_or_else(Vec::new, |host| {
+            host.borrow().indexed_db.databases.keys().cloned().collect()
+        })
+    }
+
+    /// Runs `f` with read-only access to a named database.
+    pub fn with_indexed_db<T>(&self, name: &str, f: impl FnOnce(&IdbDatabase) -> T) -> Option<T> {
+        let host = self.page().host.as_ref()?;
+        let state = host.borrow();
+        state.indexed_db.databases.get(name).map(f)
+    }
+
+    /// Ensures a named database exists in the page's HostState.
+    ///
+    /// The `indexedDB` JavaScript global reads and writes these same
+    /// [`browser_navigation::IdbDatabase`] handles, so data persists across
+    /// every script execution and microtask drain on the page.
+    pub fn ensure_indexed_db(&mut self, name: &str, version: u32) {
+        crate::script::ensure_runtime(&mut self.tab_mut().page);
+        let host = self.page().host.clone().expect("runtime installed");
+        let mut state = host.borrow_mut();
+        if !state.indexed_db.databases.contains_key(name) {
+            state
+                .indexed_db
+                .databases
+                .insert(name.to_string(), IdbDatabase::open(name, version));
+        }
     }
 
     /// Dispatches a DOM event at the node under a point (used by click handling).

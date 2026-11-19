@@ -25,16 +25,22 @@
 pub mod abort;
 pub mod console;
 pub mod cssom;
+pub mod custom_elements;
+pub mod deferred;
 pub mod document;
 pub mod element;
 pub mod events;
 pub mod fetch;
 pub mod form;
+pub mod indexed_db;
 pub mod location;
 pub mod observers;
+pub mod service_worker;
+pub mod shadow;
 pub mod storage;
 pub mod timers;
 pub mod url_search_params;
+pub mod websocket;
 pub mod xhr;
 
 use std::cell::RefCell;
@@ -44,6 +50,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use browser_dom::{Document, NodeId};
+use browser_event_loop::{
+    ServiceWorkerEvent, ServiceWorkerRegistry, WebSocketManager, WebSocketTransport,
+};
 use browser_js::{Runtime, Value};
 
 use abort::AbortSignalState;
@@ -108,11 +117,41 @@ pub struct HostState {
     pub next_abort_id: u64,
     /// Intersection, resize and mutation observers plus their host hooks.
     pub observers: observers::Observers,
+    /// `customElements` host bookkeeping: callback handles, JS constructors and
+    /// promises created by `whenDefined`.
+    pub custom_elements: custom_elements::CustomElementHost,
+    /// Shared state of the default host WebSocket transport, used to inject
+    /// inbound events and inspect outbound frames without a network.
+    pub websocket_queue: websocket::HostWebSocketQueue,
+    /// Host-side service worker registry and the worker scripts/listeners used
+    /// by the script handler bridge.
+    pub service_workers: ServiceWorkerRegistry,
+    /// Worker script source, keyed by script URL, evaluated by the bridge.
+    pub service_worker_scripts: HashMap<String, String>,
+    /// Worker event listeners registered from JavaScript, keyed by event type.
+    pub service_worker_listeners: HashMap<String, Vec<Value>>,
+    /// Script URLs already evaluated by the service worker bridge.
+    pub service_worker_evaluated: std::collections::HashSet<String>,
+    /// Worker events recorded by the installed script handler, awaiting JS
+    /// dispatch.
+    pub service_worker_events: Arc<Mutex<Vec<ServiceWorkerEvent>>>,
+    /// Managed WebSocket connections. The default transport is an in-memory
+    /// one; embedders may replace it with a real network transport.
+    pub websocket_manager: WebSocketManager<Box<dyn WebSocketTransport>>,
+    /// JS event handlers for each managed WebSocket, keyed by connection id.
+    pub websocket_handlers: HashMap<u64, websocket::WebSocketJsHandlers>,
+    /// Databases opened through the `indexedDB` global, keyed by name.
+    pub indexed_db: indexed_db::IdbHost,
+    /// Live IndexedDB transaction objects created from JavaScript.
+    pub idb_transactions: HashMap<u64, indexed_db::IdbTransactionHost>,
+    /// Next IndexedDB transaction id.
+    pub next_idb_tx: u64,
 }
 
 impl HostState {
     /// Creates state for a document.
     pub fn new(document: Rc<RefCell<Document>>, url: Option<String>) -> Self {
+        let websocket_queue = websocket::HostWebSocketQueue::default();
         Self {
             document,
             events: HashMap::new(),
@@ -130,6 +169,20 @@ impl HostState {
             abort_signals: HashMap::new(),
             next_abort_id: 0,
             observers: observers::Observers::new(),
+            custom_elements: custom_elements::CustomElementHost::new(),
+            service_workers: ServiceWorkerRegistry::new(),
+            service_worker_scripts: HashMap::new(),
+            service_worker_listeners: HashMap::new(),
+            service_worker_evaluated: std::collections::HashSet::new(),
+            service_worker_events: Arc::new(Mutex::new(Vec::new())),
+            websocket_queue: websocket_queue.clone(),
+            websocket_manager: WebSocketManager::new(Box::new(websocket::HostWebSocketTransport {
+                shared: websocket_queue,
+            })),
+            websocket_handlers: HashMap::new(),
+            indexed_db: indexed_db::IdbHost::new(),
+            idb_transactions: HashMap::new(),
+            next_idb_tx: 1,
         }
     }
 
@@ -210,6 +263,11 @@ pub fn install(
     url_search_params::install(runtime);
     xhr::install(runtime, &state);
     observers::install(runtime, &state);
+    custom_elements::install(runtime, &state);
+    shadow::install(runtime, &state);
+    service_worker::install(runtime, &state);
+    websocket::install(runtime, &state);
+    indexed_db::install(runtime, &state);
 
     state
 }
@@ -224,6 +282,40 @@ pub fn drain_timers_now(runtime: &mut Runtime, state: &Rc<RefCell<HostState>>) -
     drain_timers(runtime, state, Instant::now())
 }
 
+/// Polls the WebSocket transport and dispatches buffered events to the
+/// JavaScript `onopen` / `onmessage` / `onclose` / `onerror` handlers as
+/// microtasks. Returns the number of transport events applied.
+pub fn pump_websockets(runtime: &mut Runtime, state: &Rc<RefCell<HostState>>) -> usize {
+    websocket::pump(runtime, state)
+}
+
+/// Delivers recorded service worker events to JavaScript listeners, evaluating
+/// each worker's registered script source first. Returns the number of events
+/// dispatched.
+pub fn run_service_worker_events(runtime: &mut Runtime, state: &Rc<RefCell<HostState>>) -> usize {
+    service_worker::run_events(runtime, state)
+}
+
+/// Resolves `customElements.whenDefined()` promises for names that were defined
+/// since the last check (including definitions made from Rust). Returns the
+/// number of promises settled.
+pub fn flush_custom_elements(runtime: &mut Runtime, state: &Rc<RefCell<HostState>>) -> usize {
+    custom_elements::flush(runtime, state)
+}
+
+/// Replaces the transport used by the managed WebSockets. Existing connections
+/// are closed first because the event-loop manager owns a single transport.
+pub fn set_websocket_transport(
+    state: &Rc<RefCell<HostState>>,
+    transport: Box<dyn WebSocketTransport>,
+) {
+    let mut borrowed = state.borrow_mut();
+    let _ = borrowed
+        .websocket_manager
+        .close_all(1001, "transport replaced");
+    borrowed.websocket_manager = WebSocketManager::new(transport);
+}
+
 pub use events::{
     DispatchOutcome, EventInit, dispatch_event, dispatch_event_object, dispatch_event_with,
     dispatch_keyboard_event, dispatch_mouse_event,
@@ -233,3 +325,29 @@ pub use observers::{
     LayoutBoxResolver, Mutation, MutationKind, Observers, Rect, deliver_observer_callbacks,
     deliver_observer_callbacks_now, notify_observers, record_mutation,
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use browser_html_parser::parse_document;
+
+    #[test]
+    fn new_platform_globals_are_exposed() {
+        let mut runtime = Runtime::new();
+        let document = Rc::new(RefCell::new(parse_document("<html><body></body></html>")));
+        let _state = install(&mut runtime, document, None);
+        for expression in [
+            "typeof customElements === 'object'",
+            "typeof ServiceWorkerContainer === 'function'",
+            "typeof navigator.serviceWorker === 'object'",
+            "typeof WebSocket === 'function'",
+            "typeof indexedDB === 'object'",
+            "typeof ShadowRoot === 'function'",
+        ] {
+            assert!(
+                matches!(runtime.eval(expression).unwrap(), Value::Bool(true)),
+                "expected {expression}"
+            );
+        }
+    }
+}

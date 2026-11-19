@@ -12,6 +12,7 @@
 //! restores a usable chrome state. Escape returns the window to that state.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use browser_core::{Browser, BrowserError, Snapshot};
 use browser_gpu::{NativeDevice, NativePresenter};
@@ -24,7 +25,8 @@ use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
 
 use crate::chrome::render::{
-    FramePipeline, PageRenderJob, render_context_menu, render_window_with_page_scaled,
+    FramePipeline, LayerView, PageRenderJob, ScrollbarAxis, as_layer_frames, plan_layers,
+    render_context_menu, render_window_with_page_scaled, scrollbar_at,
 };
 use crate::chrome::{ChromeLayout, ChromePart, LoadStatus, UiState};
 use crate::devtools::{DevTools, LogLevel, RequestStatus, ResourceType};
@@ -88,6 +90,35 @@ struct WindowApp {
     context_link: Option<String>,
     /// Drag-to-reorder state machine for the tab strip.
     tab_drag: TabDrag,
+    /// Active scrollbar-thumb drag, if the user is dragging one.
+    scrollbar_drag: Option<ScrollbarDrag>,
+    /// Elapsed animation time in seconds, published for the style engine's
+    /// sampling API. See [`WindowApp::sample_animation_time`].
+    pub pending_animation_time: Option<f32>,
+    /// Wall-clock origin of the animation clock; reset on every navigation.
+    animation_epoch: Option<Instant>,
+    /// True while a sampled animation still needs continuous redraws.
+    animations_active: bool,
+}
+
+/// State captured when a page scrollbar thumb starts dragging.
+#[derive(Clone, Copy)]
+struct ScrollbarDrag {
+    box_index: usize,
+    /// A document-space point inside the scroll container (for `scroll_at`).
+    /// The gutter itself is laid out just outside the container's border box,
+    /// so the thumb position cannot be used to find the container.
+    scroll_x: f32,
+    scroll_y: f32,
+    /// Pointer document y at the start of the drag.
+    start_doc_y: f32,
+    /// Scroll offset at the start of the drag.
+    start_scroll: f32,
+    /// Scrollable range of the container.
+    max_scroll: f32,
+    /// Length of the track and thumb along the drag axis.
+    track_len: f32,
+    thumb_len: f32,
 }
 
 impl WindowApp {
@@ -122,6 +153,10 @@ impl WindowApp {
             context_menu: None,
             context_link: None,
             tab_drag: TabDrag::new(),
+            scrollbar_drag: None,
+            pending_animation_time: None,
+            animation_epoch: None,
+            animations_active: false,
         }
     }
 
@@ -240,6 +275,13 @@ impl WindowApp {
 
     /// Returns the window to a usable state after any navigation outcome.
     fn finish_navigation(&mut self, outcome: NavigationOutcome) {
+        // A new document starts a fresh animation timeline. The style engine's
+        // sampler (wired in `sample_animation_time`) will mark whether this page
+        // actually needs continuous redraws.
+        self.animation_epoch = Some(Instant::now());
+        self.pending_animation_time = None;
+        self.animations_active = false;
+        self.scrollbar_drag = None;
         match outcome {
             NavigationOutcome::Loaded(snapshot) => self.navigation_ok(snapshot),
             NavigationOutcome::Failed(error) => self.navigation_error(error),
@@ -685,6 +727,125 @@ impl WindowApp {
         }
     }
 
+    /// Maps a window-space point to document (CSS) coordinates, undoing the
+    /// page zoom that the compositor applies when rasterizing the page image.
+    fn document_point(&self, x: f32, y: f32) -> Option<(f32, f32)> {
+        let (page_x, page_y) = self.chrome.page_local(x, y)?;
+        let zoom = self.zoom.level().max(f32::MIN_POSITIVE);
+        Some((page_x / zoom, page_y / zoom))
+    }
+
+    /// Feeds elapsed wall-clock time into the style engine's animation sampler.
+    ///
+    /// This is the single call site for the window's animation clock, invoked on
+    /// every redraw from [`WindowApp::draw`]. `browser-style` now exposes
+    /// `AnimationClock::sample(elapsed)` / `is_active()` and
+    /// `animation_bridge::animated_properties`. Once a `Browser`-level sampler
+    /// surfaces those, replace the body below with a call such as
+    /// `self.animations_active = self.browser.sample_animations(elapsed);` and
+    /// keep assigning the elapsed seconds to `pending_animation_time`. Until
+    /// then the field is the documented hand-off point for that API.
+    fn sample_animation_time(&mut self) {
+        self.pending_animation_time = self
+            .animation_epoch
+            .map(|epoch| epoch.elapsed().as_secs_f32());
+        // `pending_animation_time` is the hand-off to the future sampler; read
+        // it here so it is live even before that API exists.
+        let elapsed = self.pending_animation_time;
+        // Future: self.animations_active = self.browser.sample_animations(elapsed);
+        debug_assert!(elapsed.is_none_or(|seconds| seconds.is_finite() && seconds >= 0.0));
+    }
+
+    /// Scrolls the container owning `box_index` until its offset reaches `target`.
+    ///
+    /// The engine's `scroll_at` takes a document point and scrolls the deepest
+    /// container under it. The scrollbar gutter is laid out just *outside* that
+    /// container's border box, so callers pass a point just inside it. Applying
+    /// only the difference from the live offset keeps clamping correct when the
+    /// user drags past either end.
+    fn scroll_container_to(&mut self, box_index: usize, doc_x: f32, doc_y: f32, target: f32) {
+        let current = self
+            .browser
+            .page()
+            .layout
+            .boxes
+            .get(box_index)
+            .map_or(0.0, |b| b.scroll_offset.1);
+        let delta = target - current;
+        if delta.abs() < 0.01 {
+            return;
+        }
+        if self.browser.scroll_at(doc_x, doc_y, delta) {
+            self.render_dirty = true;
+            if self.ui.find_open {
+                self.ui.find_highlights =
+                    find_overlay::highlights(self.browser.page(), &self.ui.find);
+            }
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
+        }
+    }
+
+    /// Handles a press on the page scrollbars, returning true when consumed.
+    fn begin_scrollbar_interaction(&mut self, x: f32, y: f32) -> bool {
+        let Some((doc_x, doc_y)) = self.document_point(x, y) else {
+            return false;
+        };
+        let Some(bar) = scrollbar_at(&self.browser, doc_x, doc_y) else {
+            return false;
+        };
+        if bar.axis != ScrollbarAxis::Vertical || bar.max_scroll <= 0.0 {
+            // Horizontal scrolling is not implemented by the engine yet, but
+            // consuming the click keeps it from activating page content.
+            return true;
+        }
+        let on_thumb = doc_y >= bar.thumb.y && doc_y < bar.thumb.bottom();
+        if on_thumb {
+            let start_scroll = self
+                .browser
+                .page()
+                .layout
+                .boxes
+                .get(bar.box_index)
+                .map_or(0.0, |b| b.scroll_offset.1);
+            self.scrollbar_drag = Some(ScrollbarDrag {
+                box_index: bar.box_index,
+                scroll_x: bar.track.x - 1.0,
+                scroll_y: bar.track.y + bar.track.height / 2.0,
+                start_doc_y: doc_y,
+                start_scroll,
+                max_scroll: bar.max_scroll,
+                track_len: bar.track.height,
+                thumb_len: bar.thumb.height,
+            });
+        } else {
+            // Clicking the gutter pages the thumb to the clicked position.
+            let progress = ((doc_y - bar.track.y) / bar.track.height).clamp(0.0, 1.0);
+            self.scroll_container_to(
+                bar.box_index,
+                bar.track.x - 1.0,
+                bar.track.y + bar.track.height / 2.0,
+                progress * bar.max_scroll,
+            );
+        }
+        true
+    }
+
+    /// Moves the active thumb drag to the pointer's current document position.
+    fn update_scrollbar_drag(&mut self, x: f32, y: f32) {
+        let Some((_doc_x, doc_y)) = self.document_point(x, y) else {
+            return;
+        };
+        let Some(drag) = self.scrollbar_drag else {
+            return;
+        };
+        let travel = (drag.track_len - drag.thumb_len).max(1.0);
+        let target = (drag.start_scroll + (doc_y - drag.start_doc_y) / travel * drag.max_scroll)
+            .clamp(0.0, drag.max_scroll);
+        self.scroll_container_to(drag.box_index, drag.scroll_x, drag.scroll_y, target);
+    }
+
     fn on_key(&mut self, event: &winit::event::KeyEvent) {
         if event.state != ElementState::Pressed {
             return;
@@ -870,6 +1031,10 @@ impl WindowApp {
     }
 
     fn draw(&mut self) {
+        // Every redraw advances the animation clock. Until the style engine's
+        // sampler lands, this only publishes elapsed seconds; see the call site
+        // in `sample_animation_time`.
+        self.sample_animation_time();
         let (Some(window), Some(presenter)) = (self.window.as_ref(), self.presenter.as_mut())
         else {
             return;
@@ -907,6 +1072,11 @@ impl WindowApp {
         if self.pipeline.has_pending() {
             window.request_redraw();
         }
+        // Animations have no external input to wake the loop, so keep asking
+        // for frames while the sampler reports active ones.
+        if self.animations_active {
+            window.request_redraw();
+        }
         if self.devtools.open {
             let window = Rect::new(0.0, 0.0, self.chrome.width, self.chrome.height);
             let panel = self.devtools.panel_rect(window);
@@ -918,7 +1088,30 @@ impl WindowApp {
             render_context_menu(&mut image, menu, self.ui.context_hover, scale);
         }
         window.pre_present_notify();
-        match presenter.present(&image) {
+        // Feed the compositor's layer snapshots to the multi-layer presenter.
+        // The software rasterizer has already merged them into `image`, so the
+        // planned frames reproduce the exact same pixels; a page with no layers
+        // (or an empty plan) falls back to the single-image presenter.
+        let views: Vec<LayerView> = self
+            .browser
+            .page()
+            .layers
+            .composite_layers()
+            .into_iter()
+            .map(|layer| LayerView {
+                id: layer.id.0 as u64,
+                bounds: layer.visible_bounds(),
+                opacity: layer.opacity,
+            })
+            .collect();
+        let plans = plan_layers(&image, views, self.chrome.page, scale, self.zoom.level());
+        let result = if plans.is_empty() {
+            presenter.present(&image)
+        } else {
+            let frames = as_layer_frames(&plans);
+            presenter.present_layers(&frames)
+        };
+        match result {
             Ok(_) => self.present_error = false,
             Err(error) => {
                 if !self.present_error {
@@ -1033,6 +1226,10 @@ impl ApplicationHandler for WindowApp {
                 let x = position.x as f32 / scale;
                 let y = position.y as f32 / scale;
                 self.cursor = (x, y);
+                if self.scrollbar_drag.is_some() {
+                    self.update_scrollbar_drag(x, y);
+                    return;
+                }
                 if self.tab_drag.is_dragging()
                     && y >= self.chrome.tab_strip.y
                     && y < self.chrome.tab_strip.bottom()
@@ -1101,6 +1298,9 @@ impl ApplicationHandler for WindowApp {
                                 // A click outside the menu dismisses it and then
                                 // continues to the control underneath.
                             }
+                            if self.begin_scrollbar_interaction(x, y) {
+                                return;
+                            }
                             if self.ui.find_focused
                                 && !matches!(
                                     self.chrome.hit(x, y),
@@ -1136,6 +1336,12 @@ impl ApplicationHandler for WindowApp {
                             self.click_at(x, y);
                         }
                         ElementState::Released => {
+                            if self.scrollbar_drag.take().is_some() {
+                                if let Some(window) = &self.window {
+                                    window.request_redraw();
+                                }
+                                return;
+                            }
                             if self.tab_drag.is_dragging() {
                                 let source = self.tab_drag.source();
                                 let was_click = source == self.tab_drag.target();
@@ -1160,8 +1366,18 @@ impl ApplicationHandler for WindowApp {
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        // Nothing periodic: the window is redrawn only after input or loads.
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // Animations have no input event to wake the loop, so switch to polling
+        // and request a frame until the sampler says they have settled. Idle
+        // windows stay on `Wait` and draw only after input or loads.
+        if self.animations_active {
+            event_loop.set_control_flow(ControlFlow::Poll);
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
+        } else {
+            event_loop.set_control_flow(ControlFlow::Wait);
+        }
     }
 }
 
@@ -1323,5 +1539,48 @@ mod tests {
             true,
             false
         ));
+    }
+
+    #[test]
+    fn animation_time_is_published_on_every_sample() {
+        let mut app = app();
+        assert!(app.pending_animation_time.is_none());
+        app.animation_epoch = Some(Instant::now());
+        app.sample_animation_time();
+        assert!(app.pending_animation_time.is_some());
+        // Until the sampler lands, no animation keeps the loop polling.
+        assert!(!app.animations_active);
+    }
+
+    #[test]
+    fn dragging_a_scrollbar_thumb_scrolls_its_container() {
+        let mut app = app();
+        app.browser
+            .load_html(
+                "<html><body style='margin:0'><div id='s' \
+                 style='width:100px;height:60px;overflow-y:scroll'>\
+                 <div style='height:400px'></div></div></body></html>",
+                None,
+            )
+            .unwrap();
+        let bar = *crate::chrome::render::scrollbars(&app.browser)
+            .iter()
+            .find(|bar| bar.axis == ScrollbarAxis::Vertical)
+            .expect("the overflowing div needs a scrollbar");
+        let before = app.browser.page().layout.boxes[bar.box_index]
+            .scroll_offset
+            .1;
+
+        // Tests run at zoom 1, so document coordinates equal page-local ones.
+        let x = app.chrome.page.x + bar.thumb.x + bar.thumb.width / 2.0;
+        let y = app.chrome.page.y + bar.thumb.y + 2.0;
+        assert!(app.begin_scrollbar_interaction(x, y));
+        assert!(app.scrollbar_drag.is_some());
+        app.update_scrollbar_drag(x, y + 20.0);
+        let after = app.browser.page().layout.boxes[bar.box_index]
+            .scroll_offset
+            .1;
+        assert!(after > before, "dragging the thumb down must scroll down");
+        app.scrollbar_drag = None;
     }
 }

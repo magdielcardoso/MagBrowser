@@ -14,6 +14,8 @@ browser-selectors = { workspace = true }
 browser-js = { workspace = true }
 browser-dom = { workspace = true }
 browser-url = { workspace = true }
+browser-event-loop = { workspace = true }
+browser-navigation = { workspace = true }
 
 [lints]
 workspace = true

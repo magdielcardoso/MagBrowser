@@ -53,10 +53,97 @@ pub fn build_with_effects(
     images: &HashMap<NodeId, ImageData>,
     raw: &HashMap<NodeId, crate::effects::RawEffects>,
 ) -> (DisplayList, crate::effects::EffectsList) {
-    (
-        build_with_images(layout, images),
-        crate::effects::build_effects_with(layout, raw),
-    )
+    let mut list = build_with_images(layout, images);
+    let effects = crate::effects::build_effects_with(layout, raw);
+    append_executable_effects(&mut list, &effects);
+    (list, effects)
+}
+
+fn first_rect(commands: &[DisplayCommand]) -> Option<Rect> {
+    commands.iter().find_map(|command| match command {
+        DisplayCommand::FillRect { rect, .. }
+        | DisplayCommand::DrawImage { rect, .. }
+        | DisplayCommand::DrawBorder { rect, .. } => Some(*rect),
+        DisplayCommand::DrawRoundedRect { rect, .. }
+        | DisplayCommand::DrawImageWithRendering { rect, .. }
+        | DisplayCommand::DrawBorderImage { rect, .. }
+        | DisplayCommand::DrawLinearGradient { rect, .. }
+        | DisplayCommand::DrawRadialGradient { rect, .. }
+        | DisplayCommand::DrawConicGradient { rect, .. }
+        | DisplayCommand::DrawShadow { rect, .. } => Some(*rect),
+        DisplayCommand::DrawTransformed { child_commands, .. }
+        | DisplayCommand::DrawFiltered { child_commands, .. }
+        | DisplayCommand::DrawMasked { child_commands, .. }
+        | DisplayCommand::DrawClipped { child_commands, .. }
+        | DisplayCommand::DrawBlended { child_commands, .. } => first_rect(child_commands),
+        _ => None,
+    })
+}
+
+/// Lowers parsed effect data into commands the software rasterizer executes.
+fn append_executable_effects(list: &mut DisplayList, effects: &crate::effects::EffectsList) {
+    for effect in &effects.commands {
+        use crate::effects::ExtendedCommand as E;
+        let command = match effect {
+            E::DrawMasked {
+                child_commands,
+                mask,
+            } => DisplayCommand::DrawMasked {
+                rect: first_rect(child_commands).unwrap_or_default(),
+                child_commands: child_commands.clone(),
+                mask: mask.clone(),
+            },
+            E::DrawClipped {
+                child_commands,
+                clip,
+                rect,
+            } => DisplayCommand::DrawClipped {
+                child_commands: child_commands.clone(),
+                clip: clip.clone(),
+                rect: *rect,
+            },
+            E::DrawBlended {
+                child_commands,
+                blend_mode,
+                backdrop,
+            } => DisplayCommand::DrawBlended {
+                child_commands: child_commands.clone(),
+                blend_mode: *blend_mode,
+                backdrop: backdrop.clone(),
+            },
+            E::DrawRadialGradient {
+                rect,
+                gradient,
+                radius,
+            } => DisplayCommand::DrawRadialGradient {
+                rect: *rect,
+                gradient: gradient.clone(),
+                radius: *radius,
+            },
+            E::DrawConicGradient {
+                rect,
+                gradient,
+                radius,
+            } => DisplayCommand::DrawConicGradient {
+                rect: *rect,
+                gradient: gradient.clone(),
+                radius: *radius,
+            },
+            E::DrawImageWithRendering {
+                rect,
+                image,
+                rendering,
+            } => DisplayCommand::DrawImageWithRendering {
+                rect: *rect,
+                image: *image,
+                rendering: *rendering,
+            },
+            // border-image needs a resolved image index and outline is already
+            // emitted by the regular border path; both remain data-only here.
+            E::DrawBorderImage { .. } | E::DrawOutline { .. } => continue,
+        };
+        list.push(command);
+    }
 }
 
 /// Paints one box (and its descendants) into a fresh display list.

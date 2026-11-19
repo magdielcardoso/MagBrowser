@@ -14,7 +14,8 @@ use std::thread::{self, JoinHandle};
 
 use browser_core::{Browser, Page};
 use browser_css::Color;
-use browser_layout::Size;
+use browser_gpu::{BlendMode, DirtyRect, LayerFrame, LayerTransform};
+use browser_layout::{Rect, Size};
 use browser_paint::raster::render_cached;
 use browser_paint::{DisplayList, ImageBuffer};
 
@@ -163,6 +164,130 @@ impl Default for FramePipeline {
     }
 }
 
+// -- GPU layer presentation -------------------------------------------------
+
+/// The GPU-free view of a compositor snapshot needed to build a layer frame.
+///
+/// The window maps `LayerTree::composite_layers()` into these values; keeping
+/// this struct here means the pipeline never has to depend on the compositor
+/// crate, and the mapping is easy to unit-test without a GPU adapter.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LayerView {
+    /// Stable compositor layer id.
+    pub id: u64,
+    /// Unscrolled layer bounds in document coordinates.
+    pub bounds: Rect,
+    /// Opacity reported by the compositor snapshot.
+    pub opacity: f32,
+}
+
+/// One layer's owned pixel crop, ready to be wrapped in a [`LayerFrame`].
+#[derive(Debug, Clone)]
+pub struct LayerData {
+    /// Stable compositor layer id.
+    pub id: u64,
+    /// Tightly packed RGBA pixels of the crop.
+    pub pixels: Vec<u8>,
+    /// Crop width in device pixels.
+    pub width: u32,
+    /// Crop height in device pixels.
+    pub height: u32,
+    /// Destination rectangle in device pixels.
+    pub dest: Rect,
+    /// Opacity applied at presentation time.
+    pub opacity: f32,
+    /// Opacity reported by the compositor, retained for diagnostics and for a
+    /// future path that rasterizes layers independently.
+    pub snapshot_opacity: f32,
+}
+
+/// Clips `rect` to `bounds`, returning an empty rectangle when disjoint.
+fn clamp_rect(rect: Rect, bounds: Rect) -> Rect {
+    let x = rect.x.max(bounds.x);
+    let y = rect.y.max(bounds.y);
+    let right = rect.right().min(bounds.right());
+    let bottom = rect.bottom().min(bounds.bottom());
+    Rect::new(x, y, (right - x).max(0.0), (bottom - y).max(0.0))
+}
+
+/// Plans GPU layer frames from compositor snapshots and a finished window image.
+///
+/// The software rasterizer has already blended every compositor layer into
+/// `image`. The bottom-most snapshot therefore supplies the full frame, and
+/// each remaining snapshot supplies a crop of that same image at its visible
+/// bounds. Re-drawing identical pixels is a visual no-op, which keeps the GPU
+/// path pixel-identical to `present(&ImageBuffer)` while exercising the real
+/// multi-layer upload/composite code. `opacity` is deliberately 1.0: applying
+/// the compositor's opacity again would darken already-composited pixels.
+///
+/// `scale` is the device pixel ratio and `zoom` the logical page zoom; together
+/// they map document coordinates in `bounds` onto device pixels in `image`.
+pub fn plan_layers(
+    image: &ImageBuffer,
+    layers: impl IntoIterator<Item = LayerView>,
+    page: Rect,
+    scale: f32,
+    zoom: f32,
+) -> Vec<LayerData> {
+    let full = Rect::new(0.0, 0.0, image.width as f32, image.height as f32);
+    let mut plans = Vec::new();
+    for (index, layer) in layers.into_iter().enumerate() {
+        let requested = if index == 0 {
+            full
+        } else {
+            let bounds = layer.bounds;
+            Rect::new(
+                (page.x + bounds.x * zoom) * scale,
+                (page.y + bounds.y * zoom) * scale,
+                (bounds.width * zoom * scale).max(0.0),
+                (bounds.height * zoom * scale).max(0.0),
+            )
+        };
+        let dest = clamp_rect(requested, full);
+        if dest.is_empty() {
+            continue;
+        }
+        let x = (dest.x.round().max(0.0) as u32).min(image.width.saturating_sub(1));
+        let y = (dest.y.round().max(0.0) as u32).min(image.height.saturating_sub(1));
+        let width = (dest.width.round().max(1.0) as u32).min(image.width - x);
+        let height = (dest.height.round().max(1.0) as u32).min(image.height - y);
+        let mut pixels = Vec::with_capacity((width as usize) * (height as usize) * 4);
+        for row in y..y + height {
+            let start = (row as usize * image.width as usize + x as usize) * 4;
+            pixels.extend_from_slice(&image.pixels[start..start + width as usize * 4]);
+        }
+        plans.push(LayerData {
+            id: layer.id,
+            pixels,
+            width,
+            height,
+            dest: Rect::new(x as f32, y as f32, width as f32, height as f32),
+            opacity: 1.0,
+            snapshot_opacity: layer.opacity,
+        });
+    }
+    plans
+}
+
+/// Wraps planned layer data into GPU frames, in back-to-front slice order.
+pub fn as_layer_frames(plans: &[LayerData]) -> Vec<LayerFrame<'_>> {
+    plans
+        .iter()
+        .map(|plan| LayerFrame {
+            id: plan.id,
+            pixels: &plan.pixels,
+            width: plan.width,
+            height: plan.height,
+            dest: plan.dest,
+            opacity: plan.opacity,
+            transform: LayerTransform::from_rect(plan.width, plan.height, plan.dest),
+            blend: BlendMode::Normal,
+            dirty: Some(DirtyRect::new(0, 0, plan.width, plan.height)),
+            content_hash: None,
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -249,5 +374,45 @@ mod tests {
         wait_for_frame(&mut pipeline, Duration::from_secs(10));
         let expected = second.page().render_scaled(1.0);
         assert_eq!(pipeline.latest(), Some(&expected));
+    }
+
+    #[test]
+    fn layer_plan_builds_frames_from_compositor_views() {
+        let image = ImageBuffer::filled(8, 6, Color::rgb(20, 40, 60));
+        let views = [
+            LayerView {
+                id: 0,
+                bounds: Rect::new(0.0, 0.0, 8.0, 6.0),
+                opacity: 1.0,
+            },
+            LayerView {
+                id: 1,
+                bounds: Rect::new(2.0, 1.0, 3.0, 2.0),
+                opacity: 0.5,
+            },
+        ];
+        let plans = plan_layers(&image, views, Rect::new(0.0, 0.0, 8.0, 6.0), 1.0, 1.0);
+        assert_eq!(plans.len(), 2);
+        // The bottom layer carries the whole composed frame.
+        assert_eq!((plans[0].width, plans[0].height), (8, 6));
+        assert_eq!(plans[0].pixels, image.pixels);
+        // The overlay carries only its visible bounds, already composited.
+        assert_eq!((plans[1].width, plans[1].height), (3, 2));
+        assert_eq!((plans[1].dest.x, plans[1].dest.y), (2.0, 1.0));
+        assert_eq!(plans[1].opacity, 1.0);
+        assert_eq!(plans[1].snapshot_opacity, 0.5);
+
+        let frames = as_layer_frames(&plans);
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[1].id, 1);
+        assert_eq!(frames[1].pixels.len(), 3 * 2 * 4);
+        assert!(frames[1].transform.is_finite());
+        assert!(!frames[1].is_empty());
+    }
+
+    #[test]
+    fn empty_compositor_falls_back_to_a_single_frame() {
+        let image = ImageBuffer::filled(2, 2, Color::rgb(1, 2, 3));
+        assert!(plan_layers(&image, [], Rect::new(0.0, 0.0, 2.0, 2.0), 1.0, 1.0).is_empty());
     }
 }
