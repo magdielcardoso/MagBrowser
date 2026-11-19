@@ -4,6 +4,14 @@
 //! currently performs: simple requests, preflight detection, `Access-Control-
 //! Allow-Origin` matching and preflight method/header/credential checks.
 //!
+//! Response parsing is tolerant of the shapes real servers send: repeated
+//! `Access-Control-Allow-Methods` / `Access-Control-Allow-Headers` lines are
+//! combined, `Access-Control-Max-Age` is clamped to a browser-sized cache window,
+//! and `Access-Control-Expose-Headers` / `Vary: Origin` can be inspected by the
+//! caller. It stays strict where ambiguity could leak data: an ambiguous
+//! `Access-Control-Allow-Origin`, a wildcard with credentials, and header values
+//! containing CORS-unsafe bytes are all rejected.
+//!
 //! Credentials are inferred from the presence of `Cookie` or `Authorization` on
 //! the request. Hosts that track CORS credentials mode separately should call
 //! [`evaluate_response_with_credentials`].
@@ -55,13 +63,7 @@ impl CorsRequest {
     /// The `Access-Control-Request-Headers` list, split and trimmed.
     pub fn requested_headers(&self) -> Vec<&str> {
         self.header("access-control-request-headers")
-            .map_or_else(Vec::new, |value| {
-                value
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|name| !name.is_empty())
-                    .collect()
-            })
+            .map_or_else(Vec::new, parse_header_list)
     }
 
     /// True when the request includes credentials.
@@ -121,6 +123,63 @@ impl CorsResponse {
             .find(|(key, _)| key.eq_ignore_ascii_case(name))
             .map(|(_, value)| value.as_str())
     }
+
+    /// Every value of a header name, in the order the headers were added.
+    ///
+    /// Real servers sometimes split `Access-Control-Allow-Methods` and
+    /// `Access-Control-Allow-Headers` over several header lines; CORS checks use
+    /// the union of those lines.
+    pub fn headers_all(&self, name: &str) -> Vec<&str> {
+        self.headers
+            .iter()
+            .filter(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+            .collect()
+    }
+
+    /// Parsed `Access-Control-Max-Age` in seconds.
+    ///
+    /// Multiple values take the largest one, and the result is capped at two
+    /// hours, matching common browser preflight caches. Malformed values are
+    /// ignored so a bad header cannot poison the cache.
+    pub fn max_age(&self) -> Option<u64> {
+        const MAX_PREFLIGHT_CACHE_SECONDS: u64 = 7200;
+        self.headers_all("access-control-max-age")
+            .into_iter()
+            .filter_map(|value| value.trim().parse::<u64>().ok())
+            .max()
+            .map(|age| age.min(MAX_PREFLIGHT_CACHE_SECONDS))
+    }
+
+    /// Lowercased names from every `Access-Control-Expose-Headers` header.
+    ///
+    /// A `*` entry is preserved so callers can implement their own wildcard rule.
+    pub fn exposed_headers(&self) -> Vec<String> {
+        self.headers_all("access-control-expose-headers")
+            .into_iter()
+            .flat_map(parse_header_list)
+            .map(str::to_ascii_lowercase)
+            .collect()
+    }
+
+    /// True when any `Vary` header lists `Origin`.
+    ///
+    /// This is informational: callers should still key their CORS cache by origin.
+    pub fn varies_on_origin(&self) -> bool {
+        self.headers_all("vary")
+            .into_iter()
+            .flat_map(parse_header_list)
+            .any(|name| name.eq_ignore_ascii_case("origin"))
+    }
+}
+
+/// Splits a comma-separated header list into trimmed, non-empty entries.
+pub fn parse_header_list(value: &str) -> Vec<&str> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .collect()
 }
 
 /// Whether a CORS request can be sent without a preflight.
@@ -225,7 +284,14 @@ pub fn is_simple_method(method: &str) -> bool {
 }
 
 /// True for the CORS-safelisted request headers.
+///
+/// Header values containing CORS-unsafe bytes (control characters and a handful
+/// of delimiters) are rejected instead of being treated as safelisted. `Range` is
+/// safelisted only for a single, well-formed byte range, as required by Fetch.
 pub fn is_simple_header(name: &str, value: &str) -> bool {
+    if has_cors_unsafe_bytes(value) {
+        return false;
+    }
     if name.eq_ignore_ascii_case("accept")
         || name.eq_ignore_ascii_case("accept-language")
         || name.eq_ignore_ascii_case("content-language")
@@ -244,7 +310,62 @@ pub fn is_simple_header(name: &str, value: &str) -> bool {
             "application/x-www-form-urlencoded" | "multipart/form-data" | "text/plain"
         );
     }
+    if name.eq_ignore_ascii_case("range") {
+        return is_simple_range(value);
+    }
     false
+}
+
+/// Bytes Fetch forbids in a CORS-safelisted request-header value.
+fn has_cors_unsafe_bytes(value: &str) -> bool {
+    value.bytes().any(|byte| {
+        matches!(
+            byte,
+            0x00..=0x08
+                | 0x0A..=0x0C
+                | 0x0E..=0x1F
+                | 0x7F
+                | b'"'
+                | b'('
+                | b')'
+                | b':'
+                | b'<'
+                | b'>'
+                | b'?'
+                | b'@'
+                | b'['
+                | b'\\'
+                | b']'
+                | b'{'
+                | b'}'
+        )
+    })
+}
+
+/// True for a single byte range such as `bytes=0-` or `bytes=100-999`.
+fn is_simple_range(value: &str) -> bool {
+    let Some(range) = value.strip_prefix("bytes=") else {
+        return false;
+    };
+    let Some((start, end)) = range.split_once('-') else {
+        return false;
+    };
+    if start.is_empty() || !start.bytes().all(|byte| byte.is_ascii_digit()) {
+        return false;
+    }
+    if end.is_empty() {
+        return true;
+    }
+    if !end.bytes().all(|byte| byte.is_ascii_digit()) {
+        return false;
+    }
+    let Ok(start) = start.parse::<u64>() else {
+        return false;
+    };
+    let Ok(end) = end.parse::<u64>() else {
+        return false;
+    };
+    end >= start
 }
 
 /// Headers set by the user agent that do not count as author request headers and
@@ -323,19 +444,40 @@ fn check_allow_origin(
     response: &CorsResponse,
     credentials: bool,
 ) -> Result<(), CorsError> {
-    let allowed = response
-        .header("access-control-allow-origin")
-        .ok_or(CorsError::MissingAllowOrigin)?
-        .trim();
-    if allowed.is_empty() {
-        return Err(CorsError::InvalidAllowOrigin(allowed.to_string()));
+    let raw = response.headers_all("access-control-allow-origin");
+    if raw.is_empty() {
+        return Err(CorsError::MissingAllowOrigin);
     }
+    let values: Vec<&str> = raw
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .collect();
+    let allowed = match values.as_slice() {
+        [] => return Err(CorsError::InvalidAllowOrigin(String::new())),
+        // A comma-separated value or multiple header lines are ambiguous: a
+        // server may be reflecting more than one origin. Fail closed rather than
+        // picking one.
+        [value] if !value.contains(',') => *value,
+        _ => {
+            return Err(CorsError::InvalidAllowOrigin(
+                response
+                    .headers_all("access-control-allow-origin")
+                    .join(", "),
+            ));
+        }
+    };
     if allowed == "*" {
         return if credentials {
             Err(CorsError::WildcardWithCredentials)
         } else {
             Ok(())
         };
+    }
+    // An `Origin` serialisation never contains whitespace: a value with spaces
+    // names several origins and must not be narrowed down to the first one.
+    if allowed.split_ascii_whitespace().count() != 1 {
+        return Err(CorsError::InvalidAllowOrigin(allowed.to_string()));
     }
     let allowed = OriginHeader::parse(allowed)
         .map_err(|_| CorsError::InvalidAllowOrigin(allowed.to_string()))?;
@@ -361,12 +503,16 @@ fn check_preflight(
         .requested_method()
         .unwrap_or(request.method.as_str())
         .trim();
-    let allowed_methods = response
-        .header("access-control-allow-methods")
-        .ok_or(CorsError::MissingAllowMethods)?;
+    let allowed_methods: Vec<&str> = response
+        .headers_all("access-control-allow-methods")
+        .into_iter()
+        .flat_map(parse_header_list)
+        .collect();
+    if allowed_methods.is_empty() {
+        return Err(CorsError::MissingAllowMethods);
+    }
     let mut method_allowed = false;
-    for candidate in allowed_methods.split(',') {
-        let candidate = candidate.trim();
+    for candidate in allowed_methods {
         if candidate.eq_ignore_ascii_case(method) {
             method_allowed = true;
             break;
@@ -386,14 +532,15 @@ fn check_preflight(
     if requested_headers.is_empty() {
         return Ok(());
     }
-    let allowed_headers = response
-        .header("access-control-allow-headers")
-        .ok_or(CorsError::MissingAllowHeaders)?;
-    let allowed: Vec<String> = allowed_headers
-        .split(',')
-        .map(|name| name.trim().to_ascii_lowercase())
-        .filter(|name| !name.is_empty())
+    let allowed: Vec<String> = response
+        .headers_all("access-control-allow-headers")
+        .into_iter()
+        .flat_map(parse_header_list)
+        .map(str::to_ascii_lowercase)
         .collect();
+    if allowed.is_empty() {
+        return Err(CorsError::MissingAllowHeaders);
+    }
     let wildcard = allowed.iter().any(|name| name == "*");
     if wildcard && credentials {
         return Err(CorsError::WildcardHeaderWithCredentials);
@@ -694,5 +841,142 @@ mod tests {
                 .contains("PUT")
         );
         assert!(CorsError::PreflightStatus(403).to_string().contains("403"));
+    }
+
+    #[test]
+    fn repeated_allow_methods_and_headers_lines_are_combined() {
+        // Typical of servers that append CORS headers in more than one layer.
+        let request = CorsRequest::new(ORIGIN, "OPTIONS")
+            .with_header("Access-Control-Request-Method", "PATCH")
+            .with_header(
+                "Access-Control-Request-Headers",
+                "X-Requested-With, Content-Type",
+            );
+        let response = CorsResponse::new(204)
+            .with_header("Access-Control-Allow-Origin", ORIGIN)
+            .with_header("Access-Control-Allow-Methods", "GET, HEAD")
+            .with_header("Access-Control-Allow-Methods", "POST, PATCH")
+            .with_header("Access-Control-Allow-Headers", "Content-Type")
+            .with_header("Access-Control-Allow-Headers", "X-Requested-With");
+        assert_eq!(evaluate_response(&request, &response), CorsDecision::Allow);
+    }
+
+    #[test]
+    fn ambiguous_allow_origin_is_rejected() {
+        for value in [
+            "https://a.example, https://b.example",
+            "https://a.example https://b.example",
+        ] {
+            let response = CorsResponse::new(200).with_header("Access-Control-Allow-Origin", value);
+            assert_eq!(
+                evaluate_response(&simple_request(), &response),
+                CorsDecision::Deny(CorsError::InvalidAllowOrigin(value.to_string())),
+                "{value}"
+            );
+        }
+        let response = CorsResponse::new(200)
+            .with_header("Access-Control-Allow-Origin", ORIGIN)
+            .with_header("Access-Control-Allow-Origin", ORIGIN);
+        assert!(matches!(
+            evaluate_response(&simple_request(), &response),
+            CorsDecision::Deny(CorsError::InvalidAllowOrigin(_))
+        ));
+    }
+
+    #[test]
+    fn max_age_is_parsed_and_capped() {
+        assert_eq!(
+            CorsResponse::new(200)
+                .with_header("Access-Control-Max-Age", "600")
+                .max_age(),
+            Some(600)
+        );
+        assert_eq!(
+            CorsResponse::new(200)
+                .with_header("Access-Control-Max-Age", "86400")
+                .max_age(),
+            Some(7200)
+        );
+        assert_eq!(
+            CorsResponse::new(200)
+                .with_header("Access-Control-Max-Age", "nonsense")
+                .max_age(),
+            None
+        );
+        assert_eq!(CorsResponse::new(200).max_age(), None);
+    }
+
+    #[test]
+    fn expose_headers_and_vary_origin_are_parsed() {
+        let response = CorsResponse::new(200)
+            .with_header(
+                "Access-Control-Expose-Headers",
+                "X-Request-Id, Content-Range",
+            )
+            .with_header("Access-Control-Expose-Headers", "X-Total-Count")
+            .with_header("Vary", "Accept-Encoding, Origin");
+        assert_eq!(
+            response.exposed_headers(),
+            ["x-request-id", "content-range", "x-total-count"]
+        );
+        assert!(response.varies_on_origin());
+        assert!(
+            !CorsResponse::new(200)
+                .with_header("Vary", "Accept")
+                .varies_on_origin()
+        );
+    }
+
+    #[test]
+    fn range_header_is_safelisted_only_for_single_byte_ranges() {
+        assert!(is_simple_header("Range", "bytes=0-"));
+        assert!(is_simple_header("Range", "bytes=100-999"));
+        assert!(!is_simple_header("Range", "bytes=0-100,200-300"));
+        assert!(!is_simple_header("Range", "items=0-10"));
+        assert!(!is_simple_header("Range", "bytes=500-100"));
+    }
+
+    #[test]
+    fn headers_with_unsafe_bytes_trigger_preflight() {
+        assert!(is_simple_header("Accept", "text/html, application/json"));
+        assert!(!is_simple_header("X-Token", "a:b"));
+        assert!(!is_simple_header("Accept", "text/html\r\nInjected: yes"));
+        let request = CorsRequest::new(ORIGIN, "GET").with_header("Accept", "text/html (x)");
+        assert_eq!(request.kind(), RequestKind::Preflight);
+    }
+
+    #[test]
+    fn common_api_preflight_headers_are_accepted() {
+        // A typical XHR/fetch preflight response from a JSON API.
+        let request = CorsRequest::new("https://app.example", "OPTIONS")
+            .with_header("Origin", "https://app.example")
+            .with_header("Access-Control-Request-Method", "POST")
+            .with_header(
+                "Access-Control-Request-Headers",
+                "authorization, content-type, x-requested-with",
+            );
+        let response = CorsResponse::new(200)
+            .with_header("Access-Control-Allow-Origin", "https://app.example")
+            .with_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            .with_header(
+                "Access-Control-Allow-Headers",
+                "Authorization, Content-Type, X-Requested-With",
+            )
+            .with_header("Access-Control-Allow-Credentials", "true")
+            .with_header("Access-Control-Max-Age", "600")
+            .with_header("Vary", "Origin");
+        assert_eq!(
+            evaluate_response_with_credentials(&request, &response, true),
+            CorsDecision::Allow
+        );
+    }
+
+    #[test]
+    fn trailing_slash_in_allow_origin_is_tolerated() {
+        // Some frameworks serialise the origin with a path; it still names the
+        // same tuple origin and is safe to accept.
+        let response = CorsResponse::new(200)
+            .with_header("Access-Control-Allow-Origin", "https://app.example/");
+        assert!(evaluate_response(&simple_request(), &response).is_allowed());
     }
 }

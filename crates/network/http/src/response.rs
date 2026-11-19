@@ -7,6 +7,48 @@ use crate::headers::Headers;
 /// A parsed `Set-Cookie` header: name, value and raw attribute list.
 pub type SetCookie<'a> = (&'a str, &'a str, Vec<(&'a str, &'a str)>);
 
+/// Character encodings understood when turning a response body into text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Charset {
+    /// UTF-8 (also the fallback when no supported charset is declared).
+    Utf8,
+    /// ISO-8859-1 / Latin-1.
+    Iso88591,
+    /// Windows-1252 (CP1252).
+    Windows1252,
+}
+
+impl Charset {
+    /// Parses a `charset` parameter value, returning `None` for unknown names.
+    pub fn from_name(name: &str) -> Option<Self> {
+        let name = name.trim().trim_matches(['"', '\'']).to_ascii_lowercase();
+        match name.as_str() {
+            "utf-8" | "utf8" | "unicode-1-1-utf-8" => Some(Self::Utf8),
+            "iso-8859-1" | "iso8859-1" | "iso_8859-1" | "latin1" | "latin-1" | "l1" | "cp819"
+            | "ibm819" => Some(Self::Iso88591),
+            "windows-1252" | "windows_1252" | "cp1252" | "x-cp1252" => Some(Self::Windows1252),
+            _ => None,
+        }
+    }
+
+    /// Canonical name of the encoding.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Utf8 => "utf-8",
+            Self::Iso88591 => "iso-8859-1",
+            Self::Windows1252 => "windows-1252",
+        }
+    }
+}
+
+/// Undefined Windows-1252 bytes map to the Unicode replacement character.
+const WINDOWS_1252_HIGH: [char; 32] = [
+    '\u{20ac}', '\u{fffd}', '\u{201a}', '\u{0192}', '\u{201e}', '\u{2026}', '\u{2020}', '\u{2021}',
+    '\u{02c6}', '\u{2030}', '\u{0160}', '\u{2039}', '\u{0152}', '\u{fffd}', '\u{017d}', '\u{fffd}',
+    '\u{fffd}', '\u{2018}', '\u{2019}', '\u{201c}', '\u{201d}', '\u{2022}', '\u{2013}', '\u{2014}',
+    '\u{02dc}', '\u{2122}', '\u{0161}', '\u{203a}', '\u{0153}', '\u{fffd}', '\u{017e}', '\u{0178}',
+];
+
 /// A fully read HTTP response.
 #[derive(Debug, Clone)]
 pub struct Response {
@@ -74,33 +116,62 @@ impl Response {
         })
     }
 
-    /// The `charset` parameter of `Content-Type`, if present.
+    /// The `charset` parameter of `Content-Type`, if present (lower-cased).
     pub fn charset(&self) -> Option<String> {
         let ct = self.headers.get("Content-Type")?;
         for part in ct.split(';').skip(1) {
             let part = part.trim();
-            if let Some(value) = part
-                .strip_prefix("charset=")
-                .or_else(|| part.strip_prefix("CHARSET="))
-            {
-                return Some(value.trim_matches('"').to_ascii_lowercase());
+            let Some((key, value)) = part.split_once('=') else {
+                continue;
+            };
+            if key.trim().eq_ignore_ascii_case("charset") {
+                return Some(value.trim().trim_matches('"').to_ascii_lowercase());
             }
         }
         None
     }
 
-    /// Decodes the body as text.
+    /// Detects the body charset from `Content-Type`.
     ///
-    /// UTF-8 and ASCII are decoded properly; `latin1` maps bytes to code points.
-    /// Other charsets fall back to lossy UTF-8 and the limitation is documented
-    /// in `docs/architecture.md`.
-    pub fn text(&self) -> String {
-        match self.charset().as_deref() {
-            Some("iso-8859-1" | "latin1" | "windows-1252") => {
-                self.body.iter().map(|b| char::from(*b)).collect::<String>()
-            }
-            _ => String::from_utf8_lossy(&self.body).into_owned(),
+    /// Recognises UTF-8, ISO-8859-1 and Windows-1252 (including common alias
+    /// names and mixed casing). Unknown or missing charsets fall back to UTF-8,
+    /// which is the HTML default and the safest choice for modern sites.
+    pub fn detected_charset(&self) -> Charset {
+        self.charset()
+            .as_deref()
+            .and_then(Charset::from_name)
+            .unwrap_or(Charset::Utf8)
+    }
+
+    /// Decodes the body as text using an explicit charset.
+    pub fn decode_text(&self, charset: Charset) -> String {
+        match charset {
+            Charset::Utf8 => String::from_utf8_lossy(&self.body).into_owned(),
+            Charset::Iso88591 => self.body.iter().map(|byte| char::from(*byte)).collect(),
+            Charset::Windows1252 => self
+                .body
+                .iter()
+                .map(|byte| match byte {
+                    0x80..=0x9f => WINDOWS_1252_HIGH[(byte - 0x80) as usize],
+                    other => char::from(*other),
+                })
+                .collect(),
         }
+    }
+
+    /// Decodes the body as text using the detected charset.
+    pub fn text(&self) -> String {
+        self.decode_text(self.detected_charset())
+    }
+
+    /// The `ETag` validator, trimmed for use in `If-None-Match`.
+    pub fn etag(&self) -> Option<&str> {
+        self.headers.get("ETag").map(str::trim)
+    }
+
+    /// The `Content-Encoding` header, if present.
+    pub fn content_encoding(&self) -> Option<&str> {
+        self.headers.get("Content-Encoding")
     }
 
     /// Parses `Set-Cookie` headers into `(name, value, attributes)` triples.
@@ -170,6 +241,38 @@ mod tests {
         assert!(r.is_redirect());
         r.status = 200;
         assert!(!r.is_redirect());
+    }
+
+    #[test]
+    fn detects_charset_aliases_and_casing() {
+        let mut h = Headers::new();
+        h.insert("Content-Type", "text/plain; Charset=\"Windows-1252\"");
+        let r = response_with(h, b"");
+        assert_eq!(r.charset().as_deref(), Some("windows-1252"));
+        assert_eq!(r.detected_charset(), Charset::Windows1252);
+
+        let mut h = Headers::new();
+        h.insert("Content-Type", "application/json");
+        let r = response_with(h, b"");
+        assert_eq!(r.detected_charset(), Charset::Utf8);
+    }
+
+    #[test]
+    fn decodes_windows_1252_special_bytes() {
+        let mut h = Headers::new();
+        h.insert("Content-Type", "text/html; charset=cp1252");
+        let r = response_with(h, &[0x93, 0x48, 0x69, 0x94, 0x20, 0x80, 0x81]);
+        assert_eq!(r.text(), "\u{201c}Hi\u{201d} \u{20ac}\u{fffd}");
+    }
+
+    #[test]
+    fn exposes_etag_and_content_encoding() {
+        let mut h = Headers::new();
+        h.insert("ETag", "  \"v1\"  ");
+        h.insert("Content-Encoding", "gzip");
+        let r = response_with(h, b"");
+        assert_eq!(r.etag(), Some("\"v1\""));
+        assert_eq!(r.content_encoding(), Some("gzip"));
     }
 
     #[test]

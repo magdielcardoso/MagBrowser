@@ -45,7 +45,10 @@ impl Document {
         if !self.node(previous).is_text() {
             return false;
         }
-        self.push_text(previous, &data);
+        if !self.push_text(previous, &data) {
+            // Previous node is full: keep both nodes rather than dropping text.
+            return false;
+        }
         self.remove_child(self.node(id).parent.unwrap_or(previous), id)
     }
 

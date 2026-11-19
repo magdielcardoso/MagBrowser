@@ -118,6 +118,12 @@ pub struct TreeBuilder {
     frameset_ok: bool,
     position: usize,
     eof: bool,
+    /// Set once the DOM node cap has been hit, so only one error is reported
+    /// and further tokens can be ignored cheaply.
+    node_limit_reached: bool,
+    /// Set once the open-element depth cap has been hit, to avoid one error
+    /// per element on deeply nested input.
+    depth_limit_reached: bool,
 }
 
 impl TreeBuilder {
@@ -141,6 +147,8 @@ impl TreeBuilder {
             frameset_ok: true,
             position: 0,
             eof: false,
+            node_limit_reached: false,
+            depth_limit_reached: false,
         }
     }
 
@@ -177,7 +185,23 @@ impl TreeBuilder {
             self.eof = true;
             return;
         }
+        // Once the node budget is exhausted, ignore further content. The tree
+        // built so far stays well-formed and `finish` still repairs the basic
+        // document structure.
+        if self.document.node_count() >= self.options.max_nodes {
+            if !self.node_limit_reached {
+                self.node_limit_reached = true;
+                self.error("maximum DOM node count reached; remaining content discarded");
+            }
+            return;
+        }
         self.process(token);
+    }
+
+    /// Whether the node cap has been reached and further tokens are ignored.
+    #[must_use]
+    pub fn is_saturated(&self) -> bool {
+        self.node_limit_reached
     }
 
     /// Completes parsing and returns the document together with all errors.
@@ -262,6 +286,18 @@ impl TreeBuilder {
         id
     }
 
+    /// Pushes an element onto the open stack unless the depth cap is reached.
+    /// All pushes go through here so the bound cannot be bypassed by implicit
+    /// structure, table handling or foreign content.
+    fn push_open(&mut self, id: NodeId) {
+        if self.open.len() < self.options.max_depth.max(1) {
+            self.open.push(id);
+        } else if !self.depth_limit_reached {
+            self.depth_limit_reached = true;
+            self.error("maximum element depth reached");
+        }
+    }
+
     fn insert_element(
         &mut self,
         name: &str,
@@ -271,12 +307,7 @@ impl TreeBuilder {
         let parent = self.current_node();
         let id = self.create_element(name, namespace, attributes);
         self.document.append_child(parent, id);
-        let limit = self.options.max_depth.max(1);
-        if self.open.len() < limit {
-            self.open.push(id);
-        } else {
-            self.error("maximum element depth reached");
-        }
+        self.push_open(id);
         id
     }
 
@@ -378,7 +409,7 @@ impl TreeBuilder {
     fn create_html(&mut self, attributes: Vec<(String, String)>) -> NodeId {
         let id = self.create_element("html", Namespace::Html, attributes);
         self.document.append_child(self.document.root(), id);
-        self.open.push(id);
+        self.push_open(id);
         self.html = Some(id);
         id
     }
@@ -387,7 +418,7 @@ impl TreeBuilder {
         let parent = self.current_node();
         let head = self.create_element("head", Namespace::Html, Vec::new());
         self.document.append_child(parent, head);
-        self.open.push(head);
+        self.push_open(head);
         self.head = Some(head);
         self.mode = InsertionMode::InHead;
     }
@@ -396,7 +427,7 @@ impl TreeBuilder {
         let html = self.html.unwrap_or_else(|| self.document.root());
         let body = self.create_element("body", Namespace::Html, Vec::new());
         self.document.append_child(html, body);
-        self.open.push(body);
+        self.push_open(body);
         self.body = Some(body);
         self.frameset_ok = false;
         self.mode = InsertionMode::InBody;
@@ -475,7 +506,7 @@ impl TreeBuilder {
                 let parent = self.current_node();
                 let head = self.create_element("head", Namespace::Html, attributes);
                 self.document.append_child(parent, head);
-                self.open.push(head);
+                self.push_open(head);
                 self.head = Some(head);
                 self.mode = InsertionMode::InHead;
             }
@@ -732,7 +763,7 @@ impl TreeBuilder {
                 let parent = self.current_node();
                 let body = self.create_element("body", Namespace::Html, attributes);
                 self.document.append_child(parent, body);
-                self.open.push(body);
+                self.push_open(body);
                 self.body = Some(body);
                 self.frameset_ok = false;
                 self.mode = InsertionMode::InBody;
@@ -743,7 +774,7 @@ impl TreeBuilder {
                 let parent = self.current_node();
                 let frameset = self.create_element("frameset", Namespace::Html, attributes);
                 self.document.append_child(parent, frameset);
-                self.open.push(frameset);
+                self.push_open(frameset);
                 self.mode = InsertionMode::InBody;
             }
             Token::StartTag {
@@ -765,7 +796,7 @@ impl TreeBuilder {
                 if let Some(head) = self.head
                     && !self.open.contains(&head)
                 {
-                    self.open.push(head);
+                    self.push_open(head);
                 }
                 self.handle_head_start(&name, attributes);
                 if let Some(head) = self.head {
@@ -2236,7 +2267,7 @@ impl TreeBuilder {
                         break;
                     }
                     if self.document.namespace(id) == Some(Namespace::Html) {
-                        self.open.push(id);
+                        self.push_open(id);
                         break;
                     }
                 }

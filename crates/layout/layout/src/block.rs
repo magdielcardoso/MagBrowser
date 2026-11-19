@@ -261,7 +261,13 @@ pub fn layout_box_with(
     };
 
     let horizontal_extra = borders.horizontal() + paddings.horizontal();
-    let mut content_width = match style.width() {
+    let vertical_extra = borders.vertical() + paddings.vertical();
+    let width_dim = style.width();
+    let height_dim = style.height();
+    let height_is_definite = !height_dim.is_auto() && !has_percentage(height_dim);
+    let aspect = preferred_aspect_ratio(&style);
+
+    let mut content_width = match width_dim {
         Dim::Auto => (cb_width - margins.horizontal() - horizontal_extra).max(0.0),
         Dim::Px(px) => {
             if border_box {
@@ -278,6 +284,14 @@ pub fn layout_box_with(
                 base.max(0.0)
             }
         }
+        Dim::Calc { percent, px } => {
+            let base = cb_width * percent / 100.0 + px;
+            if border_box {
+                (base - horizontal_extra).max(0.0)
+            } else {
+                base.max(0.0)
+            }
+        }
     };
 
     content_width = clamp_dim(
@@ -286,6 +300,37 @@ pub fn layout_box_with(
         style.dim(Property::MaxWidth),
         cb_width,
     );
+
+    // When the width is auto but the height is definite, derive the width
+    // from the preferred aspect ratio instead of stretching to fill the
+    // containing block. Min/max width constraints still apply.
+    if width_dim.is_auto()
+        && let Some(ratio) = aspect
+        && let Some(content_h) = definite_content_dim(height_dim, border_box, vertical_extra)
+    {
+        content_width = if border_box {
+            ((content_h + vertical_extra) * ratio - horizontal_extra).max(0.0)
+        } else {
+            (content_h * ratio).max(0.0)
+        };
+        content_width = clamp_dim(
+            content_width,
+            style.dim(Property::MinWidth),
+            style.dim(Property::MaxWidth),
+            cb_width,
+        );
+    }
+
+    // A flex/grid item's intrinsic min-content measurement resolves a
+    // descendant's percentage width against the *container* width. A deeply
+    // nested child with, say, `width: 150%` can therefore report a min-content
+    // width larger than the container, which becomes the item's `min-width:
+    // auto` base size. The next level then resolves its percentages against
+    // that inflated width and the layout grows geometrically. A flow box
+    // never needs a content box wider than its containing block here, so cap
+    // it before any descendant geometry is derived from it.
+    let containing_content_width = (cb_width - margins.horizontal() - horizontal_extra).max(0.0);
+    content_width = content_width.min(containing_content_width);
 
     let x = cb_x + margins.left;
     let mut rect = Rect::new(x, border_y, content_width + horizontal_extra, 0.0);
@@ -306,15 +351,26 @@ pub fn layout_box_with(
     }
 
     if box_type == BoxType::Image {
-        let height = match style.height() {
-            Dim::Auto => 150.0,
-            dim => resolve(dim, cb_width),
+        // `object-fit` is deliberately ignored: it only affects how the
+        // replaced content is painted inside the box, never the box size, so
+        // an image reporting it must not disturb layout or panic here.
+        let mut height = if height_is_definite {
+            resolve(height_dim, cb_width).max(0.0)
+        } else if !width_dim.is_auto()
+            && let Some(ratio) = aspect
+        {
+            // Indefinite height (auto or a percentage we cannot resolve): use
+            // the intrinsic ratio instead of treating the percentage as a
+            // fraction of the *width*, which would make every `height: 100%`
+            // image a square and feed that square back into flex/grid sizing.
+            (content_width / ratio).max(0.0)
+        } else {
+            150.0
         };
-        let mut height = height.max(0.0);
-        if border_box {
-            height = (height - borders.vertical() - paddings.vertical()).max(0.0);
+        if border_box && height_is_definite {
+            height = (height - vertical_extra).max(0.0);
         }
-        rect.height = height + borders.vertical() + paddings.vertical();
+        rect.height = height + vertical_extra;
         content.height = height;
         let b = &mut tree.boxes[index];
         b.rect = rect;
@@ -347,9 +403,10 @@ pub fn layout_box_with(
         flex::layout_flex(tree, doc, index)
     } else if box_type == BoxType::Grid {
         grid::layout_grid(tree, doc, index)
-    } else if children.iter().any(|c| {
-        tree.boxes[*c].box_type.is_block_level() || tree.boxes[*c].box_type == BoxType::LineBreak
-    }) {
+    } else if children
+        .iter()
+        .any(|c| tree.boxes[*c].box_type.is_block_level())
+    {
         let normal = layout_block_children(tree, doc, index, floats);
         if floats.is_empty() {
             normal
@@ -360,17 +417,35 @@ pub fn layout_box_with(
         layout_inline_children(tree, doc, index, floats)
     };
 
-    let mut content_height = match style.height() {
+    let mut content_height = match height_dim {
         Dim::Auto => auto_content_height,
         Dim::Px(px) => {
             if border_box {
-                (px - borders.vertical() - paddings.vertical()).max(0.0)
+                (px - vertical_extra).max(0.0)
             } else {
                 px.max(0.0)
             }
         }
-        Dim::Percent(p) => (cb_width * p / 100.0).max(0.0),
+        // A percentage height has no definite base in this top-down layout:
+        // we know the containing block's width, not its height. Resolving it
+        // against the width is a feedback loop for flex/grid tracks whose size
+        // is derived from their children. Treat such heights as indefinite.
+        Dim::Percent(_) => auto_content_height,
+        Dim::Calc { percent, .. } if percent != 0.0 => auto_content_height,
+        Dim::Calc { px, .. } => px.max(0.0),
     };
+    // Symmetrically, a definite width and an indefinite height derive the
+    // height from the ratio instead of using the intrinsic/content height.
+    if !height_is_definite
+        && !width_dim.is_auto()
+        && let Some(ratio) = aspect
+    {
+        content_height = if border_box {
+            ((content_width + horizontal_extra) / ratio - vertical_extra).max(0.0)
+        } else {
+            (content_width / ratio).max(0.0)
+        };
+    }
     content_height = clamp_dim(
         content_height,
         style.dim(Property::MinHeight),
@@ -389,6 +464,12 @@ pub fn layout_box_with(
         }
     }
     let bottom = tree.boxes[index].rect.bottom();
+
+    // Remember the unshifted position of sticky boxes so scroll updates can
+    // recompute their offset deterministically.
+    if tree.boxes[index].style.position() == browser_style::Position::Sticky {
+        tree.boxes[index].sticky_static_y = tree.boxes[index].rect.y;
+    }
 
     // Position out-of-flow children relative to this box.
     let positioned: Vec<usize> = tree.boxes[index]
@@ -410,6 +491,9 @@ pub fn layout_box_with(
             - resolve(style.dim(Property::Bottom), cb_width);
         if dx != 0.0 || dy != 0.0 {
             translate_subtree(tree, index, dx, dy);
+            if tree.boxes[index].style.position() == browser_style::Position::Sticky {
+                tree.boxes[index].sticky_static_y = tree.boxes[index].rect.y;
+            }
             return tree.boxes[index].rect.bottom();
         }
     }
@@ -426,7 +510,7 @@ fn layout_absolute(
 ) {
     let style = tree.boxes[index].style.clone();
     let shrink_width = if style.width().is_auto() {
-        shrink_to_fit(tree, doc, index, containing.width).max(0.0)
+        shrink_to_fit(tree, index, containing.width).max(0.0)
     } else {
         containing.width
     };
@@ -533,7 +617,7 @@ fn layout_float(
 ) {
     // Floats shrink to fit when no width is specified.
     let measure_width = if style.width().is_auto() {
-        (shrink_to_fit(tree, doc, child, content.width)
+        (shrink_to_fit(tree, child, content.width)
             + resolve(style.margin(Side::Left), content.width)
             + resolve(style.margin(Side::Right), content.width))
         .max(1.0)
@@ -702,7 +786,19 @@ fn collect_inline_items(
                 collect_inline_items(tree, doc, child, available_width, items);
             }
             BoxType::InlineBlock | BoxType::Image => {
-                let bottom = layout_box(tree, doc, child, 0.0, 0.0, available_width);
+                // A replaced/atomic inline with an auto width must shrink to fit
+                // its contents instead of stretching across the containing
+                // block. This is what keeps a submit `<input>` (auto width,
+                // definite height, a label) a compact button rather than a
+                // full-width bar. A definite width — from CSS or from an
+                // `<img width>` / `<input size>` presentational hint — is left
+                // untouched and honoured by `layout_box` as before.
+                let cb_width = if box_type == BoxType::InlineBlock && style.width().is_auto() {
+                    shrink_to_fit(tree, child, available_width).max(0.0)
+                } else {
+                    available_width
+                };
+                let bottom = layout_box(tree, doc, child, 0.0, 0.0, cb_width);
                 let b = &tree.boxes[child];
                 let width = b.rect.width;
                 let height = (b.content.bottom() - b.rect.y).max(b.rect.height);
@@ -779,25 +875,143 @@ fn clamp_dim(value: f32, min: Dim, max: Dim, base: f32) -> f32 {
     value
 }
 
+/// Reads the preferred aspect ratio (width / height) from a style.
+///
+/// The value is read generically through `ComputedStyle::get` and parsed
+/// defensively: the typed `AspectRatio` value is preferred, but keyword,
+/// string and plain-number representations are accepted too. Returns `None`
+/// for `auto` or for any malformed / non-positive ratio.
+pub(crate) fn preferred_aspect_ratio(style: &ComputedStyle) -> Option<f32> {
+    let property = browser_style::Property::from_name("aspect-ratio")?;
+    let value = style.get(property)?;
+    match value {
+        browser_style::ComputedValue::AspectRatio(ratio) => match ratio {
+            browser_style::AspectRatio::Ratio(w, h) => positive_ratio(w / h),
+            browser_style::AspectRatio::Auto => None,
+        },
+        browser_style::ComputedValue::Number(n) => positive_ratio(*n),
+        browser_style::ComputedValue::Px(n) => positive_ratio(*n),
+        browser_style::ComputedValue::Str(s) => parse_ratio_text(s),
+        browser_style::ComputedValue::Keyword(k) => parse_ratio_text(k),
+        browser_style::ComputedValue::IdentList(list) => parse_ratio_text(&list.join(" ")),
+        _ => None,
+    }
+}
+
+fn positive_ratio(ratio: f32) -> Option<f32> {
+    (ratio.is_finite() && ratio > 0.0).then_some(ratio)
+}
+
+/// Parses `16 / 9`, `16/9`, `1.5`, `auto 16 / 9` and similar forms.
+fn parse_ratio_text(text: &str) -> Option<f32> {
+    let mut text = text.trim();
+    if text.is_empty() || text.eq_ignore_ascii_case("auto") || text.eq_ignore_ascii_case("none") {
+        return None;
+    }
+    if let Some(rest) = text
+        .strip_prefix("auto ")
+        .or_else(|| text.strip_prefix("auto\t"))
+    {
+        text = rest.trim_start();
+    }
+    let mut parts = text.split('/');
+    let width: f32 = parts.next()?.trim().parse().ok()?;
+    let height: f32 = match parts.next() {
+        Some(part) => {
+            let part = part.trim();
+            if part.is_empty() || part.eq_ignore_ascii_case("auto") {
+                1.0
+            } else {
+                part.parse().ok()?
+            }
+        }
+        None => 1.0,
+    };
+    if parts.next().is_some() {
+        return None;
+    }
+    positive_ratio(width / height)
+}
+
+/// True when a dimension contains a percentage of an unknown base.
+///
+/// Layout only knows the containing block's width, so a percentage height has
+/// no definite value. Resolving it against the width and then deriving another
+/// dimension from it is the feedback loop that makes deeply nested flex/grid
+/// content grow geometrically.
+fn has_percentage(dim: Dim) -> bool {
+    matches!(dim, Dim::Percent(_)) || matches!(dim, Dim::Calc { percent, .. } if percent != 0.0)
+}
+
+/// Resolves a definite dimension to an inner (content) size, or `None` when
+/// the dimension is indefinite (`auto` or percentage-based). `border_box`
+/// follows the `box-sizing` convention used by the rest of this module.
+fn definite_content_dim(dim: Dim, border_box: bool, extra: f32) -> Option<f32> {
+    let resolved = match dim {
+        Dim::Auto => return None,
+        Dim::Px(px) => px,
+        // Percentage heights have no definite base here; using `base` (the
+        // width) would let a `height: 100%` box set its own width via the
+        // aspect ratio and inflate every nesting level.
+        Dim::Percent(_) => return None,
+        Dim::Calc { percent, .. } if percent != 0.0 => return None,
+        Dim::Calc { px, .. } => px,
+    };
+    Some(if border_box {
+        (resolved - extra).max(0.0)
+    } else {
+        resolved.max(0.0)
+    })
+}
+
 /// Max-content width estimate used for shrink-to-fit boxes (inline-blocks,
 /// floats and auto grid tracks).
-pub(crate) fn shrink_to_fit(
-    tree: &LayoutTree,
-    doc: &Document,
-    index: usize,
-    available: f32,
-) -> f32 {
-    let mut widest: f32 = 0.0;
-    let mut stack = vec![index];
-    while let Some(i) = stack.pop() {
-        let b = &tree.boxes[i];
-        if b.box_type == BoxType::Text {
-            widest = widest.max(measure(&b.text, b.style.font_size()));
+pub(crate) fn shrink_to_fit(tree: &LayoutTree, index: usize, available: f32) -> f32 {
+    let width = max_content_width(tree, index, available);
+    width.min(available)
+}
+
+/// Recursive max-content estimate: it accounts for explicitly sized children
+/// and for the box insets that the old text-only walk ignored. Floats and
+/// inline-blocks use this, so missing a child width used to push right-floated
+/// navigation links off the viewport.
+fn max_content_width(tree: &LayoutTree, index: usize, available: f32) -> f32 {
+    let box_ref = &tree.boxes[index];
+    let mut width = match box_ref.box_type {
+        BoxType::Text => measure(&box_ref.text, box_ref.style.font_size()),
+        _ => {
+            if let Some(explicit) = box_ref.style.width().resolve(available) {
+                explicit
+            } else {
+                let children: Vec<f32> = box_ref
+                    .children
+                    .iter()
+                    .map(|&child| max_content_width(tree, child, available))
+                    .collect();
+                let inline_children = box_ref.children.iter().any(|&child| {
+                    matches!(
+                        tree.boxes[child].box_type,
+                        BoxType::Text | BoxType::Inline | BoxType::InlineBlock | BoxType::Image
+                    )
+                });
+                if inline_children {
+                    children.iter().sum()
+                } else {
+                    children.iter().copied().fold(0.0, f32::max)
+                }
+            }
         }
-        stack.extend(b.children.iter().copied());
+    };
+    for side in [Side::Left, Side::Right] {
+        width += box_ref
+            .style
+            .padding(side)
+            .resolve(available)
+            .unwrap_or(0.0);
+        width += box_ref.style.border_width(side);
+        width += box_ref.style.margin(side).resolve(available).unwrap_or(0.0);
     }
-    let _ = doc;
-    widest.min(available)
+    width
 }
 
 /// Border style helper used by paint through the layout tree.
@@ -820,7 +1034,112 @@ pub fn scrollable_content_height(b: &LayoutBox) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use crate::test_util::layout_with;
+    use browser_dom::Document;
+    use browser_style::{Origin, StyleEngine, Viewport};
+
+    use crate::test_util::{layout_grid, layout_with};
+
+    /// Builds a document whose body holds a single `<input>` with the given
+    /// attributes, lays it out at `viewport_width`, and returns its box.
+    fn layout_input(
+        css: &str,
+        attrs: &[(&str, &str)],
+        viewport_width: f32,
+    ) -> (Document, browser_dom::NodeId, crate::LayoutTree) {
+        let mut doc = Document::new();
+        let html = doc.create_element("html");
+        let body = doc.create_element("body");
+        doc.append_child(doc.root(), html);
+        doc.append_child(html, body);
+        let input = doc.create_element("input");
+        for (name, value) in attrs {
+            doc.set_attr(input, name, value);
+        }
+        doc.append_child(body, input);
+        let mut engine = StyleEngine::new(Viewport {
+            width: viewport_width,
+            height: 800.0,
+        });
+        engine.add_css(css, Origin::Author);
+        let styled = engine.compute(&doc);
+        let tree = crate::layout(
+            &doc,
+            &styled,
+            crate::Size {
+                width: viewport_width,
+                height: 800.0,
+            },
+        );
+        (doc, input, tree)
+    }
+
+    #[test]
+    fn input_css_width_is_honored_over_size_hint() {
+        // The Google case: `.Ucigb { width: 458px }` plus `size="57"` (a 456px
+        // hint). The author width must win and the control must not stretch to
+        // the ~890px containing block.
+        let (_doc, input, tree) = layout_input(
+            "body { margin: 8px; } .Ucigb { width: 458px; }",
+            &[("class", "lst Ucigb"), ("size", "57")],
+            906.0,
+        );
+        let b = tree.find_node(input).unwrap();
+        // rect.width includes the UA border/padding; the specified width is
+        // the content width under the default content-box sizing.
+        assert_eq!(b.content.width, 458.0, "specified CSS width was ignored");
+    }
+
+    #[test]
+    fn input_size_hint_applies_without_css_width() {
+        // With no CSS width, `size="57"` becomes an ~8px-per-character hint:
+        // 57 * 8 = 456px, still far short of the 890px containing block.
+        let (_doc, input, tree) = layout_input(
+            "body { margin: 8px; }",
+            &[("type", "text"), ("size", "57")],
+            906.0,
+        );
+        let b = tree.find_node(input).unwrap();
+        assert_eq!(
+            b.content.width, 456.0,
+            "size presentational hint was ignored"
+        );
+    }
+
+    #[test]
+    fn auto_width_submit_input_shrinks_to_its_label() {
+        // A submit input has a definite height and a synthetic label child but
+        // no width: it must size to its content, not become a full-width bar.
+        let (_doc, input, tree) = layout_input(
+            "body { margin: 0; } input { height: 30px; }",
+            &[("type", "submit"), ("value", "Pesquisa Google")],
+            800.0,
+        );
+        let b = tree.find_node(input).unwrap();
+        // The author `height` sizes the content box; the UA sheet's padding and
+        // border are added on top, so the border box is taller than 30px.
+        assert_eq!(b.content.height, 30.0);
+        assert!(b.rect.height > 30.0, "border box should include UA insets");
+        assert_eq!(b.children.len(), 1, "synthetic label child must survive");
+        assert!(
+            b.rect.width > 0.0 && b.rect.width < 800.0,
+            "submit input stretched to the containing block: {}",
+            b.rect.width
+        );
+    }
+
+    #[test]
+    fn auto_width_inline_block_uses_content_width() {
+        let (_doc, tree, ids) = layout_with(
+            "body { margin: 0; } #b { display: inline-block; }",
+            &[("span", "b", "abc")],
+        );
+        let b = tree.find_node(ids[1]).unwrap();
+        assert!(
+            b.rect.width > 0.0 && b.rect.width < 800.0,
+            "auto-width inline-block filled the containing block: {}",
+            b.rect.width
+        );
+    }
 
     #[test]
     fn two_left_floats_sit_side_by_side() {
@@ -847,6 +1166,19 @@ mod tests {
         let a = tree.find_node(ids[1]).unwrap();
         assert_eq!(a.rect.x, 700.0);
         assert_eq!(a.rect.right(), 800.0);
+        let _ = doc;
+    }
+
+    #[test]
+    fn right_float_shrink_width_includes_padding() {
+        let (doc, tree, ids) = layout_with(
+            "body { margin: 0; } #a { float: right; padding: 0 20px; font-size: 10px; }",
+            &[("div", "a", "abcd")],
+        );
+        let a = tree.find_node(ids[1]).unwrap();
+        // Old text-only estimate was ~24px; horizontal padding must count too.
+        assert!(a.rect.width >= 60.0, "float width was {}", a.rect.width);
+        assert!(a.rect.right() <= 800.0 + 0.01);
         let _ = doc;
     }
 
@@ -929,5 +1261,169 @@ mod tests {
             );
         }
         let _ = doc;
+    }
+
+    /// Lays out a `<div>` holding a single `<img>`, returning the image box.
+    fn layout_image(css: &str) -> (Document, browser_dom::NodeId, crate::LayoutTree) {
+        let mut doc = Document::new();
+        let html = doc.create_element("html");
+        let body = doc.create_element("body");
+        doc.append_child(doc.root(), html);
+        doc.append_child(html, body);
+        let box_node = doc.create_element("div");
+        doc.set_attr(box_node, "id", "box");
+        doc.append_child(body, box_node);
+        let img = doc.create_element("img");
+        doc.append_child(box_node, img);
+        let mut engine = browser_style::StyleEngine::new(browser_style::Viewport {
+            width: 800.0,
+            height: 600.0,
+        });
+        engine.add_css(css, Origin::Author);
+        let styled = engine.compute(&doc);
+        let tree = crate::layout(
+            &doc,
+            &styled,
+            crate::Size {
+                width: 800.0,
+                height: 600.0,
+            },
+        );
+        let _ = box_node;
+        (doc, img, tree)
+    }
+
+    #[test]
+    fn percentage_image_height_does_not_resolve_against_width() {
+        // A 100% height inside a 400px box used to resolve against the
+        // containing-block *width*, turning the image into a 400x400 square.
+        // The base is indefinite, so the replaced element keeps its intrinsic
+        // 150px height instead of feeding the width back into its height.
+        let (_doc, img, tree) =
+            layout_image("#box { width:400px; } img { width:100%; height:100%; }");
+        let b = tree.find_node(img).unwrap();
+        assert_eq!(b.rect.width, 400.0);
+        assert!(
+            b.rect.height <= 160.0,
+            "percentage height resolved against the width: {}",
+            b.rect.height
+        );
+    }
+
+    #[test]
+    fn oversized_box_is_capped_at_its_containing_block() {
+        // A flex/grid measurement that resolves a descendant's percentage
+        // width against the container can pin an item wider than the
+        // container. Capping the content width stops the geometric growth at
+        // the next nesting level.
+        let (_doc, tree, ids) = layout_grid(
+            "body { margin:0; } #g { width:200px; } #g > div { width:1000px; height:10px; }",
+            &[("div", "wide", "")],
+        );
+        let wide = tree.find_node(ids[1]).unwrap();
+        assert!(
+            wide.rect.width <= 200.0,
+            "box grew past its containing block: {}",
+            wide.rect.width
+        );
+    }
+
+    #[test]
+    fn aspect_ratio_text_is_parsed_defensively() {
+        assert_eq!(super::parse_ratio_text("16 / 9"), Some(16.0 / 9.0));
+        assert_eq!(super::parse_ratio_text("16/9"), Some(16.0 / 9.0));
+        assert_eq!(super::parse_ratio_text("1.5"), Some(1.5));
+        assert_eq!(super::parse_ratio_text("auto 2 / 1"), Some(2.0));
+        assert_eq!(super::parse_ratio_text("auto"), None);
+        assert_eq!(super::parse_ratio_text("none"), None);
+        assert_eq!(super::parse_ratio_text("0 / 9"), None);
+        assert_eq!(super::parse_ratio_text("nonsense"), None);
+        assert_eq!(super::parse_ratio_text("2 / 0"), None);
+    }
+
+    #[test]
+    fn aspect_ratio_derives_height_from_definite_width() {
+        let (_doc, tree, ids) = layout_with(
+            "body { margin: 0; } #box { width: 200px; aspect-ratio: 2 / 1; }",
+            &[("div", "box", "")],
+        );
+        let b = tree.find_node(ids[1]).unwrap();
+        assert_eq!(b.content.width, 200.0);
+        assert!(
+            (b.content.height - 100.0).abs() < 0.01,
+            "{}",
+            b.content.height
+        );
+    }
+
+    #[test]
+    fn aspect_ratio_derives_width_from_definite_height() {
+        let (_doc, tree, ids) = layout_with(
+            "body { margin: 0; } #box { height: 100px; aspect-ratio: 16 / 9; }",
+            &[("div", "box", "")],
+        );
+        let b = tree.find_node(ids[1]).unwrap();
+        assert_eq!(b.content.height, 100.0);
+        let expected = 100.0 * 16.0 / 9.0;
+        assert!(
+            (b.content.width - expected).abs() < 0.01,
+            "got {}, expected {}",
+            b.content.width,
+            expected
+        );
+    }
+
+    #[test]
+    fn aspect_ratio_accepts_a_plain_number_with_border_box() {
+        let (_doc, tree, ids) = layout_with(
+            "body { margin: 0; } #box { width: 160px; aspect-ratio: 1.5; box-sizing: border-box; padding: 0 10px; }",
+            &[("div", "box", "")],
+        );
+        let b = tree.find_node(ids[1]).unwrap();
+        // The ratio applies to the border box: 160 / 1.5 ≈ 106.67.
+        assert!((b.rect.width - 160.0).abs() < 0.01);
+        let expected = 160.0 / 1.5;
+        assert!(
+            (b.rect.height - expected).abs() < 0.01,
+            "got {}, expected {}",
+            b.rect.height,
+            expected
+        );
+    }
+
+    #[test]
+    fn aspect_ratio_sizes_a_replaced_element() {
+        let mut doc = browser_dom::Document::new();
+        let html = doc.create_element("html");
+        let body = doc.create_element("body");
+        doc.append_child(doc.root(), html);
+        doc.append_child(html, body);
+        let img = doc.create_element("img");
+        doc.set_attr(img, "width", "200");
+        doc.append_child(body, img);
+        let mut engine = browser_style::StyleEngine::new(browser_style::Viewport {
+            width: 800.0,
+            height: 600.0,
+        });
+        engine.add_css(
+            "body { margin: 0; } img { aspect-ratio: 2 / 1; }",
+            browser_style::Origin::Author,
+        );
+        let styled = engine.compute(&doc);
+        let tree = crate::layout(
+            &doc,
+            &styled,
+            crate::Size {
+                width: 800.0,
+                height: 600.0,
+            },
+        );
+        let b = tree.find_node(img).unwrap();
+        assert_eq!(b.content.width, 200.0);
+        assert!(
+            (b.content.height - 100.0).abs() < 0.01,
+            "{}",
+            b.content.height
+        );
     }
 }

@@ -11,6 +11,7 @@ mod address_bar;
 mod app;
 mod chrome;
 mod commands;
+mod devtools;
 mod selfcheck;
 mod tabs;
 mod target;

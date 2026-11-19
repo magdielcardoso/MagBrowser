@@ -13,9 +13,10 @@ pub mod regexp;
 pub mod syntax;
 
 pub use ast::{
-    AssignOp, BinaryOp, CatchClause, DeclKind, Expr, ForInit, ForTarget, Function, LogicalOp,
-    ObjectPatternProperty, Pattern, Position, Program, Property, PropertyKey, Stmt, SwitchCase,
-    UnaryOp, UpdateOp, VarDecl, VarDeclarator,
+    AssignOp, BinaryOp, CatchClause, Class, ClassMember, DeclKind, ExportDecl, ExportKind,
+    ExportSpecifier, Expr, ForInit, ForTarget, Function, ImportDecl, ImportSpecifier, LogicalOp,
+    MethodKind, ObjectPatternProperty, OptionalChain, OptionalChainOp, Pattern, Position, Program,
+    Property, PropertyKey, Stmt, SwitchCase, UnaryOp, UpdateOp, VarDecl, VarDeclarator,
 };
 pub use lexer::{Lexer, Punct, Token, TokenKind, tokenize};
 pub use parser::{ParseError, Parser, parse};
@@ -972,5 +973,458 @@ mod tests {
         assert!(matches!(function.patterns[0], Pattern::Object { .. }));
         assert!(matches!(function.patterns[1], Pattern::Default { .. }));
         assert!(matches!(function.patterns[2], Pattern::Rest(_)));
+    }
+
+    #[test]
+    fn deeply_nested_parentheses_are_rejected() {
+        let source = format!("{}1{}", "(".repeat(10_000), ")".repeat(10_000));
+        let error = parse(&source).expect_err("deep nesting must be rejected");
+        assert_eq!(error.message, "expression is nested too deeply");
+    }
+
+    #[test]
+    fn deeply_nested_unary_operators_are_rejected() {
+        let source = format!("{}1", "!".repeat(10_000));
+        let error = parse(&source).expect_err("deep unary nesting must be rejected");
+        assert_eq!(error.message, "expression is nested too deeply");
+    }
+
+    #[test]
+    fn deeply_nested_blocks_are_rejected() {
+        let source = format!("{}{}", "{".repeat(10_000), "}".repeat(10_000));
+        let error = parse(&source).expect_err("deep block nesting must be rejected");
+        assert_eq!(error.message, "expression is nested too deeply");
+    }
+
+    #[test]
+    fn reasonable_nesting_still_parses() {
+        let source = format!("{}1{}", "(".repeat(16), ")".repeat(16));
+        assert!(parse(&source).is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // Optional chaining and nullish coalescing
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn lexes_optional_chaining_punctuator() {
+        assert_eq!(
+            kinds("a?.b?.[c]?.(d)"),
+            vec![
+                TokenKind::Identifier("a".to_owned()),
+                TokenKind::Punct(Punct::QuestionDot),
+                TokenKind::Identifier("b".to_owned()),
+                TokenKind::Punct(Punct::QuestionDot),
+                TokenKind::Punct(Punct::LBracket),
+                TokenKind::Identifier("c".to_owned()),
+                TokenKind::Punct(Punct::RBracket),
+                TokenKind::Punct(Punct::QuestionDot),
+                TokenKind::Punct(Punct::LParen),
+                TokenKind::Identifier("d".to_owned()),
+                TokenKind::Punct(Punct::RParen),
+                TokenKind::Eof,
+            ]
+        );
+        // `?.` is not recognized before a decimal digit.
+        let tokens = kinds("a?.3:0");
+        assert_eq!(tokens[1], TokenKind::Punct(Punct::Question));
+        assert_eq!(tokens[2], TokenKind::Number(0.3));
+    }
+
+    #[test]
+    fn parses_optional_chain_operations() {
+        match expr("obj?.a[0]?.b(x)") {
+            Expr::OptionalChain(OptionalChain { base, ops }) => {
+                assert!(matches!(*base, Expr::Identifier(ref name) if name == "obj"));
+                assert_eq!(ops.len(), 4);
+                assert!(matches!(
+                    &ops[0],
+                    OptionalChainOp::Member { optional: true, .. }
+                ));
+                assert!(matches!(
+                    &ops[1],
+                    OptionalChainOp::Member {
+                        computed: true,
+                        optional: false,
+                        ..
+                    }
+                ));
+                assert!(matches!(
+                    &ops[2],
+                    OptionalChainOp::Member { optional: true, .. }
+                ));
+                assert!(matches!(
+                    &ops[3],
+                    OptionalChainOp::Call {
+                        optional: false,
+                        ..
+                    }
+                ));
+            }
+            other => panic!("expected optional chain, got {other:?}"),
+        }
+        match expr("fn?.(1, ...args)") {
+            Expr::OptionalChain(OptionalChain { ops, .. }) => {
+                assert!(matches!(
+                    &ops[0],
+                    OptionalChainOp::Call { arguments, optional: true }
+                        if matches!(arguments.get(1), Some(Expr::Spread(_)))
+                ));
+            }
+            other => panic!("expected optional call, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_nullish_coalescing() {
+        match expr("a ?? b") {
+            Expr::Logical {
+                op: LogicalOp::Nullish,
+                ..
+            } => {}
+            other => panic!("expected `??`, got {other:?}"),
+        }
+        assert!(parse("a ?? b || c").is_err());
+        assert!(parse("a || b ?? c").is_err());
+        assert!(parse("(a ?? b) || c").is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // Spread / rest in calls and arrays
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parses_spread_in_arrays_and_calls() {
+        match expr("[1, ...xs, ...ys(), 4]") {
+            Expr::Array(items) => {
+                assert_eq!(items.len(), 4);
+                assert!(matches!(items[1], Some(Expr::Spread(_))));
+                assert!(matches!(items[2], Some(Expr::Spread(_))));
+            }
+            other => panic!("expected array, got {other:?}"),
+        }
+        match expr("f(a, ...args, b)") {
+            Expr::Call { arguments, .. } => {
+                assert_eq!(arguments.len(), 3);
+                assert!(matches!(arguments[1], Expr::Spread(_)));
+            }
+            other => panic!("expected call, got {other:?}"),
+        }
+        match expr("new C(...args)") {
+            Expr::New { arguments, .. } => assert!(matches!(arguments[0], Expr::Spread(_))),
+            other => panic!("expected new, got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Classes
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parses_class_declaration_with_methods_and_extends() {
+        let program = parse_ok(
+            "class Dog extends Animal { constructor(name) { super(name); this.name = name; } \
+             speak() { return super.speak() + this.name; } static create() { return new Dog('rex'); } }",
+        );
+        let Stmt::ClassDecl(class) = &program.body[0] else {
+            panic!("expected class declaration");
+        };
+        assert_eq!(class.name.as_deref(), Some("Dog"));
+        assert!(class.super_class.is_some());
+        assert_eq!(class.body.len(), 3);
+        let ClassMember::Method { key, function, .. } = &class.body[1];
+        assert_eq!(key.as_key_string(), "speak");
+        assert!(!function.is_generator);
+        assert!(!function.is_async);
+        assert!(matches!(
+            &class.body[2],
+            ClassMember::Method {
+                is_static: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_class_expression() {
+        match expr("(class Named { m() { return 1; } })") {
+            Expr::Class(class) => {
+                assert_eq!(class.name.as_deref(), Some("Named"));
+                assert_eq!(class.body.len(), 1);
+            }
+            other => panic!("expected class expression, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_generator_async_and_accessor_class_methods() {
+        let program = parse_ok(
+            "class C { *gen() { yield 1; } async load() { await x; return 1; } \
+             static *sgen() { yield 2; } get value() { return 1; } set value(v) {} }",
+        );
+        let Stmt::ClassDecl(class) = &program.body[0] else {
+            panic!("expected class");
+        };
+        let ClassMember::Method { function, kind, .. } = &class.body[0];
+        assert!(function.is_generator);
+        assert_eq!(*kind, MethodKind::Method);
+        assert!(matches!(
+            &class.body[1],
+            ClassMember::Method { function, .. } if function.is_async
+        ));
+        assert!(matches!(
+            &class.body[2],
+            ClassMember::Method { function, is_static: true, .. } if function.is_generator
+        ));
+        assert!(matches!(
+            &class.body[3],
+            ClassMember::Method {
+                kind: MethodKind::Getter,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &class.body[4],
+            ClassMember::Method {
+                kind: MethodKind::Setter,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_super_member_and_call() {
+        match expr("super.method()") {
+            Expr::Call { callee, .. } => assert!(matches!(
+                *callee,
+                Expr::Member {
+                    object,
+                    computed: false,
+                    ..
+                } if matches!(*object, Expr::Super)
+            )),
+            other => panic!("expected call, got {other:?}"),
+        }
+        match expr("super[expr]") {
+            Expr::Member {
+                object,
+                computed: true,
+                ..
+            } => assert!(matches!(*object, Expr::Super)),
+            other => panic!("expected member, got {other:?}"),
+        }
+        assert!(matches!(expr("super(1)"), Expr::Call { .. }));
+    }
+
+    // -----------------------------------------------------------------------
+    // Generators and async/await
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parses_generator_declaration_and_expressions() {
+        let program = parse_ok("function* gen(a) { yield a; yield* other(); return 3; }");
+        let Stmt::FunctionDecl(function) = &program.body[0] else {
+            panic!("expected function declaration");
+        };
+        assert!(function.is_generator);
+        assert!(matches!(
+            function.body[0],
+            Stmt::Expression(Expr::Yield { .. })
+        ));
+        assert!(matches!(
+            function.body[1],
+            Stmt::Expression(Expr::Yield { delegate: true, .. })
+        ));
+        assert!(matches!(expr("(function* () { yield 1; })"), Expr::Function(f) if f.is_generator));
+        assert!(matches!(
+            expr("({ *m() { yield 1; } })"),
+            Expr::Object(properties) if matches!(&properties[0].value, Expr::Function(f) if f.is_generator)
+        ));
+    }
+
+    #[test]
+    fn parses_async_functions_and_await() {
+        let program = parse_ok("async function load(x) { var y = await x; return y + 1; }");
+        let Stmt::FunctionDecl(function) = &program.body[0] else {
+            panic!("expected function declaration");
+        };
+        assert!(function.is_async);
+        assert!(matches!(expr("async x => x + 1"), Expr::Arrow(f) if f.is_async));
+        assert!(
+            matches!(expr("async (a, b) => { await a; return b; }"), Expr::Arrow(f) if f.is_async)
+        );
+        assert!(matches!(expr("await value"), Expr::Await(_)));
+        assert!(matches!(
+            expr("(async function* gen() { yield 1; })"),
+            Expr::Function(f) if f.is_async && f.is_generator
+        ));
+    }
+
+    #[test]
+    fn async_is_still_a_valid_identifier() {
+        assert!(matches!(expr("async"), Expr::Identifier(ref name) if name == "async"));
+        assert!(parse_ok("var async = 1;").body.len() == 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Destructuring defaults and for-of targets
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parses_nested_destructuring_defaults() {
+        let program = parse_ok("var {a: {b = 1} = {}, c: [d = 2] = []} = obj;");
+        let Stmt::VarDecl(declaration) = &program.body[0] else {
+            panic!("expected declaration");
+        };
+        let Pattern::Object { properties, .. } = &declaration.declarations[0].pattern else {
+            panic!("expected object pattern");
+        };
+        assert!(matches!(properties[0].value, Pattern::Default { .. }));
+        assert!(matches!(properties[1].value, Pattern::Default { .. }));
+        let program = parse_ok("function f([a = 1, [b = 2]] = []) { return a + b; }");
+        let Stmt::FunctionDecl(function) = &program.body[0] else {
+            panic!("expected function");
+        };
+        assert!(matches!(function.patterns[0], Pattern::Default { .. }));
+    }
+
+    #[test]
+    fn parses_for_of_destructuring_targets() {
+        let program = parse_ok("for (const [a, b = 2] of pairs) { use(a, b); }");
+        let Stmt::ForIn { left, is_of, .. } = &program.body[0] else {
+            panic!("expected for-of");
+        };
+        assert!(is_of);
+        assert!(matches!(
+            left,
+            ForTarget::Pattern {
+                kind: DeclKind::Const,
+                pattern: Pattern::Array(_)
+            }
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // More template literal coverage
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parses_nested_and_multiline_templates() {
+        match expr("`a${ `b${c}d` }e`") {
+            Expr::Template { exprs, .. } => {
+                assert_eq!(exprs.len(), 1);
+                assert!(matches!(exprs[0], Expr::Template { .. }));
+            }
+            other => panic!("expected template, got {other:?}"),
+        }
+        match expr("`line1\nline2`") {
+            Expr::Template { parts, .. } => assert_eq!(parts[0], "line1\nline2"),
+            other => panic!("expected template, got {other:?}"),
+        }
+        match expr("`n=${n}, b=${true}, u=${undefined}`") {
+            Expr::Template { exprs, .. } => assert_eq!(exprs.len(), 3),
+            other => panic!("expected template, got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // ES modules
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parses_static_import_forms() {
+        let Stmt::Import(import) = &parse_ok("import d, { a, b as c } from 'mod';").body[0] else {
+            panic!("expected import");
+        };
+        assert_eq!(import.default.as_deref(), Some("d"));
+        assert_eq!(import.source, "mod");
+        assert_eq!(import.named.len(), 2);
+        assert_eq!(import.named[0].imported, "a");
+        assert_eq!(import.named[1].imported, "b");
+        assert_eq!(import.named[1].local, "c");
+
+        let Stmt::Import(import) = &parse_ok("import * as ns from './mod.js';").body[0] else {
+            panic!("expected namespace import");
+        };
+        assert_eq!(import.namespace.as_deref(), Some("ns"));
+        assert!(import.default.is_none());
+        assert_eq!(import.source, "./mod.js");
+
+        let Stmt::Import(import) = &parse_ok("import 'side-effects';").body[0] else {
+            panic!("expected side-effect import");
+        };
+        assert_eq!(import.source, "side-effects");
+        assert!(import.default.is_none());
+        assert!(import.namespace.is_none());
+        assert!(import.named.is_empty());
+
+        let Stmt::Import(import) = &parse_ok("import d, * as ns from 'm';").body[0] else {
+            panic!("expected default plus namespace import");
+        };
+        assert_eq!(import.default.as_deref(), Some("d"));
+        assert_eq!(import.namespace.as_deref(), Some("ns"));
+    }
+
+    #[test]
+    fn parses_export_forms() {
+        let Stmt::Export(export) = &parse_ok("export default 1 + 2;").body[0] else {
+            panic!("expected default export");
+        };
+        assert!(matches!(export.kind, ExportKind::DefaultExpr(_)));
+
+        let Stmt::Export(export) = &parse_ok("export default function named() {}").body[0] else {
+            panic!("expected default function export");
+        };
+        assert!(matches!(export.kind, ExportKind::DefaultDecl(_)));
+
+        let Stmt::Export(export) = &parse_ok("export const x = 1;").body[0] else {
+            panic!("expected declaration export");
+        };
+        assert!(matches!(export.kind, ExportKind::Decl(_)));
+
+        let Stmt::Export(export) = &parse_ok("export { a, b as c };").body[0] else {
+            panic!("expected named export");
+        };
+        let ExportKind::Named { specifiers, source } = &export.kind else {
+            panic!("expected named export");
+        };
+        assert!(source.is_none());
+        assert_eq!(specifiers[1].local, "b");
+        assert_eq!(specifiers[1].exported, "c");
+
+        let Stmt::Export(export) = &parse_ok("export {};").body[0] else {
+            panic!("expected empty export");
+        };
+        assert!(matches!(
+            export.kind,
+            ExportKind::Named {
+                ref specifiers,
+                source: None,
+            } if specifiers.is_empty()
+        ));
+
+        let Stmt::Export(export) = &parse_ok("export { a } from 'm';").body[0] else {
+            panic!("expected re-export");
+        };
+        assert!(matches!(
+            export.kind,
+            ExportKind::Named {
+                source: Some(_),
+                ..
+            }
+        ));
+
+        let Stmt::Export(export) = &parse_ok("export * from 'm';").body[0] else {
+            panic!("expected star re-export");
+        };
+        assert!(matches!(export.kind, ExportKind::All { .. }));
+    }
+
+    #[test]
+    fn parses_dynamic_import_and_import_meta_without_eating_expression_statements() {
+        assert!(matches!(expr("import('mod')"), Expr::ImportCall(_)));
+        assert!(matches!(expr("import.meta"), Expr::MetaProperty { .. }));
+        let program = parse_ok("import('a'); import.meta; import x from 'b';");
+        assert_eq!(program.body.len(), 3);
     }
 }

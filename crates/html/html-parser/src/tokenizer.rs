@@ -118,14 +118,40 @@ pub struct Tokenizer<'a> {
     raw_tag: Option<String>,
     scripting: bool,
     eof_emitted: bool,
+    /// Set during preprocessing when input was cut off at `max_bytes`.
+    input_truncated: bool,
+    /// Number of character references decoded in the current tag's attributes.
+    attr_refs: usize,
 }
 
+/// Backstop for text runs consisting almost entirely of character references.
+/// Past this budget references are emitted in their literal form, keeping work
+/// bounded even when a `Tokenizer` is used directly without the input-size cap.
+/// The public parse entry points cap input well below this, so normal pages
+/// (including large, entity-heavy ones) are unaffected.
+const MAX_REFERENCES_PER_RUN: usize = 8 * 1024 * 1024;
+
 impl<'a> Tokenizer<'a> {
-    /// Creates a tokenizer over `input` with scripting enabled.
+    /// Creates a tokenizer over `input` with scripting enabled and no input cap.
     pub fn new(input: &'a str) -> Self {
-        let mut chars = Vec::with_capacity(input.len());
+        Self::with_max_input_bytes(input, usize::MAX)
+    }
+
+    /// Creates a tokenizer that preprocesses at most `max_bytes` bytes of
+    /// `input`. Longer input is truncated at a character boundary and can be
+    /// detected with [`Tokenizer::input_truncated`].
+    pub fn with_max_input_bytes(input: &'a str, max_bytes: usize) -> Self {
+        let mut chars = Vec::with_capacity(input.len().min(max_bytes));
+        let mut used = 0usize;
         let mut iter = input.chars().peekable();
+        let mut truncated = false;
         while let Some(c) = iter.next() {
+            let width = c.len_utf8();
+            if used.saturating_add(width) > max_bytes {
+                truncated = true;
+                break;
+            }
+            used += width;
             match c {
                 '\r' => {
                     if iter.peek() == Some(&'\n') {
@@ -148,7 +174,15 @@ impl<'a> Tokenizer<'a> {
             raw_tag: None,
             scripting: true,
             eof_emitted: false,
+            input_truncated: truncated,
+            attr_refs: 0,
         }
+    }
+
+    /// Whether preprocessing truncated the source at the configured byte cap.
+    #[must_use]
+    pub fn input_truncated(&self) -> bool {
+        self.input_truncated
     }
 
     /// Sets whether `noscript` content is tokenized as rawtext.
@@ -244,15 +278,27 @@ impl<'a> Tokenizer<'a> {
         decoded
     }
 
+    /// Decodes a reference into the current attribute value, respecting the
+    /// per-tag reference budget.
+    fn consume_attr_reference(&mut self) {
+        let decoded = self.consume_reference();
+        if let Some(tag) = &mut self.tag {
+            tag.attr_value.push_str(&decoded);
+        }
+        self.attr_refs += 1;
+    }
+
     /// Consumes the whole text run starting at the current position.
     fn consume_text(&mut self, decode: bool) -> Token {
         let mut out = String::new();
+        let mut refs = 0usize;
         while let Some(c) = self.peek() {
             if c == '<' && self.markup_start_ahead() {
                 break;
             }
-            if decode && c == '&' {
+            if decode && c == '&' && refs < MAX_REFERENCES_PER_RUN {
                 out.push_str(&self.consume_reference());
+                refs += 1;
             } else {
                 out.push(c);
                 self.pos += 1;
@@ -270,12 +316,14 @@ impl<'a> Tokenizer<'a> {
             return self.consume_raw_end_tag();
         }
         let mut out = String::new();
+        let mut refs = 0usize;
         while let Some(c) = self.peek() {
             if c == '<' && self.raw_end_ahead() {
                 break;
             }
-            if decode && c == '&' {
+            if decode && c == '&' && refs < MAX_REFERENCES_PER_RUN {
                 out.push_str(&self.consume_reference());
+                refs += 1;
             } else {
                 out.push(c);
                 self.pos += 1;
@@ -312,6 +360,7 @@ impl<'a> Tokenizer<'a> {
 
     fn emit_tag(&mut self) -> Token {
         self.state = State::Data;
+        self.attr_refs = 0;
         let mut tag = self.tag.take().unwrap_or_else(|| TagBuilder::start(false));
         tag.finish_attr();
         if tag.is_end {
@@ -543,7 +592,11 @@ impl<'a> Tokenizer<'a> {
                         self.pos += 1;
                         return self.emit_tag();
                     } else {
+                        // Normally the pending attribute was already committed on
+                        // entering this state, but it can still be live when we
+                        // arrive from SelfClosingStartTag. Commit before reuse.
                         if let Some(tag) = &mut self.tag {
+                            tag.finish_attr();
                             tag.attr_name = Some(c.to_ascii_lowercase().to_string());
                             tag.attr_value.clear();
                         }
@@ -589,6 +642,9 @@ impl<'a> Tokenizer<'a> {
                         self.pos += 1;
                     } else if c == '/' {
                         self.pos += 1;
+                        if let Some(tag) = &mut self.tag {
+                            tag.finish_attr();
+                        }
                         self.state = State::SelfClosingStartTag;
                     } else if c == '=' {
                         self.pos += 1;
@@ -597,7 +653,11 @@ impl<'a> Tokenizer<'a> {
                         self.pos += 1;
                         return self.emit_tag();
                     } else {
+                        // A new attribute name starts here. The previous attribute
+                        // (possibly a valueless boolean such as `hidden`) is still
+                        // pending, so commit it before overwriting `attr_name`.
                         if let Some(tag) = &mut self.tag {
+                            tag.finish_attr();
                             tag.attr_name = Some(c.to_ascii_lowercase().to_string());
                             tag.attr_value.clear();
                         }
@@ -643,11 +703,8 @@ impl<'a> Tokenizer<'a> {
                             }
                             self.state = State::BeforeAttributeName;
                         }
-                        Some('&') => {
-                            let decoded = self.consume_reference();
-                            if let Some(tag) = &mut self.tag {
-                                tag.attr_value.push_str(&decoded);
-                            }
+                        Some('&') if self.attr_refs < MAX_REFERENCES_PER_RUN => {
+                            self.consume_attr_reference();
                         }
                         Some(c) => {
                             if let Some(tag) = &mut self.tag {
@@ -671,11 +728,8 @@ impl<'a> Tokenizer<'a> {
                     } else if c == '>' {
                         self.pos += 1;
                         return self.emit_tag();
-                    } else if c == '&' {
-                        let decoded = self.consume_reference();
-                        if let Some(tag) = &mut self.tag {
-                            tag.attr_value.push_str(&decoded);
-                        }
+                    } else if c == '&' && self.attr_refs < MAX_REFERENCES_PER_RUN {
+                        self.consume_attr_reference();
                     } else {
                         if let Some(tag) = &mut self.tag {
                             tag.attr_value.push(c);
@@ -907,6 +961,44 @@ mod tests {
             )
         );
         assert_eq!(out[1], Token::Eof);
+    }
+
+    #[test]
+    fn valueless_attribute_before_another_attribute_is_kept() {
+        let out = tokens("<div id=x hidden data-foo=1>");
+        assert_eq!(
+            out[0],
+            tag(
+                "div",
+                &[("id", "x"), ("hidden", ""), ("data-foo", "1")],
+                false
+            )
+        );
+    }
+
+    #[test]
+    fn trailing_valueless_attribute_is_kept() {
+        let out = tokens("<div hidden>");
+        assert_eq!(out[0], tag("div", &[("hidden", "")], false));
+    }
+
+    #[test]
+    fn consecutive_valueless_attributes_are_kept() {
+        let out = tokens("<input disabled readonly required>");
+        assert_eq!(
+            out[0],
+            tag(
+                "input",
+                &[("disabled", ""), ("readonly", ""), ("required", "")],
+                false
+            )
+        );
+    }
+
+    #[test]
+    fn valueless_attribute_reconsumed_after_self_close_slash_is_kept() {
+        let out = tokens("<div hidden / class=x>");
+        assert_eq!(out[0], tag("div", &[("hidden", ""), ("class", "x")], false));
     }
 
     #[test]

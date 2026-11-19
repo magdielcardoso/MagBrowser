@@ -71,6 +71,8 @@ pub enum Keyword {
     Extends,
     /// `super`
     Super,
+    /// `static`
+    Static,
 }
 
 impl Keyword {
@@ -110,6 +112,7 @@ impl Keyword {
             "class" => Self::Class,
             "extends" => Self::Extends,
             "super" => Self::Super,
+            "static" => Self::Static,
             _ => return None,
         })
     }
@@ -150,6 +153,7 @@ impl Keyword {
             Self::Class => "class",
             Self::Extends => "extends",
             Self::Super => "super",
+            Self::Static => "static",
         }
     }
 }

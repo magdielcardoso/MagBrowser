@@ -23,6 +23,8 @@ pub fn set_scroll(tree: &mut LayoutTree, index: usize, x: f32, y: f32) -> bool {
         return false;
     }
     b.scroll_offset = (x.clamp(0.0, max_x), y.clamp(0.0, max_y));
+    // Keep sticky descendants pinned to the scrollport after the offset move.
+    crate::position::update_sticky(tree, index);
     true
 }
 

@@ -32,6 +32,7 @@
 
 pub mod block;
 pub mod box_model;
+pub mod budget;
 pub mod flex;
 pub mod fragment;
 pub mod grid;
@@ -70,8 +71,13 @@ pub fn layout(
     styled: &browser_style::StyledTree,
     viewport: Size,
 ) -> LayoutTree {
+    // Reset the global work budget for this pass. Tree building and layout both
+    // consume it; when a limit is hit subtrees are skipped and the flag below
+    // reports that the result is partial.
+    budget::begin();
     let mut tree = TreeBuilder::new(doc, styled).build();
     let _ = block::layout_document(&mut tree, doc, viewport.width, viewport.height);
+    tree.truncated = budget::finish();
     tree
 }
 
@@ -283,5 +289,97 @@ mod tests {
             .find(|b| b.clip.is_some())
             .expect("a scroll container");
         assert_eq!(scroll.content.height, 40.0);
+    }
+
+    /// Lays out a document whose body holds one child populated by `populate`.
+    fn pathological(
+        populate: impl FnOnce(&mut browser_dom::Document, browser_dom::NodeId),
+    ) -> LayoutTree {
+        let mut doc = browser_dom::Document::new();
+        let html = doc.create_element("html");
+        let body = doc.create_element("body");
+        doc.append_child(doc.root(), html);
+        doc.append_child(html, body);
+        populate(&mut doc, body);
+        let engine = StyleEngine::new(Viewport {
+            width: 800.0,
+            height: 600.0,
+        });
+        let styled = engine.compute(&doc);
+        layout(
+            &doc,
+            &styled,
+            Size {
+                width: 800.0,
+                height: 600.0,
+            },
+        )
+    }
+
+    #[test]
+    fn pathological_wide_dom_is_truncated_quickly() {
+        // Use a small box limit so the test stays fast in debug builds; the
+        // production default is 50,000 (see `budget::MAX_BOXES`).
+        budget::set_test_limits(2_000, 200_000, 256, 500_000);
+        let start = std::time::Instant::now();
+        let tree = pathological(|doc, body| {
+            for _ in 0..3_000 {
+                let div = doc.create_element("div");
+                doc.append_child(body, div);
+            }
+        });
+        budget::clear_test_limits();
+        let elapsed = start.elapsed();
+        assert!(tree.truncated, "the box budget must have been hit");
+        assert!(
+            tree.boxes.len() <= 2_004,
+            "too many boxes: {}",
+            tree.boxes.len()
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "layout took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn pathological_deep_dom_is_bounded_by_depth_guard() {
+        let start = std::time::Instant::now();
+        let tree = pathological(|doc, root| {
+            let mut parent = root;
+            for _ in 0..(budget::MAX_DEPTH * 3) {
+                let div = doc.create_element("div");
+                doc.append_child(parent, div);
+                parent = div;
+            }
+        });
+        let elapsed = start.elapsed();
+        assert!(tree.truncated, "the depth guard must have been hit");
+        assert!(
+            tree.boxes.len() <= budget::MAX_DEPTH + 4,
+            "too many boxes: {}",
+            tree.boxes.len()
+        );
+        // Tree walks must still complete without stack overflow.
+        let _ = tree.paint_order();
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "layout took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn pathological_huge_text_node_is_truncated_quickly() {
+        let start = std::time::Instant::now();
+        let tree = pathological(|doc, body| {
+            let text = "word ".repeat(budget::MAX_INLINE_ITEMS);
+            doc.append_text(body, &text);
+        });
+        let elapsed = start.elapsed();
+        assert!(tree.truncated, "the inline-item budget must have been hit");
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "layout took {elapsed:?}"
+        );
     }
 }

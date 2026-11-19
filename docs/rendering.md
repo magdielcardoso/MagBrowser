@@ -19,6 +19,11 @@ author sheets, and computes a `StyledTree` keyed by `NodeId`.
 - `var()` is substituted at computed-value time, with cycle protection; a missing
   custom property without a fallback invalidates the declaration (as the spec
   requires).
+- `calc()` is evaluated at computed-value time for lengths and percentages: nested
+  expressions, `+ - * /`, absolute units and `em`/`rem`/viewport units all resolve
+  against the font size / containing block.
+- HTML presentational hints (`<img width>`/`<img height>`) are injected as
+  low-priority UA declarations before author CSS, so author rules win.
 - `font-size` is resolved before every other property, because `em` values depend
   on the element's own computed font size.
 - Inheritance is applied last for properties that were not declared, using
@@ -29,8 +34,9 @@ author sheets, and computes a `StyledTree` keyed by `NodeId`.
 ## 2. Layout (`browser-layout`)
 
 `TreeBuilder` turns the DOM into a box tree: block boxes, inline boxes,
-inline-blocks, text boxes, list items, tables (as blocks), flex containers, images
-and anonymous blocks that wrap inline runs inside block containers.
+inline-blocks, text boxes, list items, tables (with automatic column layout), flex
+containers, images and anonymous blocks that wrap inline runs inside block
+containers.
 
 `layout_box` is the core algorithm:
 
@@ -41,16 +47,28 @@ and anonymous blocks that wrap inline runs inside block containers.
 3. Lay out children:
    - block flow: stack vertically, collapsing adjacent sibling margins
      (`max` of positives, sum with negatives);
-   - inline flow: greedy line breaking with the bitmap font metrics, producing
+   - inline flow: greedy line breaking with proportional Inter font metrics, producing
      `LineBox`es with `TextFragment`s; `text-align` shifts each line;
-   - flex: single-line `row`/`column` with gaps, `justify-content`, `align-items`
-     and `flex-grow`;
-   - tables: rows/cells stack as blocks (no column measurement).
+   - flex: `row`/`column` (and `-reverse`) with gaps, `justify-content`,
+     `align-items` and `flex-grow`; `flex-wrap: wrap|wrap-reverse` packs items into
+     multiple greedily formed lines with per-line justification and alignment
+     (`align-content`, `order` and baseline alignment are not implemented);
+   - tables: automatic layout measures max-content cell widths, takes the
+     per-column maximum and stretches/shrinks columns to the container
+     (`colspan`/`rowspan` are not supported).
 4. Resolve `height` (`auto` uses the content height), apply `min-height`/
    `max-height`, compute `scroll_height`, and set a clip rectangle for
    `overflow: hidden|scroll|auto`.
 5. Position out-of-flow children (`absolute`/`fixed`) from `top/right/bottom/left`.
 6. Apply `position: relative` offsets to the whole subtree.
+
+Floats with `width: auto` are measured with `shrink_to_fit` plus their margins.
+`<input>` elements are replaced boxes whose label is synthesized from the
+`value`/`placeholder` attribute (except for hidden/image/checkbox/radio types) as
+a text child, so button and field text paints. Grid containers use the subset in
+`grid.rs`: `px`/`%`/`fr`/`auto`/`repeat()` tracks with gaps and row-major
+placement; explicit placement, named lines/areas and item spanning are not
+supported.
 
 The result is a flat `Vec<LayoutBox>` plus the root index. `hit_test` returns the
 deepest box containing a point; `paint_order` returns descendants before parents,
@@ -63,16 +81,24 @@ sorted by `z-index`.
 - `FillRect` for element backgrounds,
 - `DrawBorder` for borders (solid, dashed and dotted; double/groove render solid),
 - `DrawText` for each `TextFragment` (position, baseline, size, colour, underline /
-  line-through),
-- `DrawImage` for image boxes (a deterministic checkerboard placeholder until the
-  image decoder lands),
+  line-through, synthetic bold/italic),
+- `DrawImage` for image boxes (decoded PNG/GIF/BMP when available, otherwise a
+  deterministic checkerboard placeholder),
 - `PushClip`/`PopClip` around scroll containers,
 - child offsets include the container's scroll offset.
+
+Three newer commands — `DrawRoundedRect` (anti-aliased rounded corners with an
+optional border ring), `DrawShadow` (soft, offset shadow approximated with
+concentric rounded rectangles) and `DrawLinearGradient` (stop-based gradient at an
+angle) — are defined in `DisplayCommand` and executed by the rasterizer. They are
+**not yet emitted** by `build`/`paint_box`, which still produces only the commands
+above; the CSS side (`border-radius`, `box-shadow`, gradients) is work in progress
+(see `docs/roadmap.md`).
 
 The software rasterizer executes the commands into an RGBA `ImageBuffer`:
 
 - source-over alpha blending, per-pixel clip testing,
-- glyphs drawn from the embedded 8×8 bitmap font, scaled by `font_size / 16`,
+- glyphs rasterised from the embedded Inter outlines with 4x4 anti-aliased coverage,
 - dashed/dotted borders by segmenting the edge,
 - nearest-neighbour image scaling.
 
@@ -100,7 +126,7 @@ on the CPU (deterministic), uploaded as one sRGB texture and presented with
 ### Desktop window (`apps/browser`)
 
 `--features window` opens a `winit` 0.30 window with chrome drawn by the engine's
-own primitives and bitmap font:
+own primitives and the embedded Inter font:
 
 ```
 tab strip (36 px)  →  tabs + "+"
@@ -110,10 +136,12 @@ status pill        →  Pronto / Carregando… / Erro
 ```
 
 The chrome geometry lives in `chrome/layout.rs` (pure functions, tested), the
-composition in `chrome/render.rs`, and input handling in `window_app.rs`. Text in
-the chrome comes from a glyph atlas generated from `browser_text::Font`; page text
-still uses the software rasterizer for exact deterministic output. A live window
-was smoke-tested on macOS; CI validates the same composition through
+composition in `chrome/render.rs`, and input handling in `window_app.rs`. Chrome
+shapes are supersampled 2x and reduced for smooth edges, while icons are
+anti-aliased polygons and all text is drawn with the same `browser_text` glyph
+cache as page text. The window is composed at the device pixel ratio, so HiDPI
+displays get native resolution instead of nearest-neighbour upscaling. A live
+window was smoke-tested on macOS; CI validates the same composition through
 `--window-selfcheck <out.png>`.
 
 ## Determinism and testing

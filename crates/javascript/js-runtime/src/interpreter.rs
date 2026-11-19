@@ -3,14 +3,16 @@
 use std::rc::Rc;
 
 use browser_js_parser::{
-    AssignOp, BinaryOp, CatchClause, DeclKind, Expr, ForInit, ForTarget, Function, LogicalOp,
-    Pattern, Program, Stmt, SwitchCase, UnaryOp, UpdateOp, VarDecl,
+    AssignOp, BinaryOp, CatchClause, Class, ClassMember, DeclKind, ExportDecl, ExportKind, Expr,
+    ForInit, ForTarget, Function, LogicalOp, MethodKind, ObjectPatternProperty, OptionalChain,
+    OptionalChainOp, Pattern, Program, PropertyKey, Stmt, SwitchCase, UnaryOp, UpdateOp, VarDecl,
 };
 
 use crate::errors::JsError;
 use crate::execution::{Completion, LoopAction, collect_var_names, loop_action};
 use crate::function::UserFunction;
-use crate::object::ObjectKind;
+use crate::generator::{SUPER_CTOR, SUPER_HOME};
+use crate::object::{ObjectKind, SYMBOL_ITERATOR_KEY};
 use crate::scope::{BindingKind, ScopeId};
 use crate::value::Value;
 
@@ -25,6 +27,43 @@ pub(crate) fn to_int32(value: f64) -> i32 {
         (modulo - 4_294_967_296.0) as i32
     } else {
         modulo as i32
+    }
+}
+
+/// Convert an assignment target expression into a destructuring pattern.
+pub(crate) fn pattern_from_assignment_target(expr: &Expr) -> Option<Pattern> {
+    match expr {
+        Expr::Identifier(name) => Some(Pattern::Identifier(name.clone())),
+        Expr::Member { .. } => Some(Pattern::Member(Box::new(expr.clone()))),
+        Expr::Array(items) => Some(Pattern::Array(
+            items
+                .iter()
+                .map(|item| item.as_ref().and_then(pattern_from_assignment_target))
+                .collect(),
+        )),
+        Expr::Object(properties) => Some(Pattern::Object {
+            properties: properties
+                .iter()
+                .map(|property| ObjectPatternProperty {
+                    key: property.key.clone(),
+                    value: pattern_from_assignment_target(&property.value)
+                        .unwrap_or(Pattern::Identifier("_".to_owned())),
+                })
+                .collect(),
+            rest: None,
+        }),
+        _ => None,
+    }
+}
+
+/// The declaration an `export`/`export default` wraps, when there is one.
+fn exported_declaration(stmt: &Stmt) -> Option<&Stmt> {
+    match stmt {
+        Stmt::Export(export) => match &export.kind {
+            ExportKind::Decl(inner) | ExportKind::DefaultDecl(inner) => Some(inner.as_ref()),
+            _ => None,
+        },
+        other => Some(other),
     }
 }
 
@@ -59,6 +98,25 @@ impl crate::Runtime {
         ))
     }
 
+    /// Execute an already-instantiated module's body in its own scope.
+    pub(crate) fn exec_module_body(&mut self, id: usize) -> Result<Value, JsError> {
+        let (scope, url, program) = {
+            let module = self.module(id);
+            (module.scope, module.url.clone(), module.program.clone())
+        };
+        self.env_stack.push(scope);
+        self.var_scope_stack.push(scope);
+        let previous_module = self.current_module.replace(id);
+        self.call_stack.push(url);
+        let result = self.exec_stmts(&program.body);
+        self.call_stack.pop();
+        self.current_module = previous_module;
+        self.env_stack.pop();
+        self.var_scope_stack.pop();
+        result?;
+        Ok(self.module_namespace(id))
+    }
+
     pub(crate) fn exec_stmts(&mut self, stmts: &[Stmt]) -> Result<Completion, JsError> {
         for stmt in stmts {
             match self.exec_stmt(stmt, None)? {
@@ -74,6 +132,16 @@ impl crate::Runtime {
         self.maybe_gc();
         match stmt {
             Stmt::Empty | Stmt::FunctionDecl(_) => Ok(Completion::Normal),
+            // Static imports are linked before execution, so nothing to do.
+            Stmt::Import(_) => Ok(Completion::Normal),
+            Stmt::Export(export) => self.exec_export(export),
+            Stmt::ClassDecl(class) => {
+                let value = self.create_class(class)?;
+                let name = class.name.clone().unwrap_or_default();
+                let scope = self.current_scope();
+                self.initialize_binding(scope, &name, value)?;
+                Ok(Completion::Normal)
+            }
             Stmt::Expression(expr) => {
                 let value = self.eval_expr(expr)?;
                 self.completion_value = value;
@@ -182,7 +250,7 @@ impl crate::Runtime {
     }
 
     /// Bind a declaration pattern to `value`.
-    fn bind_decl_pattern(
+    pub(crate) fn bind_decl_pattern(
         &mut self,
         pattern: &Pattern,
         value: Value,
@@ -307,18 +375,11 @@ impl crate::Runtime {
 
     /// Convert a value to the element sequence an array pattern consumes.
     fn destructure_iterable(&mut self, value: &Value) -> Result<Vec<Value>, JsError> {
-        if let Some(items) = self.object_array_items(value) {
-            return Ok(items);
-        }
         match value {
-            Value::String(text) => Ok(text
-                .chars()
-                .map(|ch| Value::String(ch.to_string()))
-                .collect()),
             Value::Undefined | Value::Null => {
                 Err(JsError::type_error("cannot destructure undefined or null"))
             }
-            _ => Err(JsError::type_error("value is not iterable")),
+            _ => self.iterate_values(value),
         }
     }
 
@@ -362,7 +423,7 @@ impl crate::Runtime {
         }
         let mut consumed = Vec::with_capacity(properties.len());
         for property in properties {
-            let key = property.key.as_key_string();
+            let key = self.property_key_string(&property.key)?;
             consumed.push(key.clone());
             let item = self.get_property_checked(value, &key)?;
             bind(self, &property.value, item)?;
@@ -390,6 +451,41 @@ impl crate::Runtime {
         Ok(())
     }
 
+    /// Execute an `export` declaration. Named and star exports are already
+    /// linked during instantiation; declarations and default values run here.
+    fn exec_export(&mut self, export: &ExportDecl) -> Result<Completion, JsError> {
+        match &export.kind {
+            ExportKind::DefaultExpr(expr) => {
+                let value = self.eval_expr(expr)?;
+                if let Some(scope) = self.current_module_scope() {
+                    self.initialize_binding(scope, "default", value.clone())?;
+                }
+                self.completion_value = value;
+                Ok(Completion::Normal)
+            }
+            ExportKind::DefaultDecl(inner) => {
+                self.exec_stmt(inner, None)?;
+                if let Some(scope) = self.current_module_scope() {
+                    let name = match inner.as_ref() {
+                        Stmt::FunctionDecl(function) => function
+                            .name
+                            .clone()
+                            .unwrap_or_else(|| "default".to_owned()),
+                        Stmt::ClassDecl(class) => {
+                            class.name.clone().unwrap_or_else(|| "default".to_owned())
+                        }
+                        _ => "default".to_owned(),
+                    };
+                    let value = self.read_binding_from_scope(scope, &name)?;
+                    self.initialize_binding(scope, "default", value)?;
+                }
+                Ok(Completion::Normal)
+            }
+            ExportKind::Decl(inner) => self.exec_stmt(inner, None),
+            ExportKind::Named { .. } | ExportKind::All { .. } => Ok(Completion::Normal),
+        }
+    }
+
     pub(crate) fn exec_block(&mut self, stmts: &[Stmt]) -> Result<Completion, JsError> {
         let scope = self.create_scope(Some(self.current_scope()), false);
         self.prepare_lexical(stmts, scope);
@@ -402,7 +498,20 @@ impl crate::Runtime {
 
     pub(crate) fn prepare_lexical(&mut self, stmts: &[Stmt], scope: ScopeId) {
         for stmt in stmts {
-            if let Stmt::VarDecl(declaration) = stmt
+            if let Stmt::Export(export) = stmt
+                && matches!(export.kind, ExportKind::DefaultExpr(_))
+            {
+                self.declare_binding(scope, "default", BindingKind::Let, Value::Undefined, false);
+            }
+            let Some(inner) = exported_declaration(stmt) else {
+                continue;
+            };
+            if let Stmt::ClassDecl(class) = inner
+                && let Some(name) = &class.name
+            {
+                self.declare_binding(scope, name, BindingKind::Let, Value::Undefined, false);
+            }
+            if let Stmt::VarDecl(declaration) = inner
                 && declaration.kind != DeclKind::Var
             {
                 let kind = if declaration.kind == DeclKind::Const {
@@ -448,7 +557,10 @@ impl crate::Runtime {
 
     pub(crate) fn hoist_functions(&mut self, stmts: &[Stmt], scope: ScopeId) {
         for stmt in stmts {
-            if let Stmt::FunctionDecl(function) = stmt
+            let Some(inner) = exported_declaration(stmt) else {
+                continue;
+            };
+            if let Stmt::FunctionDecl(function) = inner
                 && let Some(name) = &function.name
             {
                 let value = self.create_function_from_ast(function, scope);
@@ -461,10 +573,13 @@ impl crate::Runtime {
         let name = function.name.clone().unwrap_or_default();
         let user = UserFunction {
             name: name.clone(),
+            params: function.params.clone(),
             patterns: function.patterns.clone(),
             body: function.body.clone(),
             env,
             is_arrow: function.is_arrow,
+            is_generator: function.is_generator,
+            is_async: function.is_async,
         };
         let value =
             self.new_user_function_value(&name, function_length(&function.patterns), Rc::new(user));
@@ -593,15 +708,7 @@ impl crate::Runtime {
     ) -> Result<Completion, JsError> {
         let iterable = self.eval_expr(right)?;
         let values: Vec<Value> = if is_of {
-            if let Some(items) = self.object_array_items(&iterable) {
-                items
-            } else if let Value::String(text) = &iterable {
-                text.chars()
-                    .map(|ch| Value::String(ch.to_string()))
-                    .collect()
-            } else {
-                return Err(JsError::type_error("value is not iterable"));
-            }
+            self.iterate_values(&iterable)?
         } else {
             match &iterable {
                 Value::Object(_) => self
@@ -618,41 +725,18 @@ impl crate::Runtime {
 
         for item in values {
             self.tick()?;
-            let scope = match left {
-                ForTarget::Var { kind, .. } if *kind != DeclKind::Var => {
-                    Some(self.create_scope(Some(self.current_scope()), false))
+            let per_iteration = match left {
+                ForTarget::Var { kind, .. } | ForTarget::Pattern { kind, .. } => {
+                    *kind != DeclKind::Var
                 }
-                _ => None,
+                ForTarget::Expr(_) => false,
             };
-            let outcome = (|| -> Result<Completion, JsError> {
-                match left {
-                    ForTarget::Var { kind, name } => {
-                        if *kind == DeclKind::Var {
-                            if !self.assign_binding(name, item.clone())? {
-                                self.declare_var(name, item.clone());
-                            }
-                        } else if let Some(scope) = scope {
-                            let binding_kind = if *kind == DeclKind::Const {
-                                BindingKind::Const
-                            } else {
-                                BindingKind::Let
-                            };
-                            self.declare_binding(scope, name, binding_kind, item.clone(), true);
-                        }
-                    }
-                    ForTarget::Expr(target) => {
-                        self.assign_target(target, item.clone())?;
-                    }
-                }
-                if let Some(scope) = scope {
-                    self.env_stack.push(scope);
-                }
-                let completion = self.exec_stmt(body, None);
-                if scope.is_some() {
-                    self.env_stack.pop();
-                }
-                completion
-            })();
+            let scope = if per_iteration {
+                Some(self.create_scope(Some(self.current_scope()), false))
+            } else {
+                None
+            };
+            let outcome = self.exec_for_iteration(left, item, scope, body);
             match loop_action(outcome?, label) {
                 LoopAction::Continue => {}
                 LoopAction::Break => return Ok(Completion::Normal),
@@ -660,6 +744,66 @@ impl crate::Runtime {
             }
         }
         Ok(Completion::Normal)
+    }
+
+    /// Bind one iteration of a `for...in`/`for...of` loop and execute its body.
+    fn exec_for_iteration(
+        &mut self,
+        left: &ForTarget,
+        item: Value,
+        scope: Option<ScopeId>,
+        body: &Stmt,
+    ) -> Result<Completion, JsError> {
+        if let Some(scope) = scope {
+            self.env_stack.push(scope);
+        }
+        let result = (|| match left {
+            ForTarget::Var { kind, name } => {
+                if *kind == DeclKind::Var {
+                    if !self.assign_binding(name, item.clone())? {
+                        self.declare_var(name, item.clone());
+                    }
+                } else {
+                    let binding_kind = if *kind == DeclKind::Const {
+                        BindingKind::Const
+                    } else {
+                        BindingKind::Let
+                    };
+                    self.declare_binding(
+                        scope.expect("per iteration scope"),
+                        name,
+                        binding_kind,
+                        item.clone(),
+                        true,
+                    );
+                }
+                self.exec_stmt(body, None)
+            }
+            ForTarget::Pattern { kind, pattern } => {
+                if let Some(scope) = scope {
+                    let mut names = Vec::new();
+                    pattern.bound_names(&mut names);
+                    let binding_kind = if *kind == DeclKind::Const {
+                        BindingKind::Const
+                    } else {
+                        BindingKind::Let
+                    };
+                    for name in names {
+                        self.declare_binding(scope, &name, binding_kind, Value::Undefined, false);
+                    }
+                }
+                self.bind_decl_pattern(pattern, item.clone(), *kind)?;
+                self.exec_stmt(body, None)
+            }
+            ForTarget::Expr(target) => {
+                self.assign_target(target, item)?;
+                self.exec_stmt(body, None)
+            }
+        })();
+        if scope.is_some() {
+            self.env_stack.pop();
+        }
+        result
     }
 
     fn exec_switch(
@@ -843,7 +987,134 @@ impl crate::Runtime {
                 }
                 Ok(Value::String(out))
             }
+            Expr::Class(class) => self.create_class(class),
+            Expr::Super => Err(JsError::syntax_error(
+                "`super` is only valid in a method or derived constructor",
+            )),
+            Expr::Yield { .. } => Err(JsError::syntax_error(
+                "`yield` is only valid inside a generator function",
+            )),
+            Expr::Await(_) => Err(JsError::syntax_error(
+                "`await` is only valid inside an async function",
+            )),
+            Expr::OptionalChain(chain) => self.eval_optional_chain(chain),
+            Expr::Spread(_) => Err(JsError::syntax_error(
+                "spread is only valid in array literals and call arguments",
+            )),
+            Expr::ImportCall(argument) => {
+                let specifier = self.eval_expr(argument)?;
+                let specifier = crate::Runtime::import_specifier(&specifier)?;
+                self.import_module(&specifier)
+            }
+            Expr::MetaProperty { meta, property } => {
+                if meta != "import" || property != "meta" {
+                    return Err(JsError::syntax_error(format!(
+                        "unsupported meta property {meta}.{property}"
+                    )));
+                }
+                let Some(url) = self.current_module_url().map(str::to_owned) else {
+                    return Err(JsError::syntax_error(
+                        "import.meta is only valid inside a module",
+                    ));
+                };
+                let object = self.new_object();
+                if let Value::Object(id) = object {
+                    self.define_data_property(id, "url", Value::String(url.clone()));
+                    let resolve = self.new_native_value(
+                        "resolve",
+                        1,
+                        Box::new(move |_runtime, _this, args| {
+                            let value = args.first().cloned().unwrap_or(Value::Undefined);
+                            let specifier = crate::Runtime::import_specifier(&value)?;
+                            let resolved =
+                                crate::module::resolve_specifier(&specifier, Some(url.as_str()));
+                            Ok(Value::String(resolved))
+                        }),
+                    );
+                    self.define_data_property(id, "resolve", resolve);
+                }
+                Ok(object)
+            }
         }
+    }
+
+    /// Evaluate `a?.b?.[c]?.(d)`, short circuiting the rest of the chain as
+    /// soon as an optional step sees `null` or `undefined`.
+    fn eval_optional_chain(&mut self, chain: &OptionalChain) -> Result<Value, JsError> {
+        let mut value = self.eval_expr(&chain.base)?;
+        for op in &chain.ops {
+            match op {
+                OptionalChainOp::Member {
+                    property,
+                    computed,
+                    optional,
+                } => {
+                    if *optional && matches!(value, Value::Undefined | Value::Null) {
+                        return Ok(Value::Undefined);
+                    }
+                    let key = self.property_key(property, *computed)?;
+                    value = self.get_property_checked(&value, &key)?;
+                }
+                OptionalChainOp::Call {
+                    arguments,
+                    optional,
+                } => {
+                    if *optional && matches!(value, Value::Undefined | Value::Null) {
+                        return Ok(Value::Undefined);
+                    }
+                    let args = self.eval_arguments(arguments)?;
+                    value = self.call_function(&value, Value::Undefined, args)?;
+                }
+            }
+        }
+        Ok(value)
+    }
+
+    /// Evaluate call arguments, expanding `...spread` elements into their
+    /// iterator values.
+    fn eval_arguments(&mut self, arguments: &[Expr]) -> Result<Vec<Value>, JsError> {
+        let mut args = Vec::new();
+        for argument in arguments {
+            if let Expr::Spread(inner) = argument {
+                let value = self.eval_expr(inner)?;
+                let items = self.iterate_values(&value)?;
+                args.extend(items);
+            } else {
+                args.push(self.eval_expr(argument)?);
+            }
+        }
+        Ok(args)
+    }
+
+    /// Materialise the values produced by an iterable using the
+    /// `Symbol.iterator`/`next()` protocol.
+    pub(crate) fn iterate_values(&mut self, value: &Value) -> Result<Vec<Value>, JsError> {
+        let (iterator, next) = self.get_iterator(value)?;
+        let mut items = Vec::new();
+        loop {
+            self.tick()?;
+            let result = self.call_function(&next, iterator.clone(), Vec::new())?;
+            if self.get_property_checked(&result, "done")?.is_truthy() {
+                break;
+            }
+            items.push(self.get_property_checked(&result, "value")?);
+        }
+        Ok(items)
+    }
+
+    /// Obtain `(iterator, next)` for a value, raising `TypeError` when it does
+    /// not implement the iteration protocol.
+    pub(crate) fn get_iterator(&mut self, value: &Value) -> Result<(Value, Value), JsError> {
+        let method = self.get_property_checked(value, SYMBOL_ITERATOR_KEY)?;
+        if !self.is_callable(&method) {
+            return Err(JsError::type_error("value is not iterable"));
+        }
+        let iterator = self.call_function(&method, value.clone(), Vec::new())?;
+        let next = self.get_property_checked(&iterator, "next")?;
+        if !self.is_callable(&next) {
+            return Err(JsError::type_error("iterator next is not callable"));
+        }
+        Ok((iterator, next))
     }
 
     fn eval_array(&mut self, items: &[Option<Expr>]) -> Result<Value, JsError> {
@@ -851,6 +1122,21 @@ impl crate::Runtime {
         let mut values = Vec::with_capacity(items.len());
         for item in items {
             match item {
+                Some(Expr::Spread(inner)) => match self
+                    .eval_expr(inner)
+                    .and_then(|value| self.iterate_values(&value))
+                {
+                    Ok(expanded) => {
+                        for value in expanded {
+                            self.temp_roots.push(value.clone());
+                            values.push(value);
+                        }
+                    }
+                    Err(error) => {
+                        self.temp_roots.truncate(mark);
+                        return Err(error);
+                    }
+                },
                 Some(expr) => match self.eval_expr(expr) {
                     Ok(value) => {
                         self.temp_roots.push(value.clone());
@@ -878,7 +1164,7 @@ impl crate::Runtime {
         self.temp_roots.push(object.clone());
         let outcome = (|| -> Result<(), JsError> {
             for property in properties {
-                let key = property.key.as_key_string();
+                let key = self.property_key_string(&property.key)?;
                 let value = self.eval_expr(&property.value)?;
                 self.set_property_checked(&object, &key, value)?;
             }
@@ -897,6 +1183,23 @@ impl crate::Runtime {
     ) -> Result<Value, JsError> {
         let mark = self.temp_roots.len();
         let result = (|| {
+            if matches!(object, Expr::Super) {
+                let this = self.current_this();
+                let home = self.read_binding(SUPER_HOME)?;
+                let key = self.property_key(property, computed)?;
+                return match home {
+                    Value::Object(id) => {
+                        let start = self.object(id).and_then(|object| object.prototype);
+                        Ok(match start {
+                            Some(start) => self
+                                .lookup_property(&this, start, &key)?
+                                .unwrap_or(Value::Undefined),
+                            None => Value::Undefined,
+                        })
+                    }
+                    _ => Ok(Value::Undefined),
+                };
+            }
             let base = self.eval_expr(object)?;
             self.temp_roots.push(base.clone());
             let key = self.property_key(property, computed)?;
@@ -906,30 +1209,56 @@ impl crate::Runtime {
         result
     }
 
+    fn current_this(&mut self) -> Value {
+        self.read_binding("this")
+            .unwrap_or(Value::Object(self.global))
+    }
+
     fn eval_call(&mut self, callee: &Expr, arguments: &[Expr]) -> Result<Value, JsError> {
         let mark = self.temp_roots.len();
         let outcome = (|| -> Result<Value, JsError> {
-            let (function, this) = if let Expr::Member {
+            let (function, this) = if matches!(callee, Expr::Super) {
+                let constructor = self.read_binding(SUPER_CTOR)?;
+                let this = self.current_this();
+                (constructor, this)
+            } else if let Expr::Member {
                 object,
                 property,
                 computed,
             } = callee
             {
-                let base = self.eval_expr(object)?;
-                self.temp_roots.push(base.clone());
-                let key = self.property_key(property, *computed)?;
-                let function = self.get_property_checked(&base, &key)?;
-                (function, base)
+                if matches!(object.as_ref(), Expr::Super) {
+                    let this = self.current_this();
+                    let home = self.read_binding(SUPER_HOME)?;
+                    let key = self.property_key(property, *computed)?;
+                    let function = match home {
+                        Value::Object(id) => {
+                            let start = self.object(id).and_then(|object| object.prototype);
+                            match start {
+                                Some(start) => self
+                                    .lookup_property(&this, start, &key)?
+                                    .unwrap_or(Value::Undefined),
+                                None => Value::Undefined,
+                            }
+                        }
+                        _ => Value::Undefined,
+                    };
+                    (function, this)
+                } else {
+                    let base = self.eval_expr(object)?;
+                    self.temp_roots.push(base.clone());
+                    let key = self.property_key(property, *computed)?;
+                    let function = self.get_property_checked(&base, &key)?;
+                    (function, base)
+                }
             } else {
                 (self.eval_expr(callee)?, Value::Undefined)
             };
             self.temp_roots.push(function.clone());
             self.temp_roots.push(this.clone());
-            let mut args = Vec::with_capacity(arguments.len());
-            for argument in arguments {
-                let value = self.eval_expr(argument)?;
+            let args = self.eval_arguments(arguments)?;
+            for value in &args {
                 self.temp_roots.push(value.clone());
-                args.push(value);
             }
             self.call_function(&function, this, args)
         })();
@@ -954,11 +1283,9 @@ impl crate::Runtime {
             };
             let instance = Value::Object(self.alloc_object(ObjectKind::Ordinary, prototype));
             self.temp_roots.push(instance.clone());
-            let mut args = Vec::with_capacity(arguments.len());
-            for argument in arguments {
-                let value = self.eval_expr(argument)?;
+            let args = self.eval_arguments(arguments)?;
+            for value in &args {
                 self.temp_roots.push(value.clone());
-                args.push(value);
             }
             let result = self.call_function(&constructor, instance.clone(), args)?;
             match result {
@@ -970,10 +1297,32 @@ impl crate::Runtime {
         outcome
     }
 
+    /// Resolve a value used as a property key, translating well-known symbols
+    /// to their private internal keys.
+    fn key_from_value(&mut self, value: &Value) -> Result<String, JsError> {
+        if let Value::Object(id) = value
+            && let Some(Value::String(key)) = self.get_own_property(*id, "\u{0}symbol_key")
+        {
+            return Ok(key);
+        }
+        self.to_string_rt(value)
+    }
+
+    /// Resolve a property key from an AST key, evaluating computed keys.
+    fn property_key_string(&mut self, key: &PropertyKey) -> Result<String, JsError> {
+        match key {
+            PropertyKey::Computed(expr) => {
+                let value = self.eval_expr(expr)?;
+                self.key_from_value(&value)
+            }
+            other => Ok(other.as_key_string()),
+        }
+    }
+
     fn property_key(&mut self, property: &Expr, computed: bool) -> Result<String, JsError> {
         if computed {
             let value = self.eval_expr(property)?;
-            self.to_string_rt(&value)
+            self.key_from_value(&value)
         } else {
             match property {
                 Expr::Identifier(name) => Ok(name.clone()),
@@ -1281,16 +1630,12 @@ impl crate::Runtime {
 
     pub(crate) fn typeof_value(&self, value: &Value) -> &'static str {
         match value {
-            Value::Object(id) => {
-                if self
-                    .object(*id)
-                    .is_some_and(|object| matches!(&object.kind, ObjectKind::Function(_)))
-                {
-                    "function"
-                } else {
-                    "object"
-                }
-            }
+            Value::Object(id) => match self.object(*id).map(|object| &object.kind) {
+                Some(ObjectKind::Function(_)) => "function",
+                Some(ObjectKind::Symbol(_)) => "symbol",
+                Some(ObjectKind::Generator(_)) => "object",
+                _ => "object",
+            },
             other => other.type_of(),
         }
     }
@@ -1452,6 +1797,103 @@ impl crate::Runtime {
             current = self.object(id).and_then(|object| object.prototype);
         }
         Ok(Value::Bool(false))
+    }
+
+    /// Build a class constructor, its prototype (with methods and accessors),
+    /// and its static methods, wiring `super` for derived classes.
+    fn create_class(&mut self, class: &Class) -> Result<Value, JsError> {
+        let super_class = match &class.super_class {
+            Some(expr) => Some(self.eval_expr(expr)?),
+            None => None,
+        };
+        let super_prototype = match &super_class {
+            Some(value) => match self.get_property_checked(value, "prototype")? {
+                Value::Object(id) => Some(id),
+                _ => Some(self.prototypes.object),
+            },
+            None => Some(self.prototypes.object),
+        };
+        let prototype_id = self.alloc_object(ObjectKind::Ordinary, super_prototype);
+        let prototype = Value::Object(prototype_id);
+        let env = self.current_scope();
+
+        let empty_constructor = Function {
+            name: class.name.clone(),
+            params: Vec::new(),
+            patterns: Vec::new(),
+            body: Vec::new(),
+            is_arrow: false,
+            is_generator: false,
+            is_async: false,
+            pos: class.pos,
+        };
+        let constructor_ast = class
+            .body
+            .iter()
+            .find_map(|member| match member {
+                ClassMember::Method {
+                    key,
+                    function,
+                    is_static: false,
+                    ..
+                } if key.as_key_string() == "constructor" => Some(function),
+                _ => None,
+            })
+            .unwrap_or(&empty_constructor);
+        let constructor = self.create_function_from_ast(constructor_ast, env);
+        if let Some(value) = &super_class {
+            self.set_function_super_ctor(constructor.clone(), value.clone());
+            // Static members are inherited through the constructor's own
+            // prototype chain.
+            if let (Value::Object(constructor_id), Value::Object(super_id)) = (&constructor, value)
+                && let Some(object) = self.object_mut(*constructor_id)
+            {
+                object.prototype = Some(*super_id);
+            }
+        }
+        self.define_data_property(prototype_id, "constructor", constructor.clone());
+        if let Value::Object(id) = &constructor {
+            self.define_data_property(*id, "prototype", prototype.clone());
+        }
+
+        for member in &class.body {
+            let ClassMember::Method {
+                key,
+                function,
+                is_static,
+                kind,
+            } = member;
+            let name = self.property_key_string(key)?;
+            if !is_static && name == "constructor" {
+                continue;
+            }
+            let method = self.create_function_from_ast(function, env);
+            let target = if *is_static {
+                match &constructor {
+                    Value::Object(id) => *id,
+                    _ => continue,
+                }
+            } else {
+                prototype_id
+            };
+            // `super` looks up members starting at the home object's
+            // prototype: the superclass prototype for instance methods and
+            // the superclass constructor for static methods.
+            self.set_function_home(method.clone(), target);
+            match kind {
+                MethodKind::Method => self.define_data_property(target, &name, method),
+                MethodKind::Getter | MethodKind::Setter => {
+                    let (mut getter, mut setter) = self.accessor_pair(target, &name);
+                    if *kind == MethodKind::Getter {
+                        getter = Some(method);
+                    } else {
+                        setter = Some(method);
+                    }
+                    self.define_accessor_property(target, &name, getter, setter);
+                }
+            }
+        }
+        Ok(constructor)
     }
 
     pub(crate) fn error_from_throw(&mut self, value: Value) -> JsError {

@@ -14,6 +14,10 @@
 //! never produces a navigation: `back` at the first entry, `forward` at the last
 //! and any out-of-range `Go` are rejected.
 //!
+//! [`NavigationBudget`] caps a whole load pipeline with a single wall-clock
+//! deadline and guards against chained-navigation loops; the browser layer
+//! consults it before each subresource and before each layout/paint pass.
+//!
 //! ```
 //! use browser_navigation::{NavigationAction, SessionHistory};
 //! use browser_url::Url;
@@ -29,12 +33,14 @@
 
 #![forbid(unsafe_code)]
 
+mod deadline;
 mod frame;
 mod history;
 mod lifecycle;
 mod navigator;
 
 pub use browser_event_loop::Scheduler;
+pub use deadline::{NavigationBudget, NavigationDeadline, Truncation};
 pub use frame::Frame;
 pub use history::{HistoryEntry, NavError, Navigation, NavigationAction, SessionHistory};
 pub use lifecycle::{LifecycleState, Transition};

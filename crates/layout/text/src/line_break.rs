@@ -1,4 +1,4 @@
-//! Greedy line breaking for the built-in monospace face.
+//! Greedy line breaking measured with the embedded proportional face.
 //!
 //! Lines are wrapped at spaces and after hyphens, with mandatory breaks on
 //! `'\n'`. All positions are byte offsets into the source string and always
@@ -94,6 +94,11 @@ mod tests {
         &text[range.0..range.1]
     }
 
+    /// Width of `text` at `px` using the same font as the breaker.
+    fn w(text: &str, px: f32) -> f32 {
+        Font::sans().measure(text, px)
+    }
+
     #[test]
     fn empty_text_has_one_empty_line() {
         let result = line_break("", 100.0, 16.0);
@@ -111,15 +116,15 @@ mod tests {
 
     #[test]
     fn exact_fit_does_not_wrap() {
-        // 5 characters at 8px each fit in 40px exactly.
-        let result = line_break("hello", 40.0, 16.0);
+        let text = "hello";
+        let result = line_break(text, w(text, 16.0), 16.0);
         assert_eq!(result.lines, vec![(0, 5)]);
     }
 
     #[test]
     fn wraps_on_space_and_drops_the_space() {
         let text = "hello world";
-        let result = line_break(text, 40.0, 16.0);
+        let result = line_break(text, w("hello", 16.0), 16.0);
         assert_eq!(result.breaks, vec![6]);
         assert_eq!(result.lines, vec![(0, 5), (6, 11)]);
         assert_eq!(slice(text, result.lines[0]), "hello");
@@ -129,7 +134,7 @@ mod tests {
     #[test]
     fn wraps_after_hyphen_keeping_it() {
         let text = "co-operate";
-        let result = line_break(text, 24.0, 16.0);
+        let result = line_break(text, w("co-", 16.0), 16.0);
         assert_eq!(result.lines, vec![(0, 3), (3, 10)]);
         assert_eq!(slice(text, result.lines[0]), "co-");
         assert_eq!(slice(text, result.lines[1]), "operate");
@@ -155,7 +160,7 @@ mod tests {
     #[test]
     fn long_word_overflows_on_one_line() {
         let text = "abcdefghij";
-        let result = line_break(text, 24.0, 16.0);
+        let result = line_break(text, w("abc", 16.0), 16.0);
         assert_eq!(result.lines, vec![(0, 10)]);
         assert!(result.breaks.is_empty());
     }
@@ -163,14 +168,14 @@ mod tests {
     #[test]
     fn long_word_overflow_resumes_wrapping_after_it() {
         let text = "abcdefghij klm";
-        let result = line_break(text, 40.0, 16.0);
+        let result = line_break(text, w("abc", 16.0), 16.0);
         assert_eq!(result.lines, vec![(0, 10), (11, 14)]);
     }
 
     #[test]
     fn wraps_multiple_times() {
         let text = "one two three four";
-        let result = line_break(text, 32.0, 16.0);
+        let result = line_break(text, w("one", 16.0), 16.0);
         let rendered: Vec<&str> = result.lines.iter().map(|r| slice(text, *r)).collect();
         assert_eq!(rendered, vec!["one", "two", "three", "four"]);
         assert_eq!(result.breaks, vec![4, 8, 14]);
@@ -202,9 +207,9 @@ mod tests {
 
     #[test]
     fn unicode_wrap_uses_character_widths_not_bytes() {
-        // Five 2-byte characters occupy 5 cells = 40px, so this fits.
+        // Multi-byte code points are measured by advance, never by byte count.
         let text = "äääää";
-        let result = line_break(text, 40.0, 16.0);
+        let result = line_break(text, w(text, 16.0), 16.0);
         assert_eq!(result.lines, vec![(0, text.len())]);
     }
 
@@ -218,16 +223,15 @@ mod tests {
 
     #[test]
     fn scaled_text_wraps_by_pixel_size() {
-        // At 32px each character is 16px wide, so three fit in 48px.
         let text = "abc def";
-        let result = line_break(text, 48.0, 32.0);
+        let result = line_break(text, w("abc", 32.0), 32.0);
         assert_eq!(result.lines, vec![(0, 3), (4, 7)]);
     }
 
     #[test]
     fn break_offsets_are_monotonic() {
         let text = "the quick brown fox jumps over the lazy dog";
-        let result = line_break(text, 64.0, 16.0);
+        let result = line_break(text, w("the", 16.0), 16.0);
         assert!(result.breaks.windows(2).all(|w| w[0] < w[1]));
         assert_eq!(result.breaks.len() + 1, result.lines.len());
     }

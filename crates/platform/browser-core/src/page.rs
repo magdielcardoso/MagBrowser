@@ -122,8 +122,16 @@ impl Page {
 
     /// Adds a stylesheet (for example one fetched from a `<link>` element).
     pub fn add_author_css(&mut self, css: &str) {
-        self.author_css.push(css.to_string());
+        self.add_author_css_no_recompute(css);
         self.recompute();
+    }
+
+    /// Appends a stylesheet without triggering style/layout/paint.
+    ///
+    /// Used by the navigation pipeline to batch all fetched sheets into a single
+    /// recompute, which can then be skipped when the navigation deadline passes.
+    pub(crate) fn add_author_css_no_recompute(&mut self, css: &str) {
+        self.author_css.push(css.to_string());
     }
 
     /// Author stylesheets currently applied, in order.
@@ -167,7 +175,18 @@ impl Page {
 
     /// Renders the page to an image buffer using the current display list.
     pub fn render(&self) -> ImageBuffer {
-        browser_paint::Rasterizer::new(self.viewport, self.background).execute(&self.display_list)
+        self.render_scaled(1.0)
+    }
+
+    /// Renders at a device scale factor while keeping the CSS viewport intact.
+    pub fn render_scaled(&self, scale: f32) -> ImageBuffer {
+        let viewport = Size {
+            width: (self.viewport.width * scale).max(1.0),
+            height: (self.viewport.height * scale).max(1.0),
+        };
+        browser_paint::Rasterizer::new(viewport, self.background)
+            .scaled(scale)
+            .execute(&self.display_list)
     }
 
     /// The document title.

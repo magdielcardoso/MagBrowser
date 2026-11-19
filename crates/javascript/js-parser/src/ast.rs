@@ -18,6 +18,75 @@ pub struct Program {
     pub body: Vec<Stmt>,
 }
 
+/// A single specifier inside an `import { ... }` clause.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ImportSpecifier {
+    /// The name exported by the imported module.
+    pub imported: String,
+    /// The local binding the name is bound to.
+    pub local: String,
+}
+
+/// A static `import` declaration.
+///
+/// All forms share one shape: `import default_name, { named } from "source"`
+/// and `import default_name, * as namespace from "source"`. A side-effect only
+/// import (`import "source";`) leaves every binding empty.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ImportDecl {
+    /// Default import binding, if present.
+    pub default: Option<String>,
+    /// Named import specifiers, in source order.
+    pub named: Vec<ImportSpecifier>,
+    /// Namespace import binding (`import * as ns`), if present.
+    pub namespace: Option<String>,
+    /// Module specifier string, without the quotes.
+    pub source: String,
+    /// Source position of the `import` keyword.
+    pub pos: Position,
+}
+
+/// A single specifier inside an `export { ... }` clause.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExportSpecifier {
+    /// The name in the exporting module (local binding or imported name).
+    pub local: String,
+    /// The name exposed to importers.
+    pub exported: String,
+}
+
+/// The payload of an `export` declaration.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ExportKind {
+    /// `export default <expression>;`
+    DefaultExpr(Expr),
+    /// `export default function ...;` or `export default class ...;`
+    DefaultDecl(Box<Stmt>),
+    /// `export var/let/const/function/class ...;`
+    Decl(Box<Stmt>),
+    /// `export { a, b as c };` optionally followed by `from "source"`.
+    Named {
+        /// Export specifiers in source order.
+        specifiers: Vec<ExportSpecifier>,
+        /// Source module for a re-export, when `from` was present.
+        source: Option<String>,
+    },
+    /// `export * from "source";`
+    All {
+        /// Source module whose exports are re-exported.
+        source: String,
+    },
+}
+
+/// An `export` declaration.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExportDecl {
+    /// Which form of export this is.
+    pub kind: ExportKind,
+    /// Source position of the `export` keyword.
+    pub pos: Position,
+}
+
 /// Declaration kind of a variable statement.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeclKind {
@@ -133,8 +202,95 @@ pub struct Function {
     pub body: Vec<Stmt>,
     /// Whether the function is an arrow function.
     pub is_arrow: bool,
+    /// Whether the function is a generator (`function*` or `async function*`).
+    /// Generator functions return a generator object and may use `yield`.
+    pub is_generator: bool,
+    /// Whether the function is `async`. Async functions return a promise and
+    /// may use `await`.
+    pub is_async: bool,
     /// Source position of the function.
     pub pos: Position,
+}
+
+/// A class declaration or class expression.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Class {
+    /// Class name, when one was written.
+    pub name: Option<String>,
+    /// Expression evaluated to obtain the superclass.
+    pub super_class: Option<Box<Expr>>,
+    /// Methods and static methods in source order.
+    pub body: Vec<ClassMember>,
+    /// Source position of the `class` keyword.
+    pub pos: Position,
+}
+
+/// A member of a class body.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ClassMember {
+    /// A method, getter, setter, generator or async method.
+    Method {
+        /// Property key of the method.
+        key: PropertyKey,
+        /// The method body and parameters.
+        function: Function,
+        /// Whether the member is `static`.
+        is_static: bool,
+        /// Whether this is a getter, setter or regular method.
+        kind: MethodKind,
+    },
+}
+
+/// The kind of a class or object method.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MethodKind {
+    /// A regular method.
+    Method,
+    /// A `get` accessor.
+    Getter,
+    /// A `set` accessor.
+    Setter,
+}
+
+impl ClassMember {
+    /// Whether the member is static.
+    pub fn is_static(&self) -> bool {
+        match self {
+            Self::Method { is_static, .. } => *is_static,
+        }
+    }
+}
+
+/// A single step of an optional chain such as `a?.b[0]?.()`.
+#[derive(Clone, Debug, PartialEq)]
+pub enum OptionalChainOp {
+    /// A property access. `optional` is true for `?.name` / `?.[expr]`.
+    Member {
+        /// Property expression (an identifier when `computed` is false).
+        property: Box<Expr>,
+        /// Whether the access is computed (`[expr]`).
+        computed: bool,
+        /// Whether this step short circuits the whole chain when nullish.
+        optional: bool,
+    },
+    /// A call. `optional` is true for `?.(...)`.
+    Call {
+        /// Call arguments, which may contain spread elements.
+        arguments: Vec<Expr>,
+        /// Whether the call short circuits the whole chain when nullish.
+        optional: bool,
+    },
+}
+
+/// An optional chaining expression: a base followed by a sequence of member
+/// and call steps. If a step marked `optional` receives `null` or `undefined`,
+/// the whole expression evaluates to `undefined` without evaluating later steps.
+#[derive(Clone, Debug, PartialEq)]
+pub struct OptionalChain {
+    /// The expression the chain starts from.
+    pub base: Box<Expr>,
+    /// Each member access or call in the chain, in source order.
+    pub ops: Vec<OptionalChainOp>,
 }
 
 /// A key used in an object literal.
@@ -146,6 +302,8 @@ pub enum PropertyKey {
     String(String),
     /// A numeric literal key.
     Number(f64),
+    /// A computed key `[expr]`, evaluated when the object or class is created.
+    Computed(Box<Expr>),
 }
 
 impl PropertyKey {
@@ -154,6 +312,9 @@ impl PropertyKey {
         match self {
             Self::Ident(name) | Self::String(name) => name.clone(),
             Self::Number(n) => crate::ast::number_to_key(*n),
+            // Computed keys are evaluated by the runtime; the parser cannot
+            // know their value.
+            Self::Computed(_) => "[computed]".to_owned(),
         }
     }
 }
@@ -414,6 +575,34 @@ pub enum Expr {
         /// Interpolated expressions.
         exprs: Vec<Expr>,
     },
+    /// A `class` expression.
+    Class(Class),
+    /// The `super` keyword. It is only meaningful as the callee of `super(...)`
+    /// or as the object of `super.member` / `super[member]`.
+    Super,
+    /// A `yield` or `yield*` expression, valid inside generator functions.
+    Yield {
+        /// Optional value to yield.
+        argument: Option<Box<Expr>>,
+        /// Whether this is `yield*` (delegating iteration).
+        delegate: bool,
+    },
+    /// An `await` expression, valid inside async functions.
+    Await(Box<Expr>),
+    /// An optional chaining expression (`a?.b`, `a?.[b]`, `a?.()`).
+    OptionalChain(OptionalChain),
+    /// A spread element (`...value`) used in array literals and call arguments.
+    Spread(Box<Expr>),
+    /// A dynamic `import(specifier)` expression. Evaluates to a promise for the
+    /// imported module's namespace object.
+    ImportCall(Box<Expr>),
+    /// A meta property such as `import.meta`.
+    MetaProperty {
+        /// The meta object identifier (`import`).
+        meta: String,
+        /// The property name (`meta`).
+        property: String,
+    },
 }
 
 /// Initializer of a `for` statement.
@@ -434,6 +623,13 @@ pub enum ForTarget {
         kind: DeclKind,
         /// Bound variable name.
         name: String,
+    },
+    /// A destructuring declaration target such as `for (const [a, b] of xs)`.
+    Pattern {
+        /// Declaration kind.
+        kind: DeclKind,
+        /// Bound pattern.
+        pattern: Pattern,
     },
     /// An assignment target expression.
     Expr(Expr),
@@ -466,6 +662,8 @@ pub enum Stmt {
     VarDecl(VarDecl),
     /// Function declaration.
     FunctionDecl(Function),
+    /// Class declaration.
+    ClassDecl(Class),
     /// `return` statement.
     Return(Option<Expr>),
     /// `if` statement.
@@ -546,4 +744,8 @@ pub enum Stmt {
         /// Labelled statement.
         body: Box<Stmt>,
     },
+    /// A static `import` declaration.
+    Import(ImportDecl),
+    /// An `export` declaration.
+    Export(ExportDecl),
 }

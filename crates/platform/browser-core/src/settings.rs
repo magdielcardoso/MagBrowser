@@ -1,5 +1,7 @@
 //! Engine settings.
 
+use std::time::Duration;
+
 /// Configuration for a browser instance.
 #[derive(Debug, Clone)]
 pub struct Settings {
@@ -17,8 +19,12 @@ pub struct Settings {
     pub background: (u8, u8, u8),
     /// Maximum response body size in bytes.
     pub max_body_bytes: usize,
-    /// Network timeout in seconds.
+    /// Network timeout in seconds (bounds a single HTTP request).
     pub timeout_seconds: u64,
+    /// Wall-clock deadline for an entire navigation pipeline: main document,
+    /// stylesheets, images, scripts and layout/paint combined. Once it elapses
+    /// the load stops gracefully and a usable partial page is shown.
+    pub navigation_deadline: Duration,
     /// Preferred colour scheme reported to CSS media queries.
     pub prefers_color_scheme: String,
 }
@@ -34,6 +40,7 @@ impl Default for Settings {
             background: (255, 255, 255),
             max_body_bytes: 32 * 1024 * 1024,
             timeout_seconds: 20,
+            navigation_deadline: Duration::from_secs(10),
             prefers_color_scheme: "light".to_string(),
         }
     }
@@ -91,6 +98,7 @@ mod tests {
         assert_eq!(settings.style_viewport().width, settings.viewport_width);
         assert_eq!(settings.background_color().r, 255);
         assert!(!settings.enable_scripting);
+        assert_eq!(settings.navigation_deadline, Duration::from_secs(10));
     }
 
     #[test]

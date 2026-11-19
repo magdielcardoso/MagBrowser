@@ -1,0 +1,10 @@
+<!DOCTYPE html>
+<html>
+  <head><title>calc width</title></head>
+  <body style="margin:0">
+    <!-- The child's width is 100% of a 200px parent minus 20px => 180px. -->
+    <div id="parent" style="width:200px;height:60px">
+      <div id="child" style="width:calc(100% - 20px);height:20px;background:red"></div>
+    </div>
+  </body>
+</html>

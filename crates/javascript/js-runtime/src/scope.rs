@@ -17,6 +17,8 @@ pub(crate) enum BindingKind {
     Param,
     This,
     Arguments,
+    /// A module import binding whose stored value is a getter function.
+    Import,
 }
 
 /// A single variable binding.
@@ -110,15 +112,41 @@ impl crate::Runtime {
             }
             return Err(JsError::reference_error(format!("{name} is not defined")));
         };
-        if let Some(scope) = self.scope(scope_id)
-            && let Some((_, binding)) = scope.bindings.iter().find(|(bound, _)| bound == name)
-        {
-            if !binding.initialized {
-                return Err(JsError::reference_error(format!(
-                    "cannot access '{name}' before initialization"
-                )));
-            }
-            return Ok(binding.value.clone());
+        self.read_binding_from_scope(scope_id, name)
+    }
+
+    /// Read a binding from a specific scope. Used by module export accessors,
+    /// which must not depend on the currently executing environment. Import
+    /// bindings store a getter function and are resolved on every read.
+    pub(crate) fn read_binding_from_scope(
+        &mut self,
+        scope_id: ScopeId,
+        name: &str,
+    ) -> Result<Value, JsError> {
+        let Some(scope) = self.scope(scope_id) else {
+            return self.read_global_property(name);
+        };
+        let Some((_, binding)) = scope.bindings.iter().find(|(bound, _)| bound == name) else {
+            return self.read_global_property(name);
+        };
+        if !binding.initialized {
+            return Err(JsError::reference_error(format!(
+                "cannot access '{name}' before initialization"
+            )));
+        }
+        let value = binding.value.clone();
+        if binding.kind == BindingKind::Import {
+            return self.call_function(&value, Value::Undefined, Vec::new());
+        }
+        Ok(value)
+    }
+
+    /// Read a name from the global object, used as a fallback when a specific
+    /// scope does not bind it.
+    fn read_global_property(&mut self, name: &str) -> Result<Value, JsError> {
+        let global = Value::Object(self.global);
+        if let Some(value) = self.lookup_property(&global, self.global, name)? {
+            return Ok(value);
         }
         Err(JsError::reference_error(format!("{name} is not defined")))
     }
@@ -182,6 +210,11 @@ impl crate::Runtime {
             if binding.kind == BindingKind::Const && binding.initialized {
                 return Err(JsError::type_error(format!(
                     "assignment to constant variable '{name}'"
+                )));
+            }
+            if binding.kind == BindingKind::Import {
+                return Err(JsError::type_error(format!(
+                    "assignment to imported binding '{name}'"
                 )));
             }
             binding.value = value.clone();

@@ -12,11 +12,13 @@
 
 #![forbid(unsafe_code)]
 
+pub mod budget;
 pub mod fetch;
 pub mod loader;
 pub mod mime;
 pub mod preload;
 
+pub use budget::{BudgetLimit, PageStats, ResourceBudget, ResourceKind};
 pub use fetch::Resource;
 pub use loader::{LoadError, ResourceLoader};
 pub use preload::{PreloadKind, PreloadRequest, scan};

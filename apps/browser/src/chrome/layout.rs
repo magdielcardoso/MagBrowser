@@ -9,7 +9,7 @@ use browser_layout::{Rect, Size};
 use browser_text::Font;
 
 use super::{
-    BUTTON_SIZE, CHROME_HEIGHT, FONT_SIZE, LoadStatus, PADDING, STATUS_FONT_SIZE, TAB_STRIP_HEIGHT,
+    BUTTON_SIZE, CHROME_HEIGHT, LoadStatus, PADDING, STATUS_FONT_SIZE, TAB_STRIP_HEIGHT,
     TOOLBAR_HEIGHT,
 };
 
@@ -27,6 +27,14 @@ pub const STATUS_MARGIN: f32 = 8.0;
 pub const STATUS_HEIGHT: f32 = 20.0;
 /// Left inset of address field text.
 pub const ADDRESS_INSET: f32 = 10.0;
+/// Side of the square site-security icon drawn inside the address field.
+pub const ADDRESS_ICON_SIZE: f32 = 12.0;
+/// Gap between the security icon and the address text.
+pub const ADDRESS_ICON_GAP: f32 = 6.0;
+/// Size of the close button on each tab.
+pub const TAB_CLOSE_SIZE: f32 = 14.0;
+/// Gap between the close button and the tab title.
+const TAB_CLOSE_GAP: f32 = 6.0;
 
 /// A region of the window chrome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,6 +49,8 @@ pub enum ChromePart {
     Address,
     /// Tab at an index in [`ChromeLayout::tabs`].
     Tab(usize),
+    /// Close button of the tab at an index in [`ChromeLayout::tabs`].
+    CloseTab(usize),
     /// New-tab `+` button.
     NewTab,
     /// Page content area.
@@ -70,6 +80,8 @@ pub struct ChromeLayout {
     pub address: Rect,
     /// Visible tab rectangles, left to right.
     pub tabs: Vec<Rect>,
+    /// Close-button rectangles, one per visible tab.
+    pub tab_closes: Vec<Rect>,
     /// New-tab button.
     pub new_tab: Rect,
     /// Whether the new-tab button fits in the strip.
@@ -111,12 +123,20 @@ impl ChromeLayout {
         let tab_y = (TAB_STRIP_HEIGHT - TAB_HEIGHT) / 2.0;
         let right_limit = width - right_reserved;
         let mut tabs = Vec::new();
+        let mut tab_closes = Vec::new();
         let mut x = PADDING;
         for _ in 0..tab_count {
             if x + per_tab > right_limit + 0.01 {
                 break;
             }
             tabs.push(Rect::new(x, tab_y, per_tab, TAB_HEIGHT));
+            let close = TAB_CLOSE_SIZE.min(per_tab / 3.0);
+            tab_closes.push(Rect::new(
+                x + per_tab - PADDING - close,
+                tab_y + (TAB_HEIGHT - close) / 2.0,
+                close,
+                close,
+            ));
             x += per_tab + TAB_GAP;
         }
         let new_tab = Rect::new(x, tab_y, BUTTON_SIZE, TAB_HEIGHT);
@@ -149,6 +169,7 @@ impl ChromeLayout {
             reload,
             address,
             tabs,
+            tab_closes,
             new_tab,
             new_tab_visible,
             content,
@@ -188,6 +209,11 @@ impl ChromeLayout {
         if contains(self.address, x, y) {
             return Some(ChromePart::Address);
         }
+        for (index, close) in self.tab_closes.iter().enumerate() {
+            if contains(*close, x, y) {
+                return Some(ChromePart::CloseTab(index));
+            }
+        }
         for (index, tab) in self.tabs.iter().enumerate() {
             if contains(*tab, x, y) {
                 return Some(ChromePart::Tab(index));
@@ -205,21 +231,20 @@ impl ChromeLayout {
         None
     }
 
-    /// Number of characters that fit in the address field.
-    pub fn address_visible_chars(&self) -> usize {
-        let font = Font::monospace();
-        let available = (self.address.width - 2.0 * ADDRESS_INSET - 2.0).max(0.0);
-        let cell = font.advance('M', FONT_SIZE).max(1.0);
-        (available / cell) as usize
+    /// Left inset for address text, leaving room for the security icon.
+    pub fn address_text_inset() -> f32 {
+        ADDRESS_INSET + ADDRESS_ICON_SIZE + ADDRESS_ICON_GAP
     }
 
-    /// Number of characters that fit inside a tab.
-    pub fn tab_visible_chars(&self) -> usize {
-        let font = Font::monospace();
-        let available =
-            (self.tabs.first().map_or(TAB_MIN_WIDTH, |tab| tab.width) - 2.0 * PADDING).max(0.0);
-        let cell = font.advance('M', FONT_SIZE).max(1.0);
-        (available / cell) as usize
+    /// Measured width available for address text, in logical pixels.
+    pub fn address_text_width(&self) -> f32 {
+        (self.address.width - Self::address_text_inset() - ADDRESS_INSET - 2.0).max(0.0)
+    }
+
+    /// Measured width available for a tab title, in logical pixels.
+    pub fn tab_text_width(&self) -> f32 {
+        let width = self.tabs.first().map_or(TAB_MIN_WIDTH, |tab| tab.width);
+        (width - 2.0 * PADDING - TAB_CLOSE_SIZE - TAB_CLOSE_GAP).max(0.0)
     }
 }
 
@@ -250,6 +275,24 @@ mod tests {
         assert!(chrome.reload.bottom() <= CHROME_HEIGHT);
         assert_eq!(chrome.address.y, chrome.back.y);
         assert!(chrome.address.right() <= 1200.0);
+    }
+
+    #[test]
+    fn tab_close_buttons_are_hittable_and_reserve_title_space() {
+        let chrome = layout(1200.0, 800.0, 2);
+        assert_eq!(chrome.tab_closes.len(), chrome.tabs.len());
+        for (tab, close) in chrome.tabs.iter().zip(&chrome.tab_closes) {
+            assert!(close.x > tab.x && close.right() <= tab.right());
+            assert!(chrome.hit(close.x + 2.0, close.y + 2.0).is_some());
+            assert!(matches!(
+                chrome.hit(close.x + 2.0, close.y + 2.0),
+                Some(ChromePart::CloseTab(_))
+            ));
+        }
+        // Title no longer runs under the close button.
+        let title_width = chrome.tab_text_width();
+        assert!(title_width > 0.0);
+        assert!(chrome.tabs[0].width > title_width + TAB_CLOSE_SIZE + 2.0 * PADDING);
     }
 
     #[test]
@@ -300,7 +343,34 @@ mod tests {
             widths.push(chrome.status.width);
         }
         assert!(widths[1] > widths[0], "longer text needs a wider pill");
-        assert_eq!(widths[2], widths[0] - 2.0 * 6.0);
+        assert!(
+            widths[2] < widths[0],
+            "\"Erro\" is narrower than \"Pronto\""
+        );
+    }
+
+    #[test]
+    fn address_text_budget_leaves_room_for_security_icon() {
+        let chrome = layout(1000.0, 700.0, 1);
+        assert_eq!(
+            ChromeLayout::address_text_inset(),
+            ADDRESS_INSET + ADDRESS_ICON_SIZE + ADDRESS_ICON_GAP
+        );
+        assert_eq!(
+            chrome.address_text_width(),
+            chrome.address.width - ChromeLayout::address_text_inset() - ADDRESS_INSET - 2.0
+        );
+        assert!(chrome.address_text_width() > 140.0);
+    }
+
+    #[test]
+    fn new_tab_button_has_a_stable_hit_region() {
+        let chrome = layout(1200.0, 800.0, 1);
+        assert!(chrome.new_tab_visible);
+        let cx = chrome.new_tab.x + chrome.new_tab.width / 2.0;
+        let cy = chrome.new_tab.y + chrome.new_tab.height / 2.0;
+        assert_eq!(chrome.hit(cx, cy), Some(ChromePart::NewTab));
+        assert!(chrome.new_tab.x >= chrome.tabs.last().unwrap().right());
     }
 
     #[test]
@@ -315,6 +385,6 @@ mod tests {
         assert_eq!(chrome.page_local(500.0, 400.0), Some((499.0, 319.0)));
         assert_eq!(chrome.page_local(500.0, 20.0), None);
         assert_eq!(chrome.page_local(0.0, 400.0), None);
-        assert!(chrome.address_visible_chars() > 20);
+        assert!(chrome.address_text_width() > 140.0);
     }
 }

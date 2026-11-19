@@ -16,6 +16,7 @@
 pub mod cache;
 pub mod client;
 pub mod cookies;
+pub mod encoding;
 pub mod headers;
 pub mod redirect;
 pub mod request;
@@ -24,7 +25,8 @@ pub mod response;
 pub use cache::HttpCache;
 pub use client::{Client, ClientConfig, HttpError};
 pub use cookies::{Cookie, CookieJar};
+pub use encoding::ContentEncoding;
 pub use headers::Headers;
 pub use redirect::{RedirectOutcome, RedirectPolicy};
 pub use request::{Method, Request};
-pub use response::Response;
+pub use response::{Charset, Response};

@@ -7,8 +7,19 @@
 //!
 //! Multiple policies are combined with [`CspList`], which enforces the most
 //! restrictive result: a resource is allowed only when every policy allows it.
-//! Nonces, hashes, `'strict-dynamic'`, reports and `frame-ancestors` are parsed as
-//! inert keywords and do not yet grant access.
+//!
+//! `'nonce-...'` and `'sha256-...'`/`'sha384-...'`/`'sha512-...'` sources are
+//! parsed and can authorise inline and external content through
+//! [`Policy::allows_inline_with`] and [`Policy::allows_with_check`]. The caller
+//! supplies the element's nonce and the already computed content digests; this
+//! crate is I/O free and does not hash content itself. [`Policy::allows_inline`]
+//! keeps its conservative, nonce-free behaviour for existing callers.
+//!
+//! `'strict-dynamic'` is recognised so that it can invalidate `'unsafe-inline'`
+//! and host allowlists when a nonce or hash is present, as CSP Level 3 requires.
+//! Reports, `report-uri`, `upgrade-insecure-requests` and `frame-ancestors` are
+//! parsed as inert directives; mixed-content handling lives in
+//! [`crate::mixed_content`].
 
 use std::collections::HashMap;
 
@@ -29,8 +40,114 @@ pub enum SourceExpression {
     Scheme(String),
     /// A host source, optionally with scheme, port and wildcard subdomain.
     Host(HostSource),
-    /// An unsupported quoted keyword such as `'nonce-...'`; never matches a URL.
+    /// A `'nonce-...'` source. Authorises content carrying the same nonce.
+    Nonce(String),
+    /// A `'sha256-...'`, `'sha384-...'` or `'sha512-...'` source.
+    Hash(HashSource),
+    /// `'strict-dynamic'`: with a nonce or hash, host allowlists are ignored.
+    StrictDynamic,
+    /// Any other quoted keyword; never grants access.
     Keyword(String),
+}
+
+/// The hash algorithm named by a CSP hash source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HashAlgorithm {
+    /// `sha256`
+    Sha256,
+    /// `sha384`
+    Sha384,
+    /// `sha512`
+    Sha512,
+}
+
+impl HashAlgorithm {
+    /// The algorithm name used in a hash source expression.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Sha256 => "sha256",
+            Self::Sha384 => "sha384",
+            Self::Sha512 => "sha512",
+        }
+    }
+
+    /// The digest length in bytes for this algorithm.
+    pub const fn digest_len(self) -> usize {
+        match self {
+            Self::Sha256 => 32,
+            Self::Sha384 => 48,
+            Self::Sha512 => 64,
+        }
+    }
+}
+
+/// A parsed CSP hash source such as `'sha256-X48a...'`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HashSource {
+    /// The named hash algorithm.
+    pub algorithm: HashAlgorithm,
+    /// The base64 digest from the policy, preserved verbatim.
+    pub value: String,
+}
+
+impl HashSource {
+    /// True when the supplied digest matches this source.
+    ///
+    /// Both standard and URL-safe base64 alphabets are accepted when decoding,
+    /// and a missing padding suffix is tolerated. This keeps policies produced
+    /// by common build tools working without weakening the comparison: only
+    /// decoded bytes are compared.
+    pub fn matches(&self, content: &ContentHash) -> bool {
+        self.algorithm == content.algorithm
+            && decode_base64(&self.value).is_some_and(|bytes| bytes == content.digest)
+    }
+}
+
+/// A content digest computed by the caller, for CSP hash-source matching.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContentHash {
+    /// The algorithm used to compute `digest`.
+    pub algorithm: HashAlgorithm,
+    /// Raw digest bytes (32 for SHA-256, 48 for SHA-384, 64 for SHA-512).
+    pub digest: Vec<u8>,
+}
+
+impl ContentHash {
+    /// Creates a hash, returning `None` when the digest length is wrong.
+    pub fn new(algorithm: HashAlgorithm, digest: impl Into<Vec<u8>>) -> Option<Self> {
+        let digest = digest.into();
+        (digest.len() == algorithm.digest_len()).then_some(Self { algorithm, digest })
+    }
+}
+
+/// Nonce and hash metadata for an inline or external piece of content.
+///
+/// A nonce is compared verbatim. Hashes are compared by decoded bytes, so the
+/// caller only needs to provide the raw digest for the algorithm it used.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ContentCheck<'a> {
+    /// The element's `nonce` attribute.
+    pub nonce: Option<&'a str>,
+    /// Digests of the content, usually from an `integrity` attribute.
+    pub hashes: &'a [ContentHash],
+}
+
+impl<'a> ContentCheck<'a> {
+    /// A check carrying only a nonce.
+    pub fn with_nonce(nonce: &'a str) -> Self {
+        Self {
+            nonce: Some(nonce),
+            hashes: &[],
+        }
+    }
+
+    /// A check carrying only content digests.
+    pub fn with_hashes(hashes: &'a [ContentHash]) -> Self {
+        Self {
+            nonce: None,
+            hashes,
+        }
+    }
 }
 
 /// A host source expression such as `*.example.com:8443` or
@@ -84,10 +201,24 @@ impl SourceExpression {
             Self::SelfOrigin => {
                 !origin.is_opaque() && !url.origin().is_opaque() && url.origin().same_origin(origin)
             }
-            Self::None | Self::UnsafeInline | Self::Keyword(_) => false,
+            Self::None
+            | Self::UnsafeInline
+            | Self::Nonce(_)
+            | Self::Hash(_)
+            | Self::StrictDynamic
+            | Self::Keyword(_) => false,
             Self::Wildcard => url.is_network(),
             Self::Scheme(scheme) => url.scheme().eq_ignore_ascii_case(scheme),
             Self::Host(host) => host.matches(url),
+        }
+    }
+
+    /// True when this source authorises the supplied nonce or content digest.
+    pub fn matches_content(&self, check: &ContentCheck<'_>) -> bool {
+        match self {
+            Self::Nonce(value) => check.nonce.is_some_and(|nonce| nonce == value),
+            Self::Hash(source) => check.hashes.iter().any(|hash| source.matches(hash)),
+            _ => false,
         }
     }
 }
@@ -136,13 +267,7 @@ impl Policy {
         let Some(sources) = self.sources_for(directive) else {
             return true;
         };
-        if sources.is_empty() {
-            return false;
-        }
-        if sources
-            .iter()
-            .all(|source| *source == SourceExpression::None)
-        {
+        if sources_allow_nothing(sources) {
             return false;
         }
         sources.iter().any(|source| source.matches(url, origin))
@@ -150,12 +275,75 @@ impl Policy {
 
     /// True when inline content is permitted for `directive`.
     ///
-    /// Requires `'unsafe-inline'`; nonces and hashes are not yet supported.
+    /// This conservative check requires `'unsafe-inline'`; it deliberately ignores
+    /// nonces and hashes because no element metadata is available. Use
+    /// [`Policy::allows_inline_with`] to authorise nonce/hash-protected content.
     pub fn allows_inline(&self, directive: &str) -> bool {
         let Some(sources) = self.sources_for(directive) else {
             return true;
         };
         sources.contains(&SourceExpression::UnsafeInline)
+    }
+
+    /// True when inline content is permitted for `directive`, considering the
+    /// element's nonce and content digests.
+    ///
+    /// `'unsafe-inline'` is ignored when the policy also contains a nonce, hash
+    /// or `'strict-dynamic'` source, as CSP Level 3 requires.
+    pub fn allows_inline_with(&self, directive: &str, check: &ContentCheck<'_>) -> bool {
+        let Some(sources) = self.sources_for(directive) else {
+            return true;
+        };
+        if sources_allow_nothing(sources) {
+            return false;
+        }
+        let has_crypto_source = sources.iter().any(|source| {
+            matches!(
+                source,
+                SourceExpression::Nonce(_)
+                    | SourceExpression::Hash(_)
+                    | SourceExpression::StrictDynamic
+            )
+        });
+        if !has_crypto_source && sources.contains(&SourceExpression::UnsafeInline) {
+            return true;
+        }
+        sources.iter().any(|source| source.matches_content(check))
+    }
+
+    /// True when `url` is allowed for `directive`, honouring a nonce or hash
+    /// attached to the element (for example `<script nonce="..." src="...">`).
+    ///
+    /// With `'strict-dynamic'` and a nonce or hash, host and scheme sources are
+    /// ignored for `script-src`: only content carrying the nonce/hash is allowed.
+    pub fn allows_with_check(
+        &self,
+        directive: &str,
+        url: &Url,
+        origin: &Origin,
+        check: &ContentCheck<'_>,
+    ) -> bool {
+        let Some(sources) = self.sources_for(directive) else {
+            return true;
+        };
+        if sources_allow_nothing(sources) {
+            return false;
+        }
+        if sources.iter().any(|source| source.matches_content(check)) {
+            return true;
+        }
+        let strict_dynamic = directive.eq_ignore_ascii_case("script-src")
+            && sources.contains(&SourceExpression::StrictDynamic)
+            && sources.iter().any(|source| {
+                matches!(
+                    source,
+                    SourceExpression::Nonce(_) | SourceExpression::Hash(_)
+                )
+            });
+        if strict_dynamic {
+            return false;
+        }
+        sources.iter().any(|source| source.matches(url, origin))
     }
 
     fn sources_for(&self, directive: &str) -> Option<&Vec<SourceExpression>> {
@@ -231,6 +419,34 @@ impl CspList {
             .iter()
             .all(|policy| policy.allows_inline(directive))
     }
+
+    /// True when every policy allows inline content carrying this nonce/digest.
+    pub fn allows_inline_with(&self, directive: &str, check: &ContentCheck<'_>) -> bool {
+        self.policies
+            .iter()
+            .all(|policy| policy.allows_inline_with(directive, check))
+    }
+
+    /// True when every policy allows `url`, also honouring the element's
+    /// nonce/hash metadata.
+    pub fn allows_with_check(
+        &self,
+        directive: &str,
+        url: &Url,
+        origin: &Origin,
+        check: &ContentCheck<'_>,
+    ) -> bool {
+        self.policies
+            .iter()
+            .all(|policy| policy.allows_with_check(directive, url, origin, check))
+    }
+}
+
+fn sources_allow_nothing(sources: &[SourceExpression]) -> bool {
+    sources.is_empty()
+        || sources
+            .iter()
+            .all(|source| *source == SourceExpression::None)
 }
 
 fn split_policies(header: &str) -> impl Iterator<Item = &str> {
@@ -246,7 +462,17 @@ fn parse_source(token: &str) -> Option<SourceExpression> {
         "'self'" => Some(SourceExpression::SelfOrigin),
         "'none'" => Some(SourceExpression::None),
         "'unsafe-inline'" => Some(SourceExpression::UnsafeInline),
+        "'strict-dynamic'" => Some(SourceExpression::StrictDynamic),
         "*" => Some(SourceExpression::Wildcard),
+        // Nonce values are case-sensitive base64, so slice them from the original
+        // token rather than the lowercased keyword.
+        _ if lower.starts_with("'nonce-") && token.ends_with('\'') => {
+            let value = &token["'nonce-".len()..token.len() - 1];
+            (!value.is_empty()).then(|| SourceExpression::Nonce(value.to_string()))
+        }
+        _ if lower.starts_with("'sha") && token.ends_with('\'') => {
+            Some(parse_hash_source(token).unwrap_or(SourceExpression::Keyword(lower)))
+        }
         _ if lower.starts_with('\'') => Some(SourceExpression::Keyword(lower)),
         _ => {
             if let Some(scheme) = lower.strip_suffix(':') {
@@ -258,6 +484,84 @@ fn parse_source(token: &str) -> Option<SourceExpression> {
             parse_host_source(&lower).map(SourceExpression::Host)
         }
     }
+}
+
+fn parse_hash_source(token: &str) -> Option<SourceExpression> {
+    let inner = token.strip_prefix('\'')?.strip_suffix('\'')?;
+    let (name, value) = inner.split_once('-')?;
+    let algorithm = match name.to_ascii_lowercase().as_str() {
+        "sha256" => HashAlgorithm::Sha256,
+        "sha384" => HashAlgorithm::Sha384,
+        "sha512" => HashAlgorithm::Sha512,
+        _ => return None,
+    };
+    if value.is_empty() || decode_base64(value).is_none() {
+        return None;
+    }
+    Some(SourceExpression::Hash(HashSource {
+        algorithm,
+        value: value.to_string(),
+    }))
+}
+
+/// Encodes bytes as standard padded base64 (the form used in CSP hash sources).
+pub fn encode_base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let word = (u32::from(chunk[0]) << 16)
+            | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
+            | u32::from(*chunk.get(2).unwrap_or(&0));
+        out.push(ALPHABET[((word >> 18) & 63) as usize] as char);
+        out.push(ALPHABET[((word >> 12) & 63) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHABET[((word >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[(word & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// Decodes standard or URL-safe base64, with or without padding.
+///
+/// Returns `None` on invalid characters or impossible lengths so a malformed
+/// hash source can never be treated as a match.
+pub fn decode_base64(input: &str) -> Option<Vec<u8>> {
+    let bytes = input.as_bytes();
+    let mut end = bytes.len();
+    while end > 0 && bytes[end - 1] == b'=' {
+        end -= 1;
+    }
+    if bytes.len() - end > 2 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(end / 4 * 3 + 2);
+    let mut word = 0u32;
+    let mut bits = 0u32;
+    for &byte in &bytes[..end] {
+        let value = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            _ => return None,
+        };
+        word = (word << 6) | u32::from(value);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((word >> bits) as u8);
+            word &= (1u32 << bits) - 1;
+        }
+    }
+    (bits < 6).then_some(out)
 }
 
 fn parse_host_source(token: &str) -> Option<HostSource> {
@@ -576,5 +880,170 @@ mod tests {
         let opaque = Origin::opaque();
         let policy = Policy::parse("script-src 'self'");
         assert!(!policy.allows("script-src", &url("data:text/javascript,alert(1)"), &opaque));
+    }
+
+    fn digest(hex: &str) -> Vec<u8> {
+        (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn nonce_and_hash_sources_are_parsed() {
+        let policy = Policy::parse(
+            "script-src 'nonce-rAnd0m==' 'sha256-bhHHL3z2vDgxUt0W3dWQOrprscmda2Y5pLsLg4GF+pI=' 'strict-dynamic'",
+        );
+        let sources = &policy.directives()["script-src"];
+        assert!(sources.contains(&SourceExpression::Nonce("rAnd0m==".to_string())));
+        assert!(sources.iter().any(|source| matches!(
+            source,
+            SourceExpression::Hash(HashSource {
+                algorithm: HashAlgorithm::Sha256,
+                ..
+            })
+        )));
+        assert!(sources.contains(&SourceExpression::StrictDynamic));
+    }
+
+    #[test]
+    fn nonce_authorises_inline_content_without_unsafe_inline() {
+        let policy = Policy::parse(
+            "default-src 'self'; script-src 'self' 'nonce-rAnd0m'; style-src 'unsafe-inline'",
+        );
+        assert!(policy.allows_inline_with("script-src", &ContentCheck::with_nonce("rAnd0m")));
+        assert!(!policy.allows_inline_with("script-src", &ContentCheck::with_nonce("wrong")));
+        assert!(!policy.allows_inline_with("script-src", &ContentCheck::default()));
+        // The conservative API keeps its old answer.
+        assert!(!policy.allows_inline("script-src"));
+        assert!(policy.allows_inline_with("style-src", &ContentCheck::default()));
+    }
+
+    #[test]
+    fn hash_authorises_matching_inline_content() {
+        let policy =
+            Policy::parse("script-src 'sha256-bhHHL3z2vDgxUt0W3dWQOrprscmda2Y5pLsLg4GF+pI='");
+        // Independently derived from SHA-256("alert(1)").
+        let hash = ContentHash::new(
+            HashAlgorithm::Sha256,
+            digest("6e11c72f7cf6bc383152dd16ddd5903aba6bb1c99d6b6639a4bb0b838185fa92"),
+        )
+        .unwrap();
+        let other = ContentHash::new(
+            HashAlgorithm::Sha256,
+            digest("46289932de1604479260f0178bba3a5f7019d133b263efc139c9a18d856bebf1"),
+        )
+        .unwrap();
+        assert!(policy.allows_inline_with("script-src", &ContentCheck::with_hashes(&[hash])));
+        assert!(!policy.allows_inline_with("script-src", &ContentCheck::with_hashes(&[other])));
+        assert!(!policy.allows_inline_with("script-src", &ContentCheck::default()));
+        // Hash sources never authorise a URL on their own.
+        assert!(!allows(&policy, "script-src", "https://app.example/a.js"));
+    }
+
+    #[test]
+    fn hash_algorithm_must_match() {
+        let source = HashSource {
+            algorithm: HashAlgorithm::Sha256,
+            value: "bhHHL3z2vDgxUt0W3dWQOrprscmda2Y5pLsLg4GF+pI=".to_string(),
+        };
+        assert!(
+            source.matches(
+                &ContentHash::new(
+                    HashAlgorithm::Sha256,
+                    digest("6e11c72f7cf6bc383152dd16ddd5903aba6bb1c99d6b6639a4bb0b838185fa92"),
+                )
+                .unwrap()
+            )
+        );
+        assert!(!source.matches(&ContentHash {
+            algorithm: HashAlgorithm::Sha384,
+            digest: digest("6e11c72f7cf6bc383152dd16ddd5903aba6bb1c99d6b6639a4bb0b838185fa92"),
+        }));
+    }
+
+    #[test]
+    fn base64_helpers_round_trip_and_accept_url_safe_forms() {
+        let bytes = digest("6e11c72f7cf6bc383152dd16ddd5903aba6bb1c99d6b6639a4bb0b838185fa92");
+        let encoded = encode_base64(&bytes);
+        assert_eq!(encoded, "bhHHL3z2vDgxUt0W3dWQOrprscmda2Y5pLsLg4GF+pI=");
+        assert_eq!(decode_base64(&encoded), Some(bytes.clone()));
+        assert_eq!(decode_base64(encoded.trim_end_matches('=')), Some(bytes));
+        assert_eq!(decode_base64("not!base64"), None);
+    }
+
+    #[test]
+    fn strict_dynamic_ignores_unsafe_inline_and_host_allowlists() {
+        let policy = Policy::parse(
+            "script-src 'nonce-abc' 'strict-dynamic' 'unsafe-inline' https://cdn.example",
+        );
+        assert!(!policy.allows_inline_with("script-src", &ContentCheck::default()));
+        assert!(policy.allows_inline_with("script-src", &ContentCheck::with_nonce("abc")));
+        assert!(allows(&policy, "script-src", "https://cdn.example/a.js"));
+        assert!(!policy.allows_with_check(
+            "script-src",
+            &url("https://cdn.example/a.js"),
+            &origin(),
+            &ContentCheck::default()
+        ));
+        assert!(policy.allows_with_check(
+            "script-src",
+            &url("https://cdn.example/a.js"),
+            &origin(),
+            &ContentCheck::with_nonce("abc")
+        ));
+    }
+
+    #[test]
+    fn nonce_allows_an_external_script_from_an_unlisted_host() {
+        let policy = Policy::parse("script-src 'self' 'nonce-abc'");
+        assert!(!allows(&policy, "script-src", "https://cdn.example/a.js"));
+        assert!(policy.allows_with_check(
+            "script-src",
+            &url("https://cdn.example/a.js"),
+            &origin(),
+            &ContentCheck::with_nonce("abc")
+        ));
+        let list = CspList::parse("script-src 'self' 'nonce-abc'");
+        assert!(list.allows_with_check(
+            "script-src",
+            &url("https://cdn.example/a.js"),
+            &origin(),
+            &ContentCheck::with_nonce("abc")
+        ));
+        assert!(!list.allows_inline_with("script-src", &ContentCheck::with_nonce("wrong")));
+    }
+
+    #[test]
+    fn common_real_site_policy_with_nonce_and_data_images() {
+        // A shape used by many frameworks: nonced scripts, a CDN fallback,
+        // inline styles and data: images.
+        let policy = Policy::parse(concat!(
+            "default-src 'self'; ",
+            "script-src 'self' 'nonce-rAnd0m' https://cdnjs.cloudflare.com; ",
+            "style-src 'self' 'unsafe-inline'; ",
+            "img-src 'self' data: https:; ",
+            "connect-src 'self' https://api.example"
+        ));
+        assert!(policy.allows_inline_with("script-src", &ContentCheck::with_nonce("rAnd0m")));
+        assert!(policy.allows_with_check(
+            "script-src",
+            &url("https://cdnjs.cloudflare.com/ajax/libs/x.js"),
+            &origin(),
+            &ContentCheck::with_nonce("rAnd0m")
+        ));
+        assert!(allows(&policy, "style-src", "https://app.example/a.css"));
+        assert!(policy.allows_inline_with("style-src", &ContentCheck::default()));
+        assert!(allows(&policy, "img-src", "data:image/png;base64,AAAA"));
+        assert!(allows(&policy, "img-src", "https://images.example/a.png"));
+        assert!(!allows(&policy, "img-src", "http://images.example/a.png"));
+        assert!(allows(&policy, "connect-src", "https://api.example/v1"));
+    }
+
+    #[test]
+    fn malformed_hash_sources_do_not_grant_access() {
+        let policy = Policy::parse("script-src 'sha256-!!!not-base64!!!'");
+        assert!(!policy.allows_inline_with("script-src", &ContentCheck::default()));
+        assert!(!allows(&policy, "script-src", "https://app.example/a.js"));
     }
 }

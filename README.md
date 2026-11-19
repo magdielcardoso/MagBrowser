@@ -16,14 +16,19 @@ navigation and security policy primitives.
   SVG/MathML namespaces.
 - **CSS** — full tokenizer/parser into component values, at-rules, colours,
   selectors (all combinators, `:not/:is/:where`, `nth-child`), specificity,
-  cascade with origins/`!important`/inline styles, inheritance, `var()`, media
-  queries and a user-agent stylesheet.
+  cascade with origins/`!important`/inline styles, inheritance, `var()`,
+  `calc()`, HTML presentational hints (`<img width/height>`), media queries and a
+  user-agent stylesheet.
 - **Layout** — block flow with margin collapsing, inline flow with line breaking,
-  `text-align`, `white-space`, inline-blocks, flexbox (single line), absolute and
-  fixed positioning, relative offsets, overflow scrolling, hit testing.
-- **Rendering** — display list, software rasterizer with an embedded bitmap font,
-  borders, backgrounds, images, clipping, scrolling, a dependency-free PNG encoder
-  and a deterministic headless renderer.
+  `text-align`, `white-space`, inline-blocks, flexbox (wrap/wrap-reverse,
+  multi-line), floats with shrink-to-fit, a CSS Grid subset, automatic table
+  column widths, absolute and fixed positioning, relative offsets, overflow
+  scrolling, hit testing.
+- **Rendering** — display list, software rasterizer with an embedded Inter outline
+  font and anti-aliased text, borders, backgrounds, decoded PNG/GIF/BMP images,
+  clipping, scrolling, a dependency-free PNG encoder and a deterministic headless
+  renderer. Rasterizer primitives for rounded rectangles, soft shadows and linear
+  gradients exist but are not yet driven by CSS (see `docs/roadmap.md`).
 - **JavaScript** — lexer, parser, tree-walking interpreter, closures, prototypes,
   exceptions, promises/microtasks and a mark-and-sweep GC.
 - **Web APIs** — `document`, element wrappers, `textContent`, `innerHTML`,
@@ -64,7 +69,9 @@ cargo run -p mag-browser -- tests/fixtures/script.html --script
 
 The native window is feature-gated (default build stays GPU-free), there is no
 process isolation yet, and JavaScript still lacks classes, generators and
-`async`/`await`. See
+`async`/`await`. On the CSS side there is no full grid (only a row-major subset),
+no transforms, no real filters, and no CSS-driven rounded corners, shadows or
+gradients yet; JPEG/WebP images are detected but not decoded. See
 `docs/roadmap.md` for the full list and `docs/security.md` for the threat model.
 
 ## Layout

@@ -6,7 +6,7 @@
 //! not implemented (documented in `docs/roadmap.md`).
 
 use browser_dom::Document;
-use browser_style::Side;
+use browser_style::{ComputedValue, Dim, Property, Side};
 
 use crate::block::{layout_box, resolve, shrink_to_fit};
 use crate::tree::{BoxType, LayoutTree};
@@ -36,9 +36,12 @@ pub fn layout_table(tree: &mut LayoutTree, doc: &Document, index: usize) -> f32 
     // 1. Natural (max-content) width per column.
     let mut natural = vec![0.0_f32; columns];
     for row in &rows {
+        if !crate::budget::try_step() {
+            break;
+        }
         let cells = cells_of(tree, *row);
         for (column, cell) in cells.iter().enumerate() {
-            let measured = shrink_to_fit(tree, doc, *cell, content.width)
+            let measured = shrink_to_fit(tree, *cell, content.width)
                 + tree.boxes[*cell].borders.horizontal()
                 + tree.boxes[*cell].paddings.horizontal();
             if let Some(slot) = natural.get_mut(column) {
@@ -47,24 +50,81 @@ pub fn layout_table(tree: &mut LayoutTree, doc: &Document, index: usize) -> f32 
         }
     }
 
-    // 2. Fit the natural widths into the available content width.
-    let total: f32 = natural.iter().sum();
+    // 2. Explicit cell widths (from CSS or HTML `width` attributes) take
+    // precedence. Percentages resolve against the table's content width.
     let width = content.width.max(1.0);
-    let widths: Vec<f32> = if total <= 0.0 {
-        vec![width / columns as f32; columns]
-    } else if total < width {
-        let extra = (width - total) / columns as f32;
-        natural.iter().map(|n| n + extra).collect()
+    let mut specified: Vec<Option<f32>> = vec![None; columns];
+    for row in &rows {
+        if !crate::budget::try_step() {
+            break;
+        }
+        for (column, cell) in cells_of(tree, *row).iter().enumerate() {
+            if let Some(px) = tree.boxes[*cell].style.width().resolve(width) {
+                let slot = &mut specified[column];
+                if slot.is_none_or(|current| px > current) {
+                    *slot = Some(px);
+                }
+            }
+        }
+    }
+
+    // 3. Fit the column widths into the available content width. Columns with
+    // an explicit width keep it and the leftover space goes to the auto
+    // columns (e.g. the `nowrap` middle cell), instead of being shared equally
+    // which lets the search box stretch across the whole table. When nothing
+    // is explicitly sized, keep the original max-content distribution.
+    let widths: Vec<f32> = if specified.iter().all(Option::is_none) {
+        let total: f32 = natural.iter().sum();
+        if total <= 0.0 {
+            vec![width / columns as f32; columns]
+        } else if total < width {
+            let extra = (width - total) / columns as f32;
+            natural.iter().map(|n| n + extra).collect()
+        } else {
+            natural
+                .iter()
+                .map(|n| (n * width / total).max(1.0))
+                .collect()
+        }
     } else {
-        natural
-            .iter()
-            .map(|n| (n * width / total).max(1.0))
-            .collect()
+        let fixed: f32 = specified.iter().flatten().sum();
+        let auto_indices: Vec<usize> = (0..columns)
+            .filter(|&index| specified[index].is_none())
+            .collect();
+        if auto_indices.is_empty() {
+            // Every column is specified: honour the widths, shrinking
+            // proportionally only when they overflow the table.
+            if fixed <= width {
+                specified.iter().map(|slot| slot.unwrap()).collect()
+            } else {
+                specified
+                    .iter()
+                    .map(|slot| (slot.unwrap() * width / fixed).max(1.0))
+                    .collect()
+            }
+        } else {
+            let remaining = (width - fixed).max(0.0);
+            let auto_natural: f32 = auto_indices.iter().map(|&i| natural[i]).sum();
+            let mut result = vec![0.0_f32; columns];
+            for (index, slot) in result.iter_mut().enumerate() {
+                if let Some(px) = specified[index] {
+                    *slot = px;
+                } else if auto_natural > 0.0 {
+                    *slot = (remaining * natural[index] / auto_natural).max(1.0);
+                } else {
+                    *slot = (remaining / auto_indices.len() as f32).max(1.0);
+                }
+            }
+            result
+        }
     };
 
-    // 3. Lay out each row, then place its cells side by side.
+    // 4. Lay out each row, then place its cells side by side.
     let mut cursor_y = content.y;
     for row in &rows {
+        if !crate::budget::try_step() {
+            break;
+        }
         let cells = cells_of(tree, *row);
         let mut row_bottom = cursor_y;
         let mut x = content.x;
@@ -78,7 +138,7 @@ pub fn layout_table(tree: &mut LayoutTree, doc: &Document, index: usize) -> f32 
                     resolve(style.margin(Side::Top), cell_width),
                 )
             };
-            let bottom = layout_box(
+            let bottom = layout_table_cell(
                 tree,
                 doc,
                 *cell,
@@ -123,6 +183,33 @@ fn cells_of(tree: &LayoutTree, row: usize) -> Vec<usize> {
         .copied()
         .filter(|child| tree.boxes[*child].box_type == BoxType::TableCell)
         .collect()
+}
+
+/// Lays out a cell at a column width that has already been resolved.
+///
+/// A cell's own `width` (for example `width="25%"`) was used to size its
+/// column above. Passing that same box as the containing block again would
+/// apply the percentage a second time, so the cell is laid out with
+/// `width: auto` and its original value restored afterwards.
+fn layout_table_cell(
+    tree: &mut LayoutTree,
+    doc: &Document,
+    cell: usize,
+    x: f32,
+    y: f32,
+    cell_width: f32,
+) -> f32 {
+    let original = tree.boxes[cell]
+        .style
+        .get(Property::Width)
+        .cloned()
+        .unwrap_or(ComputedValue::Dim(Dim::Auto));
+    tree.boxes[cell]
+        .style
+        .set(Property::Width, ComputedValue::Dim(Dim::Auto));
+    let bottom = layout_box(tree, doc, cell, x, y, cell_width);
+    tree.boxes[cell].style.set(Property::Width, original);
+    bottom
 }
 
 #[cfg(test)]
@@ -199,6 +286,89 @@ mod tests {
         let (tree, table, _cells) = table_page();
         let table_box = tree.find_node(table).unwrap();
         assert!(table_box.content.height > 30.0);
+    }
+
+    /// Builds the shape of Google's search form: two 25% outer columns and an
+    /// auto-width, `nowrap` middle cell carrying the search box.
+    fn search_table_page() -> (LayoutTree, Vec<browser_dom::NodeId>) {
+        let mut doc = Document::new();
+        let html = doc.create_element("html");
+        let body = doc.create_element("body");
+        doc.append_child(doc.root(), html);
+        doc.append_child(html, body);
+        let table = doc.create_element("table");
+        doc.set_attr(table, "cellpadding", "0");
+        doc.set_attr(table, "cellspacing", "0");
+        doc.append_child(body, table);
+        let row = doc.create_element("tr");
+        doc.append_child(table, row);
+
+        let mut cells = Vec::new();
+        let columns = [
+            (Some("25%"), None, false, "\u{a0}"),
+            (None, Some("center"), true, "search box"),
+            (Some("25%"), None, false, "Pesquisa avançada"),
+        ];
+        for (width, align, nowrap, text) in columns {
+            let cell = doc.create_element("td");
+            if let Some(width) = width {
+                doc.set_attr(cell, "width", width);
+            }
+            if let Some(align) = align {
+                doc.set_attr(cell, "align", align);
+            }
+            if nowrap {
+                doc.set_attr(cell, "nowrap", "");
+            }
+            doc.append_text(cell, text);
+            doc.append_child(row, cell);
+            cells.push(cell);
+        }
+
+        let mut engine = StyleEngine::new(Viewport {
+            width: 600.0,
+            height: 400.0,
+        });
+        engine.add_css(
+            "body { margin: 0; } table { width: 600px; } td { border: 0; }",
+            Origin::Author,
+        );
+        let styled = engine.compute(&doc);
+        let tree = crate::layout(
+            &doc,
+            &styled,
+            Size {
+                width: 600.0,
+                height: 400.0,
+            },
+        );
+        (tree, cells)
+    }
+
+    #[test]
+    fn percentage_columns_give_the_remaining_space_to_the_auto_cell() {
+        let (tree, cells) = search_table_page();
+        let left = tree.find_node(cells[0]).unwrap();
+        let middle = tree.find_node(cells[1]).unwrap();
+        let right = tree.find_node(cells[2]).unwrap();
+
+        assert!(
+            (left.rect.width - 150.0).abs() < 1.0,
+            "25% column should be 150px, got {}",
+            left.rect.width
+        );
+        assert!(
+            (right.rect.width - 150.0).abs() < 1.0,
+            "25% column should be 150px, got {}",
+            right.rect.width
+        );
+        assert!(
+            (middle.rect.width - 300.0).abs() < 1.0,
+            "auto column should get the leftover 300px, got {}",
+            middle.rect.width
+        );
+        assert!(middle.rect.x >= left.rect.right());
+        assert!(right.rect.x >= middle.rect.right());
     }
 
     #[test]

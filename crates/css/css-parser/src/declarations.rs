@@ -3,15 +3,29 @@
 
 use crate::Token;
 use crate::ast::Declaration;
+use crate::diagnostics::ParseDiagnostic;
+use crate::limits::ParseBudget;
 use crate::tokenizer::{to_component_values, tokenize};
 use crate::values::{ComponentValue, Value};
 
 /// Parses a semicolon-separated declaration list.
 ///
 /// Invalid declarations are skipped individually; they never invalidate the
-/// rest of the list.
+/// rest of the list. Declaration count is bounded by
+/// [`MAX_DECLARATIONS`](crate::MAX_DECLARATIONS).
 #[must_use]
 pub fn parse_declarations(input: &str) -> Vec<Declaration> {
+    let mut budget = ParseBudget::new(crate::limits::Limits::default());
+    let mut diagnostics = Vec::new();
+    parse_declarations_inner(input, &mut budget, &mut diagnostics)
+}
+
+/// Parses declarations against a shared budget, stopping once it is exhausted.
+pub(crate) fn parse_declarations_inner(
+    input: &str,
+    budget: &mut ParseBudget,
+    diagnostics: &mut Vec<ParseDiagnostic>,
+) -> Vec<Declaration> {
     let mut result = Vec::new();
     let mut segment: Vec<Token> = Vec::new();
     let mut depth: i32 = 0;
@@ -23,8 +37,8 @@ pub fn parse_declarations(input: &str) -> Vec<Declaration> {
                 depth = (depth - 1).max(0);
             }
             Token::Semicolon if depth == 0 => {
-                if let Some(declaration) = parse_one(&segment) {
-                    result.push(declaration);
+                if !push_one(&segment, &mut result, budget, diagnostics) {
+                    return result;
                 }
                 segment.clear();
                 continue;
@@ -34,10 +48,27 @@ pub fn parse_declarations(input: &str) -> Vec<Declaration> {
         segment.push(token);
     }
 
-    if let Some(declaration) = parse_one(&segment) {
-        result.push(declaration);
-    }
+    push_one(&segment, &mut result, budget, diagnostics);
     result
+}
+
+/// Parses one declaration segment and consumes a budget slot if it succeeds.
+/// Returns `false` when the budget is exhausted (so the caller stops early).
+fn push_one(
+    tokens: &[Token],
+    result: &mut Vec<Declaration>,
+    budget: &mut ParseBudget,
+    diagnostics: &mut Vec<ParseDiagnostic>,
+) -> bool {
+    let Some(declaration) = parse_single_declaration(tokens) else {
+        return true;
+    };
+    if budget.take_declaration(diagnostics) {
+        result.push(declaration);
+        true
+    } else {
+        false
+    }
 }
 
 /// Parses the contents of a `style` attribute.
@@ -46,7 +77,10 @@ pub fn parse_inline_style(input: &str) -> Vec<Declaration> {
     parse_declarations(input)
 }
 
-fn parse_one(tokens: &[Token]) -> Option<Declaration> {
+/// Parses one declaration from a token slice.
+///
+/// Used by `@supports` to recognise `(property: value)` feature tests.
+pub(crate) fn parse_single_declaration(tokens: &[Token]) -> Option<Declaration> {
     let mut start = 0;
     while matches!(tokens.get(start), Some(Token::Whitespace)) {
         start += 1;

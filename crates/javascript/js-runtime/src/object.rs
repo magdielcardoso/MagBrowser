@@ -4,8 +4,14 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::errors::JsError;
+use crate::generator::GeneratorFrame;
 use crate::promise::PromiseState;
 use crate::value::{ObjectId, Value};
+
+/// Internal property key used for `Symbol.iterator` methods. Symbols are
+/// represented by unique objects; this private string key keeps symbol-keyed
+/// properties separate from ordinary string-keyed ones.
+pub(crate) const SYMBOL_ITERATOR_KEY: &str = "\u{0}Symbol.iterator";
 
 /// A builtin function implemented as a stateless function pointer.
 pub(crate) type BuiltinFn = fn(&mut crate::Runtime, Value, Vec<Value>) -> Result<Value, JsError>;
@@ -38,6 +44,10 @@ pub(crate) enum ObjectKind {
     Promise(Rc<RefCell<PromiseState>>),
     /// A regular expression.
     RegExp(Rc<browser_js_parser::Regex>),
+    /// A symbol primitive, identified by its description.
+    Symbol(String),
+    /// A suspended generator object.
+    Generator(Rc<RefCell<GeneratorFrame>>),
 }
 
 /// A heap allocated object.
@@ -159,6 +169,20 @@ impl crate::Runtime {
         }
     }
 
+    /// The getter and setter currently installed for an own accessor property.
+    pub(crate) fn accessor_pair(&self, id: ObjectId, key: &str) -> (Option<Value>, Option<Value>) {
+        match self.object(id).and_then(|object| {
+            object
+                .properties
+                .iter()
+                .find(|(name, _)| name == key)
+                .map(|(_, data)| data)
+        }) {
+            Some(PropertyData::Accessor { getter, setter }) => (getter.clone(), setter.clone()),
+            _ => (None, None),
+        }
+    }
+
     /// Define (or overwrite) an own accessor property from function values.
     pub(crate) fn define_accessor_property(
         &mut self,
@@ -229,9 +253,11 @@ impl crate::Runtime {
                     ((key == "length" || key == "name") && !overridden)
                         || object.properties.iter().any(|(name, _)| name == key)
                 }
-                ObjectKind::Ordinary | ObjectKind::Promise(_) | ObjectKind::RegExp(_) => {
-                    object.properties.iter().any(|(name, _)| name == key)
-                }
+                ObjectKind::Ordinary
+                | ObjectKind::Promise(_)
+                | ObjectKind::RegExp(_)
+                | ObjectKind::Symbol(_)
+                | ObjectKind::Generator(_) => object.properties.iter().any(|(name, _)| name == key),
             },
             None => false,
         }
@@ -264,7 +290,11 @@ impl crate::Runtime {
                     }
                 }
             }
-            ObjectKind::Ordinary | ObjectKind::Promise(_) | ObjectKind::RegExp(_) => {}
+            ObjectKind::Ordinary
+            | ObjectKind::Promise(_)
+            | ObjectKind::RegExp(_)
+            | ObjectKind::Symbol(_)
+            | ObjectKind::Generator(_) => {}
         }
         object
             .properties
@@ -570,6 +600,61 @@ impl crate::Runtime {
     /// Create an array prototype-less object shell used during bootstrap.
     pub(crate) fn bootstrap_object(&mut self, prototype: Option<ObjectId>) -> ObjectId {
         self.alloc_object(ObjectKind::Ordinary, prototype)
+    }
+
+    /// Allocate a symbol value with the given description.
+    pub(crate) fn new_symbol(&mut self, description: &str) -> Value {
+        let prototype = self.prototypes.object;
+        let id = self.alloc_object(ObjectKind::Symbol(description.to_owned()), Some(prototype));
+        let key = if description == "Symbol.iterator" {
+            SYMBOL_ITERATOR_KEY.to_owned()
+        } else {
+            format!("\u{0}Symbol({description})")
+        };
+        self.define_data_property(id, "\u{0}symbol_key", Value::String(key));
+        Value::Object(id)
+    }
+
+    /// The generator frame captured by a generator object, if any.
+    pub(crate) fn generator_frame_of(&self, value: &Value) -> Option<Rc<RefCell<GeneratorFrame>>> {
+        let Value::Object(id) = value else {
+            return None;
+        };
+        match self.object(*id).map(|object| &object.kind) {
+            Some(ObjectKind::Generator(frame)) => Some(Rc::clone(frame)),
+            _ => None,
+        }
+    }
+
+    /// Wrap a value in an iterator result object (`{ value, done }`).
+    pub(crate) fn new_iterator_result(&mut self, value: Value, done: bool) -> Value {
+        let object = self.new_object();
+        self.set_property(object.clone(), "value", value);
+        self.set_property(object.clone(), "done", Value::Bool(done));
+        object
+    }
+
+    /// Build an iterator over a pre-computed item sequence.
+    pub(crate) fn new_array_iterator(&mut self, items: Vec<Value>) -> Value {
+        let index = Rc::new(RefCell::new(0usize));
+        let captured = Rc::clone(&index);
+        let values = Rc::new(items);
+        let next_values = Rc::clone(&values);
+        let next = self.new_native_value(
+            "next",
+            0,
+            Box::new(move |runtime, _this, _args| {
+                let position = *captured.borrow();
+                if position >= next_values.len() {
+                    return Ok(runtime.new_iterator_result(Value::Undefined, true));
+                }
+                *captured.borrow_mut() = position + 1;
+                Ok(runtime.new_iterator_result(next_values[position].clone(), false))
+            }),
+        );
+        let iterator = self.new_object();
+        self.set_property(iterator.clone(), "next", next);
+        iterator
     }
 }
 

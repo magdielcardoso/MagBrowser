@@ -4,16 +4,35 @@ use crate::ast::{
     FontFaceRule, ImportRule, Keyframe, KeyframesRule, MediaRule, Origin, Rule, StyleRule,
     Stylesheet,
 };
-use crate::declarations::parse_declarations;
+use crate::at_rules;
+use crate::declarations::parse_declarations_inner;
+use crate::diagnostics::{DiagnosticKind, ParseDiagnostic, push_diagnostic};
+use crate::limits::{Limits, ParseBudget, clamp_input};
 use crate::tokenizer::{SpannedToken, Token, tokenize, tokenize_spanned};
 
 impl Stylesheet {
     /// Parses a stylesheet. This never fails: invalid rules are skipped.
     #[must_use]
     pub fn parse(css: &str, origin: Origin) -> Self {
+        Self::parse_with_limits(css, origin, Limits::default())
+    }
+
+    /// Parses a stylesheet with explicit [`Limits`].
+    ///
+    /// Input beyond the limits is skipped and recorded in
+    /// [`Stylesheet::diagnostics`] rather than causing an error or panic. This
+    /// is primarily useful for tests and for embedders that need tighter
+    /// budgets than the defaults.
+    #[must_use]
+    pub fn parse_with_limits(css: &str, origin: Origin, limits: Limits) -> Self {
+        let mut diagnostics = Vec::new();
+        let css = clamp_input(css, limits.max_bytes, &mut diagnostics);
+        let mut budget = ParseBudget::new(limits);
+        let rules = Parser::new(css, &mut budget, 0, &mut diagnostics).parse_rule_list();
         Self {
-            rules: parse_rules(css),
+            rules,
             origin,
+            diagnostics,
         }
     }
 
@@ -69,22 +88,59 @@ fn media_types(list: &str) -> Vec<String> {
         .collect()
 }
 
-fn parse_rules(css: &str) -> Vec<Rule> {
-    Parser::new(css).parse_rule_list()
+/// Parses a rule list with a shared budget and an explicit nesting depth.
+pub(crate) fn parse_rule_list_with(
+    css: &str,
+    budget: &mut ParseBudget,
+    depth: usize,
+    diagnostics: &mut Vec<ParseDiagnostic>,
+) -> Vec<Rule> {
+    Parser::new(css, budget, depth, diagnostics).parse_rule_list()
 }
 
-struct Parser<'a> {
-    css: &'a str,
+/// Parses the body of a nested at-rule, enforcing the shared depth limit.
+pub(crate) fn parse_nested_rules(
+    css: &str,
+    budget: &mut ParseBudget,
+    diagnostics: &mut Vec<ParseDiagnostic>,
+    depth: usize,
+) -> Vec<Rule> {
+    let max_depth = budget.max_nesting_depth();
+    if depth >= max_depth {
+        push_diagnostic(
+            diagnostics,
+            DiagnosticKind::NestingDepth,
+            format!("nesting depth limit of {max_depth} reached; skipping nested rules"),
+        );
+        return Vec::new();
+    }
+    parse_rule_list_with(css, budget, depth + 1, diagnostics)
+}
+
+struct Parser<'css, 'state> {
+    css: &'css str,
     tokens: Vec<SpannedToken>,
     pos: usize,
+    /// Shared across nested parses so one stylesheet has a single budget.
+    budget: &'state mut ParseBudget,
+    diagnostics: &'state mut Vec<ParseDiagnostic>,
+    depth: usize,
 }
 
-impl<'a> Parser<'a> {
-    fn new(css: &'a str) -> Self {
+impl<'css, 'state> Parser<'css, 'state> {
+    fn new(
+        css: &'css str,
+        budget: &'state mut ParseBudget,
+        depth: usize,
+        diagnostics: &'state mut Vec<ParseDiagnostic>,
+    ) -> Self {
         Self {
             css,
             tokens: tokenize_spanned(css),
             pos: 0,
+            budget,
+            diagnostics,
+            depth,
         }
     }
 
@@ -103,7 +159,7 @@ impl<'a> Parser<'a> {
             .map_or(self.css.len(), |spanned| spanned.start)
     }
 
-    fn slice(&self, start: usize, end: usize) -> &'a str {
+    fn slice(&self, start: usize, end: usize) -> &'css str {
         if end <= start {
             return "";
         }
@@ -123,10 +179,16 @@ impl<'a> Parser<'a> {
         let mut rules = Vec::new();
         loop {
             self.skip_noise();
-            let Some(spanned) = self.tokens.get(self.pos) else {
+            // Clone the token so the borrow of `self.tokens` ends before the
+            // mutable borrows taken by the parse helpers below.
+            let Some(spanned) = self.tokens.get(self.pos).cloned() else {
                 break;
             };
-            match &spanned.token {
+            if self.budget.rule_limit_reached() {
+                self.budget.report_rule_limit(self.diagnostics);
+                break;
+            }
+            let rule = match &spanned.token {
                 Token::RightBrace => {
                     self.pos += 1;
                     break;
@@ -134,18 +196,25 @@ impl<'a> Parser<'a> {
                 Token::AtKeyword(name) => {
                     let name = name.clone();
                     self.pos += 1;
-                    if let Some(rule) = self.parse_at_rule(&name) {
-                        rules.push(rule);
-                    }
+                    self.parse_at_rule(&name)
                 }
-                _ => {
-                    if let Some(rule) = self.parse_qualified_rule() {
-                        rules.push(rule);
-                    }
+                _ => self.parse_qualified_rule(),
+            };
+            if let Some(rule) = rule {
+                if self.budget.take_rule(self.diagnostics) {
+                    rules.push(rule);
+                } else {
+                    break;
                 }
             }
         }
         rules
+    }
+
+    /// Parses a nested rule list (e.g. the body of `@media`) while sharing the
+    /// stylesheet-wide budget and enforcing the nesting-depth limit.
+    fn parse_nested_rules(&mut self, css: &'css str) -> Vec<Rule> {
+        parse_nested_rules(css, self.budget, self.diagnostics, self.depth)
     }
 
     fn parse_qualified_rule(&mut self) -> Option<Rule> {
@@ -175,13 +244,18 @@ impl<'a> Parser<'a> {
 
         self.pos = open + 1;
         let body = self.consume_block();
-        let selectors = split_top_level_commas(self.slice(prelude_start, prelude_end));
+        let prelude = self.slice(prelude_start, prelude_end);
+        let max_depth = self.budget.max_nesting_depth();
+        if !selector_nesting_within_limit(prelude, max_depth, &mut *self.diagnostics) {
+            return None;
+        }
+        let selectors = split_top_level_commas(prelude);
         if selectors.is_empty() {
             return None;
         }
         Some(Rule::Style(StyleRule {
             selectors,
-            declarations: parse_declarations(body),
+            declarations: parse_declarations_inner(body, &mut *self.budget, &mut *self.diagnostics),
         }))
     }
 
@@ -213,27 +287,78 @@ impl<'a> Parser<'a> {
             None
         };
         let prelude = self.slice(prelude_start, prelude_end);
+        let prelude_tokens = self.tokens[prelude_start..prelude_end].to_vec();
+        let css = self.css;
 
         match name.to_ascii_lowercase().as_str() {
+            "supports" => at_rules::parse_supports(
+                css,
+                &prelude_tokens,
+                body,
+                self.budget,
+                self.diagnostics,
+                self.depth,
+            ),
+            "container" => at_rules::parse_container(
+                css,
+                &prelude_tokens,
+                body,
+                self.budget,
+                self.diagnostics,
+                self.depth,
+            ),
+            "layer" => at_rules::parse_layer(
+                css,
+                &prelude_tokens,
+                body,
+                self.budget,
+                self.diagnostics,
+                self.depth,
+            ),
+            "scope" => at_rules::parse_scope(
+                css,
+                &prelude_tokens,
+                body,
+                self.budget,
+                self.diagnostics,
+                self.depth,
+            ),
+            "starting-style" => {
+                at_rules::parse_starting_style(body, self.budget, self.diagnostics, self.depth)
+            }
+            "property" => {
+                at_rules::parse_property(css, &prelude_tokens, body, self.budget, self.diagnostics)
+            }
             "media" => Some(Rule::Media(MediaRule {
                 query: prelude.trim().to_string(),
-                rules: body.map_or_else(Vec::new, parse_rules),
+                rules: body.map_or_else(Vec::new, |body| self.parse_nested_rules(body)),
             })),
             "import" => parse_import(prelude).map(Rule::Import),
             "font-face" => body.map(|body| {
                 Rule::FontFace(FontFaceRule {
-                    declarations: parse_declarations(body),
+                    declarations: parse_declarations_inner(
+                        body,
+                        &mut *self.budget,
+                        &mut *self.diagnostics,
+                    ),
                 })
             }),
             "keyframes" | "-webkit-keyframes" | "-moz-keyframes" | "-o-keyframes" => {
-                body.map(|body| Rule::Keyframes(parse_keyframes(prelude, body)))
+                body.map(|body| {
+                    Rule::Keyframes(parse_keyframes(
+                        prelude,
+                        body,
+                        &mut *self.budget,
+                        &mut *self.diagnostics,
+                    ))
+                })
             }
             _ => None,
         }
     }
 
     /// Consumes a `{ ... }` block and returns the text between the braces.
-    fn consume_block(&mut self) -> &'a str {
+    fn consume_block(&mut self) -> &'css str {
         let start = self.byte_offset(self.pos);
         let mut depth = 0i32;
         while let Some(spanned) = self.tokens.get(self.pos) {
@@ -285,7 +410,12 @@ fn parse_import(prelude: &str) -> Option<ImportRule> {
     })
 }
 
-fn parse_keyframes(prelude: &str, body: &str) -> KeyframesRule {
+fn parse_keyframes(
+    prelude: &str,
+    body: &str,
+    budget: &mut ParseBudget,
+    diagnostics: &mut Vec<ParseDiagnostic>,
+) -> KeyframesRule {
     let name = keyframes_name(prelude);
     let tokens = tokenize_spanned(body);
     let mut keyframes = Vec::new();
@@ -349,8 +479,11 @@ fn parse_keyframes(prelude: &str, body: &str) -> KeyframesRule {
         if offsets.is_empty() {
             continue;
         }
-        let declarations =
-            parse_declarations(&body[declarations_start.min(body.len())..declarations_end]);
+        let declarations = parse_declarations_inner(
+            &body[declarations_start.min(body.len())..declarations_end],
+            budget,
+            diagnostics,
+        );
         for offset in offsets {
             keyframes.push(Keyframe {
                 offset,
@@ -381,6 +514,51 @@ fn keyframe_offset(selector: &str) -> Option<f32> {
     }
     let number = selector.strip_suffix('%')?.trim().parse::<f32>().ok()?;
     Some((number / 100.0).clamp(0.0, 1.0))
+}
+
+/// Checks that a selector prelude does not nest brackets/parentheses beyond
+/// `max_depth`. Strings and escapes are ignored so quoted `"("` does not count.
+fn selector_nesting_within_limit(
+    text: &str,
+    max_depth: usize,
+    diagnostics: &mut Vec<ParseDiagnostic>,
+) -> bool {
+    let mut depth = 0_usize;
+    let mut quote = None;
+    let mut escaped = false;
+    for character in text.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if character == '\\' {
+            escaped = true;
+            continue;
+        }
+        if let Some(open) = quote {
+            if character == open {
+                quote = None;
+            }
+            continue;
+        }
+        match character {
+            '"' | '\'' => quote = Some(character),
+            '(' | '[' | '{' => {
+                depth += 1;
+                if depth > max_depth {
+                    push_diagnostic(
+                        diagnostics,
+                        DiagnosticKind::NestingDepth,
+                        format!("selector nesting limit of {max_depth} reached; skipping selector"),
+                    );
+                    return false;
+                }
+            }
+            ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    true
 }
 
 /// Splits text on commas that are not nested inside blocks, strings or
@@ -426,6 +604,7 @@ fn split_top_level_commas(text: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::MAX_STYLESHEET_BYTES;
     use crate::values::Length;
 
     fn style_rules(sheet: &Stylesheet) -> Vec<&StyleRule> {
@@ -637,7 +816,7 @@ mod tests {
     #[test]
     fn skips_unknown_at_rules_with_blocks() {
         let sheet = Stylesheet::parse(
-            "@supports (display: grid) { p { color: red } } q { color: blue }",
+            "@some-future-rule (x) { p { color: red } } q { color: blue }",
             Origin::Author,
         );
         assert_eq!(style_rules(&sheet).len(), 1);
@@ -700,6 +879,155 @@ mod tests {
         );
         assert_eq!(sheet.declarations_of_matching_media("screen").len(), 1);
         assert_eq!(sheet.declarations_of_matching_media("").len(), 1);
+    }
+
+    #[test]
+    fn normal_sheets_have_no_diagnostics() {
+        let sheet = Stylesheet::parse("p { color: red } @import \"a.css\";", Origin::Author);
+        assert!(sheet.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn clamp_input_respects_utf8_char_boundaries() {
+        let mut diagnostics = Vec::new();
+        // The emoji is four bytes; cutting at 4 would land inside it.
+        let input = "a\u{e9}\u{1f600}b";
+        let clamped = crate::limits::clamp_input(input, 4, &mut diagnostics);
+        assert_eq!(clamped, "a\u{e9}");
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].kind, DiagnosticKind::InputSize);
+    }
+
+    #[test]
+    fn input_size_limit_truncates_and_reports() {
+        let sheet = Stylesheet::parse_with_limits(
+            "p { color: red } q { color: blue }",
+            Origin::Author,
+            Limits {
+                max_bytes: 17,
+                ..Limits::default()
+            },
+        );
+        assert_eq!(sheet.diagnostics.len(), 1);
+        assert_eq!(sheet.diagnostics[0].kind, DiagnosticKind::InputSize);
+        assert_eq!(style_rules(&sheet).len(), 1);
+    }
+
+    #[test]
+    fn rule_limit_skips_remaining_rules() {
+        let sheet = Stylesheet::parse_with_limits(
+            "a { color: red } b { color: blue } c { color: green } d { color: black }",
+            Origin::Author,
+            Limits {
+                max_rules: 2,
+                ..Limits::default()
+            },
+        );
+        assert_eq!(style_rules(&sheet).len(), 2);
+        assert_eq!(sheet.diagnostics.len(), 1);
+        assert_eq!(sheet.diagnostics[0].kind, DiagnosticKind::Rules);
+    }
+
+    #[test]
+    fn declaration_limit_skips_excess_declarations() {
+        let sheet = Stylesheet::parse_with_limits(
+            "p { color: red; width: 1px; height: 2px; margin: 0 }",
+            Origin::Author,
+            Limits {
+                max_declarations: 2,
+                ..Limits::default()
+            },
+        );
+        let rules = style_rules(&sheet);
+        assert_eq!(rules[0].declarations.len(), 2);
+        assert_eq!(rules[0].declarations[0].name, "color");
+        assert_eq!(rules[0].declarations[1].name, "width");
+        assert_eq!(sheet.diagnostics.len(), 1);
+        assert_eq!(sheet.diagnostics[0].kind, DiagnosticKind::Declarations);
+    }
+
+    #[test]
+    fn declaration_budget_is_shared_across_rules() {
+        let sheet = Stylesheet::parse_with_limits(
+            "a { color: red; width: 1px } b { height: 2px; margin: 0 }",
+            Origin::Author,
+            Limits {
+                max_declarations: 3,
+                ..Limits::default()
+            },
+        );
+        let rules = style_rules(&sheet);
+        let total: usize = rules.iter().map(|rule| rule.declarations.len()).sum();
+        assert_eq!(total, 3);
+        assert_eq!(sheet.diagnostics.len(), 1);
+        assert_eq!(sheet.diagnostics[0].kind, DiagnosticKind::Declarations);
+    }
+
+    #[test]
+    fn nesting_depth_limit_skips_deep_media_rules() {
+        let mut css = String::new();
+        for _ in 0..8 {
+            css.push_str("@media screen { ");
+        }
+        css.push_str("p { color: red }");
+        for _ in 0..8 {
+            css.push_str(" }");
+        }
+        let sheet = Stylesheet::parse_with_limits(
+            &css,
+            Origin::Author,
+            Limits {
+                max_nesting_depth: 2,
+                ..Limits::default()
+            },
+        );
+        assert!(
+            sheet
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.kind == DiagnosticKind::NestingDepth)
+        );
+        // The innermost `p` rule was never reached.
+        assert!(sheet.declarations_of_matching_media("screen").is_empty());
+    }
+
+    #[test]
+    fn selector_nesting_limit_skips_deep_selectors() {
+        let mut selector = String::from("p");
+        for _ in 0..8 {
+            selector = format!(":not({selector})");
+        }
+        let sheet = Stylesheet::parse_with_limits(
+            &format!("{selector} {{ color: red }} q {{ color: blue }}"),
+            Origin::Author,
+            Limits {
+                max_nesting_depth: 2,
+                ..Limits::default()
+            },
+        );
+        let rules = style_rules(&sheet);
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].selectors, ["q"]);
+        assert!(
+            sheet
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.kind == DiagnosticKind::NestingDepth)
+        );
+    }
+
+    #[test]
+    fn oversized_stylesheet_is_skipped_without_panicking() {
+        // A single comment token keeps tokenization cheap while exceeding the
+        // default 4 MiB limit.
+        let css = format!(
+            "/*{}*/ p {{ color: red }}",
+            "x".repeat(MAX_STYLESHEET_BYTES)
+        );
+        let sheet = Stylesheet::parse(&css, Origin::Author);
+        assert_eq!(sheet.diagnostics.len(), 1);
+        assert_eq!(sheet.diagnostics[0].kind, DiagnosticKind::InputSize);
+        assert!(sheet.rules.is_empty());
     }
 
     #[test]

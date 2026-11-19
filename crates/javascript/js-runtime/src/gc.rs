@@ -12,7 +12,7 @@ impl crate::Runtime {
     pub(crate) fn tick(&mut self) -> Result<(), JsError> {
         self.steps += 1;
         if self.steps > self.max_steps {
-            return Err(JsError::range_error("execution step limit exceeded"));
+            return Err(JsError::range_error("execution budget exceeded"));
         }
         Ok(())
     }
@@ -155,7 +155,16 @@ fn mark_object(
         ObjectKind::Promise(state) => {
             push_promise_values(state, values);
         }
-        ObjectKind::RegExp(_) => {}
+        ObjectKind::RegExp(_) | ObjectKind::Symbol(_) => {}
+        ObjectKind::Generator(frame) => {
+            if let Ok(frame) = frame.try_borrow() {
+                scopes.push(frame.scope);
+                scopes.extend(frame.block_scopes.iter().copied());
+                if let Some(promise) = &frame.promise {
+                    values.push(promise.clone());
+                }
+            }
+        }
     }
 }
 

@@ -146,7 +146,6 @@ pub struct FloatBand {
 /// Greedy line breaker over inline items.
 pub(crate) struct LineBreaker {
     width: f32,
-    start_y: f32,
     next_y: f32,
     lines: Vec<LineBox>,
     line_spans: Vec<(f32, f32)>,
@@ -178,7 +177,6 @@ impl LineBreaker {
         let width = width.max(1.0);
         Self {
             width,
-            start_y,
             next_y: start_y,
             lines: Vec::new(),
             line_spans: Vec::new(),
@@ -366,20 +364,26 @@ impl LineBreaker {
         if !self.current.is_empty() || !self.atoms.is_empty() {
             self.flush();
         }
-        let _ = container_width;
-        let total_height = self.next_y - self.start_y;
-        let _ = total_height;
         let mut lines = self.lines;
         let spans = std::mem::take(&mut self.line_spans);
         for (line, (left, width)) in lines.iter_mut().zip(spans) {
+            // `width` is the available inline span after floats. Fall back to
+            // the containing block width if no span was recorded for the line.
+            let available = if width > 0.0 {
+                width
+            } else {
+                container_width.max(0.0)
+            };
             let offset = match align {
                 TextAlign::Left | TextAlign::Justify => 0.0,
-                TextAlign::Right => (width - line.rect.width).max(0.0),
-                TextAlign::Center => ((width - line.rect.width) / 2.0).max(0.0),
+                TextAlign::Right => (available - line.rect.width).max(0.0),
+                TextAlign::Center => ((available - line.rect.width) / 2.0).max(0.0),
             };
-            let _ = left;
             if offset > 0.0 {
-                line.rect.x += offset;
+                // Shift the line rectangle, every text fragment **and** every
+                // atomic inline box together. Centring only the text would
+                // leave images and inline-blocks pinned to the left edge.
+                line.rect.x = left + offset;
                 for fragment in &mut line.fragments {
                     fragment.x += offset;
                 }
@@ -455,5 +459,93 @@ mod tests {
         let lines = breaker.finish(TextAlign::Center, 100.0);
         assert_eq!(lines[0].rect.x, 40.0);
         assert_eq!(lines[0].fragments[0].x, 40.0);
+    }
+
+    #[test]
+    fn center_alignment_offsets_atoms() {
+        // A 272px-wide atomic inline box inside an 800px container must be
+        // centered just like a run of text: (800 - 272) / 2 == 264.
+        let mut breaker = LineBreaker::new(800.0, 0.0);
+        breaker.push(InlineItem::Atom {
+            box_index: 0,
+            width: 272.0,
+            height: 92.0,
+            baseline: 92.0,
+        });
+        let lines = breaker.finish(TextAlign::Center, 800.0);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].rect.x, 264.0);
+        assert_eq!(lines[0].atoms.len(), 1);
+        assert_eq!(lines[0].atoms[0].rect.x, 264.0);
+    }
+
+    #[test]
+    fn center_alignment_offsets_text_and_atom_together() {
+        let mut breaker = LineBreaker::new(800.0, 0.0);
+        breaker.push(InlineItem::Text {
+            node: NodeId(1),
+            text: "hi".into(),
+            width: 100.0,
+            font_size: 10.0,
+            color: browser_style::Color::rgb(0, 0, 0),
+            underline: false,
+            line_through: false,
+            bold: false,
+            italic: false,
+            break_before: false,
+        });
+        breaker.push(InlineItem::Atom {
+            box_index: 0,
+            width: 272.0,
+            height: 92.0,
+            baseline: 92.0,
+        });
+        let lines = breaker.finish(TextAlign::Center, 800.0);
+        assert_eq!(lines.len(), 1);
+        let offset = (800.0 - 372.0) / 2.0;
+        assert_eq!(lines[0].fragments[0].x, offset);
+        assert_eq!(lines[0].atoms[0].rect.x, offset + 100.0);
+    }
+
+    #[test]
+    fn img_atom_is_centered_by_inherited_text_align() {
+        let mut doc = browser_dom::Document::new();
+        let html = doc.create_element("html");
+        let body = doc.create_element("body");
+        doc.append_child(doc.root(), html);
+        doc.append_child(html, body);
+        let center = doc.create_element("center");
+        doc.append_child(body, center);
+        let div = doc.create_element("div");
+        doc.append_child(center, div);
+        let img = doc.create_element("img");
+        doc.set_attr(img, "width", "272");
+        doc.set_attr(img, "height", "92");
+        doc.append_child(div, img);
+
+        let engine = browser_style::StyleEngine::new(browser_style::Viewport {
+            width: 800.0,
+            height: 600.0,
+        });
+        let styled = engine.compute(&doc);
+        let tree = crate::layout(
+            &doc,
+            &styled,
+            crate::Size {
+                width: 800.0,
+                height: 600.0,
+            },
+        );
+        let img_node = tree.find_node(img).unwrap().node.unwrap();
+        let img_box = tree
+            .boxes
+            .iter()
+            .find(|b| b.node == Some(img_node))
+            .unwrap();
+        assert!(
+            (img_box.rect.x - 264.0).abs() < 1.0,
+            "image x = {}",
+            img_box.rect.x
+        );
     }
 }

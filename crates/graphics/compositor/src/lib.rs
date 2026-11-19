@@ -27,4 +27,4 @@ pub use animations::{Animation, AnimationTimeline, Easing};
 pub use clipping::ClipStack;
 pub use damage::Damage;
 pub use layers::{Layer, LayerId, LayerTree};
-pub use tiles::TileGrid;
+pub use tiles::{MAX_TILES, TileGrid};

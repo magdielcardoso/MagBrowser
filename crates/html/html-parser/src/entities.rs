@@ -183,6 +183,13 @@ fn is_legacy(name: &str) -> bool {
     LEGACY.contains(&name)
 }
 
+/// Maximum number of numeric-reference digits that are decoded. A reference
+/// with more digits is still consumed in full (so parsing makes progress), but
+/// only the first `MAX_REFERENCE_DIGITS` are parsed into a code point. This
+/// bounds work on pathological input such as `&#` followed by megabytes of
+/// digits.
+const MAX_REFERENCE_DIGITS: usize = 32;
+
 /// Decodes the character reference starting at `chars[pos]` (which must be
 /// `&`). Returns the decoded text and the position immediately after the
 /// reference. Unknown references decode to the literal `&`.
@@ -202,26 +209,36 @@ pub(crate) fn consume_char_ref(chars: &[char], pos: usize) -> (String, usize) {
         if hexadecimal {
             i += 1;
         }
-        let digits_start = i;
-        while i < len {
-            let c = chars[i];
-            let valid = if hexadecimal {
+        let is_digit = |c: char| {
+            if hexadecimal {
                 c.is_ascii_hexdigit()
             } else {
                 c.is_ascii_digit()
-            };
-            if !valid {
-                break;
             }
+        };
+        let digits_start = i;
+        while i < len && is_digit(chars[i]) {
             i += 1;
         }
-        if i == digits_start {
+        let digits_end = i;
+        if digits_end == digits_start {
             // `&#` / `&#x` without digits is emitted literally.
             let literal: String = chars[pos..i].iter().collect();
             return (literal, i);
         }
-        let digits: String = chars[digits_start..i].iter().collect();
-        let value = if hexadecimal {
+        // Leading zeros are skipped before applying the digit cap so ordinary
+        // zero-padded references still decode correctly. Only a bounded number
+        // of significant digits are ever parsed, which keeps pathological input
+        // (e.g. megabytes of digits) linear in the already-capped input size.
+        let mut value_start = digits_start;
+        while value_start < digits_end && chars[value_start] == '0' {
+            value_start += 1;
+        }
+        let value_end = (value_start + MAX_REFERENCE_DIGITS).min(digits_end);
+        let digits: String = chars[value_start..value_end].iter().collect();
+        let value = if digits.is_empty() {
+            Ok(0)
+        } else if hexadecimal {
             u32::from_str_radix(&digits, 16)
         } else {
             digits.parse::<u32>()

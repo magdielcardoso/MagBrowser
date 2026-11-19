@@ -48,6 +48,8 @@ pub const TOOLBAR: Color = Color::rgb(0xf7, 0xf7, 0xf9);
 pub const TAB_ACTIVE: Color = Color::rgb(0xff, 0xff, 0xff);
 /// Hover background for chrome controls.
 pub const HOVER: Color = Color::rgb(0xe4, 0xe4, 0xe9);
+/// Pressed background for chrome controls.
+pub const PRESSED: Color = Color::rgb(0xd2, 0xd2, 0xda);
 /// Page surround inside the content frame.
 pub const PAGE_SURROUND: Color = Color::rgb(0xff, 0xff, 0xff);
 
@@ -84,6 +86,8 @@ pub struct UiState {
     pub status: LoadStatus,
     /// Chrome control currently under the pointer.
     pub hover: Option<ChromePart>,
+    /// Chrome control currently held down by the pointer.
+    pub pressed: Option<ChromePart>,
     /// Last navigation error, when any.
     pub error: Option<String>,
 }
@@ -94,6 +98,7 @@ impl Default for UiState {
             address: AddressBar::new(),
             status: LoadStatus::Ready,
             hover: None,
+            pressed: None,
             error: None,
         }
     }

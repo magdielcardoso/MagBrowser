@@ -6,7 +6,7 @@ use browser_js_parser::{Regex, RegexMatch};
 
 use crate::Runtime;
 use crate::errors::JsError;
-use crate::object::ObjectKind;
+use crate::object::{ObjectKind, SYMBOL_ITERATOR_KEY};
 use crate::value::{Value, number_to_string};
 
 impl Runtime {
@@ -22,6 +22,7 @@ impl Runtime {
         self.prototypes.error = self.bootstrap_object(Some(object_prototype));
         self.prototypes.promise = self.bootstrap_object(Some(object_prototype));
         self.prototypes.regexp = self.bootstrap_object(Some(object_prototype));
+        self.generator_prototype = self.bootstrap_object(Some(object_prototype));
 
         let global = self.bootstrap_object(Some(object_prototype));
         self.global = global;
@@ -43,6 +44,8 @@ impl Runtime {
         self.install_json();
         self.install_console();
         self.install_promise();
+        self.install_symbol_and_iterators();
+        self.install_generator_prototype();
 
         self.declare_binding(
             global_scope,
@@ -102,6 +105,46 @@ impl Runtime {
             self.define_data_property(*id, "isArray", is_array);
         }
         self.declare_global("Array", array);
+    }
+
+    /// Install `Symbol`, its well-known `iterator` symbol, and the default
+    /// iterators for arrays, strings and generators.
+    fn install_symbol_and_iterators(&mut self) {
+        let iterator = self.new_symbol("Symbol.iterator");
+        if let Value::Object(id) = iterator {
+            self.symbol_iterator = id;
+        }
+        let constructor = self.new_builtin_value("Symbol", 0, symbol_constructor);
+        self.define_data_property(
+            match &constructor {
+                Value::Object(id) => *id,
+                _ => unreachable!("builtin values are objects"),
+            },
+            "iterator",
+            iterator.clone(),
+        );
+        self.declare_global("Symbol", constructor);
+
+        let array_iterator = self.new_builtin_value("[Symbol.iterator]", 0, array_iterator);
+        self.define_data_property(self.prototypes.array, SYMBOL_ITERATOR_KEY, array_iterator);
+        let string_iterator = self.new_builtin_value("[Symbol.iterator]", 0, string_iterator);
+        self.define_data_property(self.prototypes.string, SYMBOL_ITERATOR_KEY, string_iterator);
+        let generator_iterator =
+            self.new_builtin_value("[Symbol.iterator]", 0, generator_self_iterator);
+        self.define_data_property(
+            self.generator_prototype,
+            SYMBOL_ITERATOR_KEY,
+            generator_iterator,
+        );
+    }
+
+    /// Install `next`, `return` and `throw` on the generator prototype.
+    fn install_generator_prototype(&mut self) {
+        let prototype = self.generator_prototype;
+        self.define_builtin_method(prototype, "next", 1, generator_next);
+        self.define_builtin_method(prototype, "return", 1, generator_return);
+        self.define_builtin_method(prototype, "throw", 1, generator_throw);
+        self.define_builtin_method(prototype, "toString", 0, generator_to_string);
     }
 
     fn install_console(&mut self) {
@@ -509,6 +552,12 @@ fn object_to_string(
     this: Value,
     _args: Vec<Value>,
 ) -> Result<Value, JsError> {
+    if let Value::Object(id) = &this
+        && let Some(ObjectKind::Symbol(description)) =
+            runtime.object(*id).map(|object| &object.kind)
+    {
+        return Ok(Value::String(format!("Symbol({description})")));
+    }
     let name = match &this {
         Value::Undefined => "Undefined",
         Value::Null => "Null",
@@ -1876,6 +1925,98 @@ impl JsonParser {
             .map(JsonValue::Number)
             .map_err(|_| JsError::syntax_error("invalid JSON number"))
     }
+}
+
+fn symbol_constructor(
+    runtime: &mut Runtime,
+    _this: Value,
+    args: Vec<Value>,
+) -> Result<Value, JsError> {
+    let description = args.first().map(Value::to_string_value).unwrap_or_default();
+    Ok(runtime.new_symbol(&description))
+}
+
+fn array_iterator(runtime: &mut Runtime, this: Value, _args: Vec<Value>) -> Result<Value, JsError> {
+    let items = runtime.object_array_items(&this).unwrap_or_default();
+    Ok(runtime.new_array_iterator(items))
+}
+
+fn string_iterator(
+    runtime: &mut Runtime,
+    this: Value,
+    _args: Vec<Value>,
+) -> Result<Value, JsError> {
+    let Value::String(text) = this else {
+        return Err(JsError::type_error("String iterator on non-string"));
+    };
+    let items = text
+        .chars()
+        .map(|ch| Value::String(ch.to_string()))
+        .collect();
+    Ok(runtime.new_array_iterator(items))
+}
+
+fn generator_self_iterator(
+    _runtime: &mut Runtime,
+    this: Value,
+    _args: Vec<Value>,
+) -> Result<Value, JsError> {
+    Ok(this)
+}
+
+fn generator_next(runtime: &mut Runtime, this: Value, args: Vec<Value>) -> Result<Value, JsError> {
+    let frame = runtime
+        .generator_frame_of(&this)
+        .ok_or_else(|| JsError::type_error("Generator.prototype.next on non-generator"))?;
+    if frame.borrow().done {
+        return Ok(runtime.new_iterator_result(Value::Undefined, true));
+    }
+    // The first `next()` starts the machine; later calls resume a suspension.
+    let resume = if frame.borrow().suspended {
+        Some(args.first().cloned().unwrap_or(Value::Undefined))
+    } else {
+        None
+    };
+    match runtime.step_generator(&frame, resume)? {
+        crate::generator::Step::Yield(value) => Ok(runtime.new_iterator_result(value, false)),
+        crate::generator::Step::Await(value) => Ok(runtime.new_iterator_result(value, false)),
+        crate::generator::Step::Return(value) => Ok(runtime.new_iterator_result(value, true)),
+    }
+}
+
+fn generator_return(
+    runtime: &mut Runtime,
+    this: Value,
+    args: Vec<Value>,
+) -> Result<Value, JsError> {
+    let frame = runtime
+        .generator_frame_of(&this)
+        .ok_or_else(|| JsError::type_error("Generator.prototype.return on non-generator"))?;
+    let value = args.first().cloned().unwrap_or(Value::Undefined);
+    frame.borrow_mut().done = true;
+    Ok(runtime.new_iterator_result(value, true))
+}
+
+fn generator_throw(runtime: &mut Runtime, this: Value, args: Vec<Value>) -> Result<Value, JsError> {
+    let frame = runtime
+        .generator_frame_of(&this)
+        .ok_or_else(|| JsError::type_error("Generator.prototype.throw on non-generator"))?;
+    let value = args.first().cloned().unwrap_or(Value::Undefined);
+    // With no `try`/`catch` inside the generator machine, a thrown value
+    // propagates to the caller and terminates the generator.
+    if frame.borrow().done {
+        return Err(runtime.error_from_throw(value));
+    }
+    frame.borrow_mut().done = true;
+    Err(runtime.error_from_throw(value))
+}
+
+fn generator_to_string(
+    _runtime: &mut Runtime,
+    _this: Value,
+    _args: Vec<Value>,
+) -> Result<Value, JsError> {
+    Ok(Value::String("[object Generator]".to_owned()))
 }
 
 #[cfg(test)]

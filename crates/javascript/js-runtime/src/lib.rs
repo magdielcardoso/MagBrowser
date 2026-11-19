@@ -10,15 +10,18 @@ mod errors;
 mod execution;
 mod function;
 mod gc;
+mod generator;
 mod interpreter;
+mod module;
 mod object;
 mod promise;
 mod scope;
 mod value;
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 pub use errors::JsError;
+pub use module::ModuleLoader;
 pub use object::HostFunction;
 pub use value::{ObjectId, Value, number_to_string};
 
@@ -39,6 +42,10 @@ pub struct Runtime {
     pub(crate) scopes: Vec<Option<Scope>>,
     pub(crate) scope_free: Vec<usize>,
     pub(crate) prototypes: Prototypes,
+    /// Well-known `Symbol.iterator` value.
+    pub(crate) symbol_iterator: ObjectId,
+    /// Prototype shared by generator objects.
+    pub(crate) generator_prototype: ObjectId,
     pub(crate) global: ObjectId,
     pub(crate) global_scope: ScopeId,
     pub(crate) microtasks: VecDeque<Microtask>,
@@ -58,6 +65,14 @@ pub struct Runtime {
     pub(crate) call_depth: usize,
     pub(crate) max_call_depth: usize,
     pub(crate) in_microtask: bool,
+    /// Registered ES modules, indexed by module id.
+    pub(crate) modules: Vec<module::ModuleRecord>,
+    /// Maps a resolved module URL to its id in `modules`.
+    pub(crate) module_urls: HashMap<String, usize>,
+    /// Host callback used to resolve and fetch unknown module sources.
+    pub(crate) module_loader: Option<ModuleLoader>,
+    /// Module currently executing, used for `import.meta` and relative imports.
+    pub(crate) current_module: Option<usize>,
 }
 
 impl Default for Runtime {
@@ -67,6 +82,16 @@ impl Default for Runtime {
 }
 
 impl Runtime {
+    /// Default number of execution steps a single script evaluation may take.
+    ///
+    /// A step is counted for every statement and every loop iteration. Scripts
+    /// that exceed this budget are aborted with an `execution budget exceeded`
+    /// runtime error instead of freezing the caller.
+    pub const DEFAULT_STEP_BUDGET: u64 = 1_000_000;
+
+    /// Default maximum depth of nested JavaScript function calls.
+    pub const DEFAULT_MAX_CALL_DEPTH: usize = 512;
+
     /// Create a runtime with the global environment fully installed.
     pub fn new() -> Self {
         let seed = std::time::SystemTime::now()
@@ -89,6 +114,8 @@ impl Runtime {
                 promise: ObjectId(0),
                 regexp: ObjectId(0),
             },
+            symbol_iterator: ObjectId(0),
+            generator_prototype: ObjectId(0),
             global: ObjectId(0),
             global_scope: ScopeId(0),
             microtasks: VecDeque::new(),
@@ -104,10 +131,14 @@ impl Runtime {
             gc_threshold: usize::MAX,
             rng_state: seed | 1,
             steps: 0,
-            max_steps: 20_000_000,
+            max_steps: Self::DEFAULT_STEP_BUDGET,
             call_depth: 0,
-            max_call_depth: 512,
+            max_call_depth: Self::DEFAULT_MAX_CALL_DEPTH,
             in_microtask: false,
+            modules: Vec::new(),
+            module_urls: HashMap::new(),
+            module_loader: None,
+            current_module: None,
         };
         runtime.bootstrap();
         runtime.gc_threshold = 2048;
@@ -159,6 +190,18 @@ impl Runtime {
     /// Replace the console output sink.
     pub fn set_console_sink(&mut self, sink: Box<dyn FnMut(&str) + Send>) {
         self.console = sink;
+    }
+
+    /// Set the maximum number of execution steps allowed for a single
+    /// `eval`/`eval_named` call. The counter is reset at the start of every
+    /// evaluation, so each script receives a fresh budget.
+    pub fn set_execution_budget(&mut self, max_steps: u64) {
+        self.max_steps = max_steps;
+    }
+
+    /// Set the maximum depth of nested JavaScript function calls.
+    pub fn set_max_call_depth(&mut self, max_depth: usize) {
+        self.max_call_depth = max_depth;
     }
 
     /// Allocate a plain object with the given prototype (used while bootstrapping).
@@ -677,5 +720,575 @@ mod tests {
         runtime.add_gc_root(object.clone());
         runtime.collect_garbage();
         assert_eq!(runtime.get_property(&object, "kept"), Value::Number(1.0));
+    }
+
+    #[test]
+    fn infinite_loop_hits_the_execution_budget() {
+        let mut runtime = Runtime::new();
+        let error = runtime
+            .eval("while (true) {}")
+            .expect_err("an infinite loop must be stopped by the step budget");
+        assert_eq!(error.message, "RangeError: execution budget exceeded");
+        assert_eq!(runtime.steps, runtime.max_steps + 1);
+    }
+
+    #[test]
+    fn infinite_for_loop_hits_the_execution_budget() {
+        let mut runtime = Runtime::new();
+        let error = runtime
+            .eval("for (;;) { }")
+            .expect_err("an infinite for loop must be stopped by the step budget");
+        assert_eq!(error.message, "RangeError: execution budget exceeded");
+    }
+
+    #[test]
+    fn deep_recursion_hits_the_call_depth_limit() {
+        let mut runtime = Runtime::new();
+        let error = runtime
+            .eval("function recurse(n) { return recurse(n + 1); } recurse(0);")
+            .expect_err("unbounded recursion must be stopped by the call depth limit");
+        assert_eq!(
+            error.message,
+            "RangeError: maximum call stack size exceeded"
+        );
+        assert_eq!(
+            runtime.call_depth, 0,
+            "call depth must be restored after error"
+        );
+    }
+
+    #[test]
+    fn execution_budget_is_reset_and_configurable() {
+        let mut runtime = Runtime::new();
+        runtime.set_execution_budget(50);
+        assert!(runtime.eval("while (true) {}").is_err());
+        // A fresh evaluation starts with a fresh budget.
+        assert_eq!(number(&mut runtime, "6 * 7"), 42.0);
+    }
+
+    // -----------------------------------------------------------------------
+    // ES6 classes
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn class_constructor_methods_and_static_methods() {
+        let mut runtime = Runtime::new();
+        eval_ok(
+            &mut runtime,
+            "class Point { \
+                constructor(x, y) { this.x = x; this.y = y; } \
+                sum() { return this.x + this.y; } \
+                static origin() { return new Point(0, 0); } \
+             } \
+             var p = new Point(2, 3);",
+        );
+        assert_eq!(number(&mut runtime, "p.sum()"), 5.0);
+        assert_eq!(number(&mut runtime, "Point.origin().sum()"), 0.0);
+        assert_eq!(
+            eval_ok(&mut runtime, "p instanceof Point"),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            eval_ok(&mut runtime, "typeof Point"),
+            Value::String("function".into())
+        );
+        assert_eq!(
+            eval_ok(&mut runtime, "p.constructor === Point"),
+            Value::Bool(true)
+        );
+    }
+
+    #[test]
+    fn class_extends_and_super_calls() {
+        let mut runtime = Runtime::new();
+        eval_ok(
+            &mut runtime,
+            "class Animal { \
+                constructor(name) { this.name = name; } \
+                speak() { return this.name + ' makes a sound'; } \
+             } \
+             class Dog extends Animal { \
+                constructor(name) { super(name.toUpperCase()); this.kind = 'dog'; } \
+                speak() { return super.speak() + ' (woof)'; } \
+             } \
+             var dog = new Dog('rex');",
+        );
+        assert_eq!(
+            eval_ok(&mut runtime, "dog.name"),
+            Value::String("REX".into())
+        );
+        assert_eq!(
+            eval_ok(&mut runtime, "dog.speak()"),
+            Value::String("REX makes a sound (woof)".into())
+        );
+        assert_eq!(
+            eval_ok(&mut runtime, "dog instanceof Dog"),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            eval_ok(&mut runtime, "dog instanceof Animal"),
+            Value::Bool(true)
+        );
+    }
+
+    #[test]
+    fn class_accessors_and_computed_method_calls() {
+        let mut runtime = Runtime::new();
+        eval_ok(
+            &mut runtime,
+            "class Box { \
+                constructor() { this._value = 1; } \
+                get value() { return this._value * 2; } \
+                set value(v) { this._value = v; } \
+                call(fn) { return fn.call(this); } \
+             } \
+             var box = new Box();",
+        );
+        assert_eq!(number(&mut runtime, "box.value"), 2.0);
+        eval_ok(&mut runtime, "box.value = 5");
+        assert_eq!(number(&mut runtime, "box.value"), 10.0);
+        assert_eq!(
+            number(
+                &mut runtime,
+                "box.call(function () { return this._value; })"
+            ),
+            5.0
+        );
+    }
+
+    #[test]
+    fn class_expression_and_static_inheritance() {
+        let mut runtime = Runtime::new();
+        assert_eq!(
+            number(
+                &mut runtime,
+                "var Base = class { static id() { return 7; } }; \
+                 var Derived = class extends Base {}; Derived.id()"
+            ),
+            7.0
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Generators
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn generator_yield_next_and_return_value() {
+        let mut runtime = Runtime::new();
+        eval_ok(
+            &mut runtime,
+            "function* numbers() { yield 1; yield 2; return 3; } var it = numbers();",
+        );
+        assert_eq!(number(&mut runtime, "it.next().value"), 1.0);
+        assert_eq!(number(&mut runtime, "it.next().value"), 2.0);
+        assert_eq!(number(&mut runtime, "it.next().value"), 3.0);
+        assert_eq!(eval_ok(&mut runtime, "it.next().done"), Value::Bool(true));
+    }
+
+    #[test]
+    fn generator_preserves_side_effects_and_loop_state_across_yields() {
+        let mut runtime = Runtime::new();
+        eval_ok(
+            &mut runtime,
+            "var log = []; \
+             function* counter(n) { \
+                 for (var i = 0; i < n; i++) { log.push('before' + i); yield i; log.push('after' + i); } \
+                 return 'done'; \
+             } \
+             var it = counter(3);",
+        );
+        assert_eq!(number(&mut runtime, "it.next().value"), 0.0);
+        assert_eq!(
+            eval_ok(&mut runtime, "log.join(',')"),
+            Value::String("before0".into())
+        );
+        assert_eq!(number(&mut runtime, "it.next().value"), 1.0);
+        assert_eq!(
+            eval_ok(&mut runtime, "log.join(',')"),
+            Value::String("before0,after0,before1".into())
+        );
+        assert_eq!(number(&mut runtime, "it.next().value"), 2.0);
+        assert_eq!(
+            eval_ok(&mut runtime, "it.next().value"),
+            Value::String("done".into())
+        );
+        assert_eq!(eval_ok(&mut runtime, "it.next().done"), Value::Bool(true));
+    }
+
+    #[test]
+    fn generator_receives_next_values() {
+        let mut runtime = Runtime::new();
+        eval_ok(
+            &mut runtime,
+            "function* echo() { var first = yield 'ask'; var second = yield first + 1; return second; } var it = echo();",
+        );
+        assert_eq!(
+            eval_ok(&mut runtime, "it.next().value"),
+            Value::String("ask".into())
+        );
+        assert_eq!(number(&mut runtime, "it.next(10).value"), 11.0);
+        assert_eq!(number(&mut runtime, "it.next(20).value"), 20.0);
+    }
+
+    #[test]
+    fn generator_is_iterable_and_works_with_for_of_and_spread() {
+        let mut runtime = Runtime::new();
+        assert_eq!(
+            number(
+                &mut runtime,
+                "function* range(n) { for (var i = 0; i < n; i++) { yield i; } } \
+                 var total = 0; for (var value of range(5)) { total += value; } total"
+            ),
+            10.0
+        );
+        assert_eq!(
+            eval_ok(
+                &mut runtime,
+                "function* ab() { yield 'a'; yield 'b'; } [...ab()].join('-')"
+            ),
+            Value::String("a-b".into())
+        );
+    }
+
+    #[test]
+    fn yield_star_delegates_to_another_generator() {
+        let mut runtime = Runtime::new();
+        eval_ok(
+            &mut runtime,
+            "function* inner() { yield 1; yield 2; return 'inner'; } \
+             function* outer() { yield 0; var result = yield* inner(); yield result; return 'outer'; } \
+             var it = outer();",
+        );
+        let values: Vec<f64> = (0..3)
+            .map(|_| number(&mut runtime, "it.next().value"))
+            .collect();
+        assert_eq!(values, vec![0.0, 1.0, 2.0]);
+        assert_eq!(
+            eval_ok(&mut runtime, "it.next().value"),
+            Value::String("inner".into())
+        );
+        assert_eq!(
+            eval_ok(&mut runtime, "it.next().value"),
+            Value::String("outer".into())
+        );
+    }
+
+    #[test]
+    fn generator_method_and_return_force_completion() {
+        let mut runtime = Runtime::new();
+        eval_ok(
+            &mut runtime,
+            "var obj = { values: [1, 2], *items() { for (var v of this.values) { yield v; } } }; \
+             var it = obj.items();",
+        );
+        assert_eq!(number(&mut runtime, "it.next().value"), 1.0);
+        assert_eq!(number(&mut runtime, "it.return(99).value"), 99.0);
+        assert_eq!(eval_ok(&mut runtime, "it.next().done"), Value::Bool(true));
+    }
+
+    // -----------------------------------------------------------------------
+    // Async / await
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn async_function_returns_a_promise_and_await_resumes() {
+        let mut runtime = Runtime::new();
+        eval_ok(
+            &mut runtime,
+            "var order = []; \
+             async function load() { order.push('start'); var value = await 42; order.push('got' + value); return value + 1; } \
+             var result = load(); order.push('after-call'); \
+             result.then(function (value) { order.push('result' + value); });",
+        );
+        assert_eq!(
+            eval_ok(&mut runtime, "order.join(',')"),
+            Value::String("start,after-call".into())
+        );
+        runtime.run_microtasks().expect("microtasks");
+        assert_eq!(
+            eval_ok(&mut runtime, "order.join(',')"),
+            Value::String("start,after-call,got42,result43".into())
+        );
+    }
+
+    #[test]
+    fn await_unwraps_promises_and_propagates_rejections() {
+        let mut runtime = Runtime::new();
+        eval_ok(
+            &mut runtime,
+            "var log = []; \
+             async function chain() { var a = await Promise.resolve(1); var b = await Promise.resolve(a + 1); return b * 10; } \
+             async function failing() { await 1; throw new Error('boom'); } \
+             chain().then(function (v) { log.push('ok' + v); }); \
+             failing().catch(function (e) { log.push(e.message); });",
+        );
+        for _ in 0..8 {
+            runtime.run_microtasks().expect("microtasks");
+        }
+        let log = eval_ok(&mut runtime, "log.join(',')").to_string_value();
+        assert!(log.contains("ok20"), "{log}");
+        assert!(log.contains("boom"), "{log}");
+    }
+
+    #[test]
+    fn async_arrow_and_await_in_loop() {
+        let mut runtime = Runtime::new();
+        eval_ok(
+            &mut runtime,
+            "var seen = []; \
+             var collect = async function (xs) { for (var x of xs) { seen.push(await x); } return seen.length; }; \
+             var pending = collect([1, 2, 3]);",
+        );
+        for _ in 0..8 {
+            runtime.run_microtasks().expect("microtasks");
+        }
+        assert_eq!(
+            eval_ok(&mut runtime, "seen.join(',')"),
+            Value::String("1,2,3".into())
+        );
+        assert_eq!(
+            eval_ok(&mut runtime, "pending instanceof Promise"),
+            Value::Bool(true)
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Iterators, spread, optional chaining, nullish coalescing, Symbol
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn for_of_with_custom_symbol_iterator() {
+        let mut runtime = Runtime::new();
+        assert_eq!(
+            eval_ok(
+                &mut runtime,
+                "var range = { from: 1, to: 3, [Symbol.iterator]: function () { \
+                     var current = this.from; var last = this.to; var self = this; \
+                     return { next: function () { \
+                         if (current <= last) { return { value: current++, done: false }; } \
+                         return { value: undefined, done: true }; \
+                     } }; \
+                 } }; \
+                 var out = []; for (var n of range) { out.push(n); } out.join(',')"
+            ),
+            Value::String("1,2,3".into())
+        );
+    }
+
+    #[test]
+    fn spread_in_calls_and_arrays_including_strings() {
+        let mut runtime = Runtime::new();
+        assert_eq!(
+            eval_ok(&mut runtime, "var args = [1, 2, 3]; Math.max(...args)"),
+            Value::Number(3.0)
+        );
+        assert_eq!(
+            eval_ok(
+                &mut runtime,
+                "var head = [0]; var tail = [2, 3]; head.concat(...tail).join(',')"
+            ),
+            Value::String("0,2,3".into())
+        );
+        assert_eq!(
+            eval_ok(&mut runtime, "[...'abc'].join('')"),
+            Value::String("abc".into())
+        );
+        assert_eq!(
+            eval_ok(
+                &mut runtime,
+                "function f(a, b) { return a + b; } f(...[1, 2])"
+            ),
+            Value::Number(3.0)
+        );
+    }
+
+    #[test]
+    fn optional_chaining_short_circuits_whole_chain() {
+        let mut runtime = Runtime::new();
+        eval_ok(
+            &mut runtime,
+            "var calls = 0; function bump() { calls++; return 1; }",
+        );
+        assert_eq!(
+            eval_ok(&mut runtime, "var unset; unset?.a?.b?.()"),
+            Value::Undefined
+        );
+        assert_eq!(number(&mut runtime, "calls"), 0.0);
+        assert_eq!(
+            eval_ok(&mut runtime, "({ a: { b: 5 } }).a?.b"),
+            Value::Number(5.0)
+        );
+        assert_eq!(
+            eval_ok(&mut runtime, "({ a: null }).a?.b"),
+            Value::Undefined
+        );
+        assert_eq!(eval_ok(&mut runtime, "null?.[0]"), Value::Undefined);
+        assert_eq!(
+            eval_ok(&mut runtime, "var f = function () { return 9; }; f?.()"),
+            Value::Number(9.0)
+        );
+        assert_eq!(eval_ok(&mut runtime, "undefined?.()"), Value::Undefined);
+    }
+
+    #[test]
+    fn nullish_coalescing_only_checks_null_and_undefined() {
+        let mut runtime = Runtime::new();
+        assert_eq!(eval_ok(&mut runtime, "null ?? 5"), Value::Number(5.0));
+        assert_eq!(eval_ok(&mut runtime, "undefined ?? 5"), Value::Number(5.0));
+        assert_eq!(eval_ok(&mut runtime, "0 ?? 5"), Value::Number(0.0));
+        assert_eq!(eval_ok(&mut runtime, "'' ?? 5"), Value::String("".into()));
+        assert_eq!(eval_ok(&mut runtime, "false ?? 5"), Value::Bool(false));
+        assert_eq!(
+            eval_ok(&mut runtime, "var object = { a: null }; object.a ?? 7"),
+            Value::Number(7.0)
+        );
+    }
+
+    #[test]
+    fn symbol_basics() {
+        let mut runtime = Runtime::new();
+        assert_eq!(
+            eval_ok(&mut runtime, "typeof Symbol('x')"),
+            Value::String("symbol".into())
+        );
+        assert_eq!(
+            eval_ok(&mut runtime, "Symbol('a') === Symbol('a')"),
+            Value::Bool(false)
+        );
+        assert_eq!(
+            eval_ok(&mut runtime, "typeof Symbol.iterator"),
+            Value::String("symbol".into())
+        );
+        assert_eq!(
+            eval_ok(&mut runtime, "[][Symbol.iterator]().next().done"),
+            Value::Bool(true)
+        );
+    }
+
+    #[test]
+    fn nested_destructuring_defaults_evaluate_lazily() {
+        let mut runtime = Runtime::new();
+        eval_ok(
+            &mut runtime,
+            "var calls = 0; function mark() { calls++; return 99; } \
+             var { a: { b = 1 } = {}, c: [d = 2] = [] } = { a: {}, c: [] }; \
+             function f([x = mark(), [y = 4] = []] = []) { return x + y; }",
+        );
+        assert_eq!(number(&mut runtime, "b + d"), 3.0);
+        assert_eq!(number(&mut runtime, "f()"), 103.0);
+        assert_eq!(number(&mut runtime, "calls"), 1.0);
+        assert_eq!(number(&mut runtime, "f([5, [7]])"), 12.0);
+    }
+
+    #[test]
+    fn templates_interpolate_all_value_kinds() {
+        let mut runtime = Runtime::new();
+        assert_eq!(
+            eval_ok(&mut runtime, "`n=${1 + 1}, s=${'x'}, b=${true}, o=${null}`"),
+            Value::String("n=2, s=x, b=true, o=null".into())
+        );
+        assert_eq!(
+            eval_ok(&mut runtime, "var n = 3; `square=${n * n}`"),
+            Value::String("square=9".into())
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Limits still apply to the new execution paths
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn infinite_generator_next_respects_step_budget() {
+        let mut runtime = Runtime::new();
+        runtime.set_execution_budget(40);
+        let error = runtime
+            .eval(
+                "function* forever() { while (true) { yield 1; } } var it = forever(); \
+                   for (var i = 0; i < 50; i++) { it.next(); }",
+            )
+            .expect_err("step budget must stop unbounded generators");
+        assert_eq!(error.message, "RangeError: execution budget exceeded");
+    }
+
+    #[test]
+    fn deeply_recursive_async_calls_respect_call_depth() {
+        let mut runtime = Runtime::new();
+        assert!(
+            runtime
+                .eval("async function recurse(n) { return await recurse(n + 1); } recurse(0);")
+                .is_ok(),
+            "async recursion is queued through promises, so the initial call returns"
+        );
+        for _ in 0..4 {
+            let _ = runtime.run_microtasks();
+        }
+    }
+
+    #[test]
+    fn static_super_methods_and_for_of_destructuring() {
+        let mut runtime = Runtime::new();
+        assert_eq!(
+            number(
+                &mut runtime,
+                "class Base { static twice(x) { return x * 2; } } \
+                 class Child extends Base { static four(x) { return super.twice(x) * 2; } } \
+                 Child.four(3)"
+            ),
+            12.0
+        );
+        assert_eq!(
+            eval_ok(
+                &mut runtime,
+                "var sum = 0; for (const [a, b = 1] of [[1], [2, 5]]) { sum += a + b; } sum"
+            ),
+            Value::Number(9.0)
+        );
+    }
+
+    #[test]
+    fn symbol_values_work_as_computed_property_keys() {
+        let mut runtime = Runtime::new();
+        assert_eq!(
+            number(
+                &mut runtime,
+                "var key = Symbol('id'); var obj = { [key]: 42 }; obj[key]"
+            ),
+            42.0
+        );
+    }
+
+    #[test]
+    fn generator_break_and_continue_keep_loop_state() {
+        let mut runtime = Runtime::new();
+        assert_eq!(
+            eval_ok(
+                &mut runtime,
+                "function* g() { for (var i = 0; i < 5; i++) { if (i === 1) continue; if (i === 4) break; yield i; } return 'end'; } \
+                 [...g()].join(',')"
+            ),
+            Value::String("0,2,3".into())
+        );
+    }
+
+    #[test]
+    fn awaited_rejection_can_be_caught_in_an_async_function() {
+        let mut runtime = Runtime::new();
+        eval_ok(
+            &mut runtime,
+            "var log = []; \
+             async function safe() { \
+                 try { await Promise.reject('nope'); } catch (error) { log.push('caught:' + error); } \
+                 return 'ok'; \
+             } \
+             safe().then(function (value) { log.push(value); });",
+        );
+        for _ in 0..8 {
+            runtime.run_microtasks().expect("microtasks");
+        }
+        assert_eq!(
+            eval_ok(&mut runtime, "log.join(',')"),
+            Value::String("caught:nope,ok".into())
+        );
     }
 }

@@ -49,10 +49,13 @@ impl Candidate {
     }
 }
 
-/// Picks the winning declaration per property.
-pub fn cascade(candidates: Vec<Candidate>) -> Vec<Candidate> {
-    let mut winners: Vec<Candidate> = Vec::new();
-    for candidate in candidates {
+/// Picks the winning declaration per property, reusing both buffers.
+///
+/// Candidates are drained and winners are cleared, so callers can keep the
+/// allocations across elements instead of rebuilding them every time.
+pub(crate) fn cascade_into(candidates: &mut Vec<Candidate>, winners: &mut Vec<Candidate>) {
+    winners.clear();
+    for candidate in candidates.drain(..) {
         match winners
             .iter_mut()
             .find(|w| w.property == candidate.property)
@@ -65,6 +68,12 @@ pub fn cascade(candidates: Vec<Candidate>) -> Vec<Candidate> {
             None => winners.push(candidate),
         }
     }
+}
+
+/// Picks the winning declaration per property.
+pub fn cascade(mut candidates: Vec<Candidate>) -> Vec<Candidate> {
+    let mut winners = Vec::new();
+    cascade_into(&mut candidates, &mut winners);
     winners
 }
 
@@ -156,6 +165,8 @@ pub fn expand(declaration: &Declaration) -> Vec<(Property, Value)> {
             let second = groups.get(1).cloned().unwrap_or_else(|| first.clone());
             vec![(Property::OverflowX, first), (Property::OverflowY, second)]
         }
+        // `gap` (and its legacy `grid-gap` alias) expand to the two physical
+        // gap longhands. Both are plain lengths, so they are interpreted as px.
         "gap" | "grid-gap" => {
             let first = groups.first().cloned().unwrap_or_default();
             let second = groups.get(1).cloned().unwrap_or_else(|| first.clone());
@@ -209,11 +220,63 @@ pub fn expand(declaration: &Declaration) -> Vec<(Property, Value)> {
             })
             .map(|g| vec![(Property::TextDecoration, g.clone())])
             .unwrap_or_default(),
-        "font" => groups
-            .iter()
-            .find(|g| g.as_length().is_some())
-            .map(|g| vec![(Property::FontSize, g.clone())])
-            .unwrap_or_default(),
+        "font" => {
+            // `font: 13px/27px Arial` keeps the size and line-height in one
+            // component group separated by `/`; split it into longhands.
+            let mut out = Vec::new();
+            if let Some(first) = groups.first() {
+                let mut parts = first
+                    .components
+                    .split(|component| matches!(component, ComponentValue::Delim('/')));
+                if let Some(size) = parts.next() {
+                    let value = Value {
+                        components: size.to_vec(),
+                    };
+                    let is_keyword = matches!(
+                        value.ident(),
+                        Some(
+                            "xx-small"
+                                | "x-small"
+                                | "small"
+                                | "smaller"
+                                | "medium"
+                                | "large"
+                                | "larger"
+                                | "x-large"
+                                | "xx-large"
+                        )
+                    );
+                    if value.as_length().is_some() || is_keyword {
+                        out.push((Property::FontSize, value));
+                    }
+                }
+                if let Some(line) = parts.next() {
+                    let value = Value {
+                        components: line.to_vec(),
+                    };
+                    if value.as_length().is_some()
+                        || value.as_number().is_some()
+                        || value.ident() == Some("normal")
+                    {
+                        out.push((Property::LineHeight, value));
+                    }
+                }
+            }
+            out
+        }
+        // Modern compound properties (border-radius with 1-4 values plus an
+        // optional `/` group, comma-separated box/text-shadow lists, transform
+        // and filter function lists, aspect-ratio, object-fit) are kept as one
+        // longhand here and parsed as a whole by `interpret`. The default arm
+        // below passes their value through untouched.
+        //
+        // `grid-area` is deliberately in this group, not expanded into
+        // `grid-row-start`/`-end` and `grid-column-start`/`-end`: the grid
+        // layout engine accepts both the named-area form (`grid-area: main`)
+        // and the four-line form (`1 / 2 / 3 / 4`) as a single value, and
+        // `grid-column`/`grid-row` override its components during placement.
+        // The same applies to `grid-column`, `grid-row`, `grid-template-areas`,
+        // `grid-auto-*`, `justify-items`, `justify-self` and `align-content`.
         _ => Property::from_name(&name)
             .map(|property| vec![(property, value.clone())])
             .unwrap_or_default(),
@@ -331,6 +394,51 @@ mod tests {
                 .iter()
                 .any(|(p, v)| *p == Property::BorderBottomColor && v.as_color().is_some())
         );
+    }
+
+    #[test]
+    fn gap_shorthand_expands_to_row_and_column() {
+        let expanded = expand(&decl("gap: 10px 20px"));
+        let map: std::collections::HashMap<_, _> = expanded.into_iter().collect();
+        assert_eq!(
+            map[&Property::RowGap].as_length(),
+            Some(browser_css::Length::Px(10.0))
+        );
+        assert_eq!(
+            map[&Property::ColumnGap].as_length(),
+            Some(browser_css::Length::Px(20.0))
+        );
+
+        // A single value is copied to both axes (legacy `grid-gap` alias too).
+        let expanded = expand(&decl("grid-gap: 7px"));
+        let map: std::collections::HashMap<_, _> = expanded.into_iter().collect();
+        assert_eq!(
+            map[&Property::RowGap].as_length(),
+            Some(browser_css::Length::Px(7.0))
+        );
+        assert_eq!(
+            map[&Property::ColumnGap].as_length(),
+            Some(browser_css::Length::Px(7.0))
+        );
+    }
+
+    #[test]
+    fn grid_area_and_placement_pass_through_as_single_longhands() {
+        for (css, property) in [
+            ("grid-area: main", Property::GridArea),
+            ("grid-column: span 2", Property::GridColumn),
+            ("grid-row: 1 / 3", Property::GridRow),
+            ("grid-template-areas: \"a b\"", Property::GridTemplateAreas),
+            ("grid-auto-flow: column", Property::GridAutoFlow),
+            ("justify-items: center", Property::JustifyItems),
+            ("justify-self: end", Property::JustifySelf),
+            ("align-self: start", Property::AlignSelf),
+            ("align-content: center", Property::AlignContent),
+        ] {
+            let expanded = expand(&decl(css));
+            assert_eq!(expanded.len(), 1, "{css}");
+            assert_eq!(expanded[0].0, property, "{css}");
+        }
     }
 
     #[test]

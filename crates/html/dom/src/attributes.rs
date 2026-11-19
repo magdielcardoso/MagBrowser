@@ -1,15 +1,37 @@
 //! Element attributes: ordered, case-insensitive for HTML elements.
 
-/// An ordered attribute list.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+use crate::limits::Limits;
+
+/// An ordered attribute list with a bounded number of entries.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Attributes {
     entries: Vec<(String, String)>,
+    limit: usize,
+}
+
+impl Default for Attributes {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Attributes {
-    /// Creates an empty attribute list.
+    /// Creates an empty attribute list using the default attribute cap.
     pub fn new() -> Self {
-        Self::default()
+        Self::with_limit(Limits::default().max_attributes_per_element)
+    }
+
+    /// Creates an empty attribute list that holds at most `limit` attributes.
+    pub fn with_limit(limit: usize) -> Self {
+        Self {
+            entries: Vec::new(),
+            limit,
+        }
+    }
+
+    /// Maximum number of attributes this list will hold.
+    pub fn limit(&self) -> usize {
+        self.limit
     }
 
     /// Returns the value of `name` (case-insensitive).
@@ -26,16 +48,30 @@ impl Attributes {
     }
 
     /// Sets `name`, replacing the existing value while keeping its position.
+    ///
+    /// A new attribute is silently ignored once [`Self::limit`] is reached;
+    /// use [`Self::try_set`] to detect that case. Existing attributes can
+    /// always be updated.
     pub fn set(&mut self, name: &str, value: &str) {
+        let _ = self.try_set(name, value);
+    }
+
+    /// Sets `name`, returning `false` (without changing anything) when the
+    /// attribute is new and the cap is full.
+    pub fn try_set(&mut self, name: &str, value: &str) -> bool {
         if let Some((_, v)) = self
             .entries
             .iter_mut()
             .find(|(k, _)| k.eq_ignore_ascii_case(name))
         {
             *v = value.to_string();
-            return;
+            return true;
+        }
+        if self.entries.len() >= self.limit {
+            return false;
         }
         self.entries.push((name.to_string(), value.to_string()));
+        true
     }
 
     /// Removes `name`, returning its previous value.
@@ -91,5 +127,29 @@ mod tests {
         let mut attrs = Attributes::new();
         attrs.set("class", "  a  b\tc ");
         assert_eq!(attrs.class_list(), ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn attribute_cap_rejects_new_entries_but_allows_updates() {
+        let mut attrs = Attributes::with_limit(2);
+        assert_eq!(attrs.limit(), 2);
+        assert!(attrs.try_set("a", "1"));
+        assert!(attrs.try_set("b", "2"));
+        assert!(!attrs.try_set("c", "3"));
+        // The infallible API ignores the failure.
+        attrs.set("d", "4");
+        assert_eq!(attrs.len(), 2);
+        assert_eq!(attrs.get("c"), None);
+        assert_eq!(attrs.get("d"), None);
+
+        // Updating an existing key still works at the cap.
+        assert!(attrs.try_set("A", "updated"));
+        assert_eq!(attrs.get("a"), Some("updated"));
+        assert_eq!(attrs.len(), 2);
+
+        // Freeing a slot permits a new attribute again.
+        assert_eq!(attrs.remove("b").as_deref(), Some("2"));
+        assert!(attrs.try_set("c", "3"));
+        assert_eq!(attrs.len(), 2);
     }
 }

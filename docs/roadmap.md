@@ -31,23 +31,36 @@ with documented gaps, **planned** = designed but not implemented.
 - Cascade with origins, importance, inline styles and document order; shorthand
   expansion; inheritance; CSS-wide keywords; `var()` with fallbacks; media
   queries; a user-agent stylesheet covering the HTML defaults.
+- `calc()` arithmetic at computed-value time for lengths and percentages
+  (nested expressions, `+ - * /`, absolute units, `em`/`rem`/viewport units).
+- Presentational hints: `<img width>`/`<img height>` behave as low-priority UA
+  declarations, so author CSS overrides them.
 
 ## Phase 3 — Layout — done (subset)
 
 - Box tree with anonymous block wrapping.
 - Block flow with percentage edges, `box-sizing`, min/max sizes, sibling margin
   collapsing; inline flow with greedy line breaking, `text-align`, `white-space`,
-  inline-blocks and `<br>`; basic flexbox; absolute/fixed positioning; relative
-  offsets; overflow clipping and scroll ranges; hit testing and paint order.
-- Floats (left/right with per-line float bands and `clear`) and a CSS Grid subset
-  (`px`/`%`/`fr`/`auto`/`repeat()`, gaps, row-major placement).
-- **Not done:** full table layout (column widths, row spanning), `vertical-align`
-  beyond keywords, named grid lines/areas, bidirectional text.
+  inline-blocks and `<br>`; absolute/fixed positioning; relative offsets; overflow
+  clipping and scroll ranges; hit testing and paint order.
+- Flexbox: `row`/`row-reverse`/`column`/`column-reverse` and `flex-wrap:
+  wrap|wrap-reverse` (greedy multi-line packing with per-line `justify-content`
+  and `align-items`), gaps and `flex-grow`/`flex-shrink`/`flex-basis`.
+  **Not done:** `align-content`, `order`, baseline alignment.
+- Floats (left/right with per-line float bands and `clear`; auto-width floats
+  shrink to fit) and a CSS Grid subset (`px`/`%`/`fr`/`auto`/`repeat()`, gaps,
+  row-major placement).
+- Automatic table layout measures max-content column widths and fits them to the
+  container; form controls synthesize a text child from `value`/`placeholder` so
+  button and field labels paint.
+- **Not done:** `colspan`/`rowspan` and fixed table layout, `vertical-align` beyond
+  keywords, explicit grid placement and named grid lines/areas, bidirectional
+  text.
 
-## Phase 4 — Rendering — done (software), GPU planned
+## Phase 4 — Rendering — done (software + optional native GPU/window)
 
-- Display list, software rasterizer, bitmap-font text, borders, backgrounds,
-  images (placeholder), clipping, scrolling.
+- Display list, software rasterizer, anti-aliased Inter text, borders, backgrounds,
+  images (decoded PNG/GIF/BMP with a placeholder fallback), clipping, scrolling.
 - Dependency-free PNG encoder; deterministic screenshots; headless CLI.
 - Compositor: layers, tiles, damage rectangles, clip stack, animation timeline.
 - GPU abstraction with embedded WGSL shaders and a software reference device.
@@ -58,8 +71,14 @@ with documented gaps, **planned** = designed but not implemented.
 - Synthetic bold/italic and list markers in the rasterizer.
 - Native desktop window: `winit 0.30` + `wgpu 30` behind the `window` feature,
   with engine-drawn chrome and a `--window-selfcheck` PNG mode.
-- **Planned:** damage-based partial repaint, HiDPI-perfect composition, real font
-  loading/shaping, WebP decoding.
+- **In progress:** display-list/rasterizer primitives for anti-aliased rounded
+  rectangles (`DrawRoundedRect`), soft offset shadows (`DrawShadow`) and linear
+  gradients (`DrawLinearGradient`). They are defined and executed by the rasterizer
+  but are not yet emitted by the layout → display-list builder, so CSS
+  `border-radius`, `box-shadow` and gradients have no visual effect yet.
+- **Planned:** damage-based partial repaint, HiDPI-perfect composition everywhere,
+  real font loading/shaping, WebP decoding, CSS-driven decoration (rounded corners,
+  shadows, gradients).
 
 ## Phase 5 — Navigation — done
 
@@ -88,18 +107,24 @@ with documented gaps, **planned** = designed but not implemented.
 
 ## Phase 8 — Compatibility — partial / planned
 
-- Done: Flexbox (single line), media queries, cookies, cache, redirects, CORS/CSP/
-  permissions/sandbox primitives, IPC channels.
-- Partial: tables (block fallback), forms (elements render and expose `value`, but
-  no submission/validation), `innerHTML` (fragment parsing, no `<template>`).
-- Planned: `fetch()` from scripts, IndexedDB-like storage, grid layout, native
-  GPU/windowing, process isolation, incremental rendering, Web Platform Tests and
-  Test262 conformance reporting.
+- Done: Flexbox (single- and multi-line), floats, a CSS Grid subset, `calc()`,
+  presentational hints, media queries, cookies, cache, redirects, CORS/CSP/
+  permissions/sandbox primitives, IPC channels, native window/GPU presentation.
+- Partial: tables (automatic column widths, no spans), forms (elements render and
+  expose `value` and synthesized labels, but no submission/validation),
+  `innerHTML` (fragment parsing, no `<template>`).
+- Not implemented yet: transforms, filters, full grid (explicit placement, dense
+  flow, named lines/areas), CSS-driven `border-radius`/`box-shadow`/gradients
+  (rasterizer primitives exist but are not emitted from CSS).
+- Planned: `fetch()` from scripts, IndexedDB-like storage, process isolation,
+  incremental rendering, Web Platform Tests and Test262 conformance reporting.
 
 ## Known gaps that affect correctness
 
 1. No incremental style/layout invalidation: every mutation re-renders the page.
-2. PNG-only image support: no decoder for network images yet.
+2. JPEG and WebP are detected but not decoded; those images fall back to a
+   deterministic placeholder. PNG, GIF (first frame) and BMP decode from network
+   resources.
 3. The desktop window requires `--features window` (adds `wgpu`/`winit`); the
    default build renders to PNG buffers.
 4. Scripts from external `<script src>` are not fetched or executed.

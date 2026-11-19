@@ -1,5 +1,7 @@
 //! `browser-cli`: inspect every stage of the Mag engine.
 
+mod diagnostics;
+
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -15,7 +17,9 @@ USAGE:
   mag-cli html      <file|url>            print serialised body HTML
   mag-cli css       <file|url>            print collected author CSS
   mag-cli styles    <file|url> [selector] print computed styles
+                    --winning            show cascade winners with sources
   mag-cli layout    <file|url>            print the layout box tree
+                    --json               dump boxes as JSON with box rects
   mag-cli commands  <file|url>            print the display list
   mag-cli render    <file|url> -o <png>   render to PNG
   mag-cli fetch     <url> -o <file>       download a URL
@@ -27,6 +31,8 @@ OPTIONS:
   --height <px>         viewport height (default 768)
   --script              enable JavaScript execution
   --network             allow network access for <link>/<script> resources
+  --winning             for `styles`, show winning declarations with sources
+  --json                for `layout`, emit a JSON dump with box rects
   -h, --help            show this help
 ";
 
@@ -92,7 +98,16 @@ fn run(args: &[String]) -> Result<(), String> {
                 let name = document.element_name(node).unwrap_or("?");
                 let id = document.id_attr(node).unwrap_or("");
                 println!("{name}#{id} {{");
-                if let Some(style) = page.styles.get(node) {
+                if options.winning {
+                    for decl in diagnostics::winning_declarations(page, node) {
+                        println!(
+                            "  {}: {}; /* {} */",
+                            decl.property.name(),
+                            decl.value,
+                            decl.attribution()
+                        );
+                    }
+                } else if let Some(style) = page.styles.get(node) {
                     let mut entries: Vec<(String, String)> = style
                         .iter()
                         .map(|(property, value)| {
@@ -110,14 +125,18 @@ fn run(args: &[String]) -> Result<(), String> {
         "layout" => {
             let browser = load_browser(target, &options)?;
             let layout = &browser.page().layout;
-            if let Some(root) = layout.root {
-                print_layout(layout, root, 0);
+            if options.json {
+                print!("{}", diagnostics::layout_json(layout));
+            } else {
+                if let Some(root) = layout.root {
+                    print_layout(layout, root, 0);
+                }
+                println!(
+                    "document height: {:.1}px, boxes: {}",
+                    layout.document_height,
+                    layout.boxes.len()
+                );
             }
-            println!(
-                "document height: {:.1}px, boxes: {}",
-                layout.document_height,
-                layout.boxes.len()
-            );
         }
         "commands" => {
             let browser = load_browser(target, &options)?;
@@ -184,6 +203,8 @@ struct Options {
     height: Option<f32>,
     scripting: bool,
     network: bool,
+    winning: bool,
+    json: bool,
 }
 
 impl Options {
@@ -218,6 +239,8 @@ impl Options {
                 }
                 "--script" => options.scripting = true,
                 "--network" => options.network = true,
+                "--winning" => options.winning = true,
+                "--json" => options.json = true,
                 other if other.starts_with('-') && other.len() > 1 => {
                     return Err(format!("unknown option `{other}`"));
                 }

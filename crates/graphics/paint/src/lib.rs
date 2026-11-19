@@ -33,9 +33,11 @@ pub mod display_list;
 pub mod images;
 pub mod png;
 pub mod raster;
+pub mod svg;
 
 pub use commands::{build, build_with_images, content_bounds, render, render_with_background};
 pub use decode::{DecodeError, ImageFormat, decode, decode_png, detect_format};
-pub use display_list::{DisplayCommand, DisplayList};
-pub use images::ImageData;
+pub use display_list::{DisplayCommand, DisplayList, MAX_COMMANDS};
+pub use images::{ImageData, MAX_IMAGE_DIMENSION};
 pub use raster::{ImageBuffer, Rasterizer};
+pub use svg::{rasterize, rasterize_bytes};

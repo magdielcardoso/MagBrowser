@@ -110,6 +110,31 @@ pub fn install(runtime: &mut Runtime, state: &Rc<RefCell<HostState>>) {
         })
     });
 
+    runtime.define_host_method(document.clone(), "dispatchEvent", {
+        let state = state.clone();
+        Box::new(move |runtime, _this, args| {
+            let handled = match args.first() {
+                Some(Value::Object(_)) => {
+                    crate::events::dispatch_event_object(
+                        runtime,
+                        &state,
+                        NodeId(0),
+                        args[0].clone(),
+                    )
+                    .handled
+                }
+                _ => {
+                    let event_type = args
+                        .first()
+                        .map(Value::to_string_value)
+                        .unwrap_or_else(|| "custom".to_string());
+                    crate::events::dispatch_event(runtime, &state, NodeId(0), &event_type)
+                }
+            };
+            Ok(Value::Bool(handled))
+        })
+    });
+
     runtime.define_host_method(document.clone(), "getElementsByTagName", {
         let state = state.clone();
         Box::new(move |runtime, _this, args| {
@@ -167,6 +192,19 @@ fn install_accessors(runtime: &mut Runtime, state: &Rc<RefCell<HostState>>, obje
                     Some(node) => Ok(wrap(runtime, &state, node)),
                     None => Ok(Value::Null),
                 }
+            })
+        },
+        { Box::new(|_runtime, _this, _args| Err(JsError::type_error("read-only property"))) },
+    );
+
+    runtime.define_accessor(
+        object.clone(),
+        "activeElement",
+        {
+            let state = state.clone();
+            Box::new(move |runtime, _this, _args| match state.borrow().focused {
+                Some(node) => Ok(wrap(runtime, &state, node)),
+                None => Ok(Value::Null),
             })
         },
         { Box::new(|_runtime, _this, _args| Err(JsError::type_error("read-only property"))) },

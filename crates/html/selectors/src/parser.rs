@@ -2,8 +2,8 @@
 //! pseudo-classes.
 
 use crate::{
-    AttrOp, Combinator, CompoundSelector, PseudoClass, Selector, SelectorError, SimpleSelector,
-    Specificity,
+    AttrOp, Combinator, CompoundSelector, Direction, PseudoClass, Selector, SelectorError,
+    SimpleSelector, Specificity,
 };
 
 /// Parses a single complex selector.
@@ -30,6 +30,22 @@ pub fn parse_selectors(input: &str) -> Result<Vec<Selector>, SelectorError> {
 }
 
 fn parse_list(text: &str, base: usize) -> Result<Vec<Selector>, SelectorError> {
+    parse_list_inner(text, base, false)
+}
+
+/// Parses a `<relative-selector-list>`, as accepted by functional
+/// pseudo-classes such as `:has()`. Unlike a normal selector list, each
+/// selector may begin with a combinator (`>`, `+`, `~`) describing its
+/// relationship to the element that owns the pseudo-class.
+fn parse_relative_list(text: &str, base: usize) -> Result<Vec<Selector>, SelectorError> {
+    parse_list_inner(text, base, true)
+}
+
+fn parse_list_inner(
+    text: &str,
+    base: usize,
+    allow_leading_combinator: bool,
+) -> Result<Vec<Selector>, SelectorError> {
     let mut selectors = Vec::new();
     for (start, end) in split_top_level_commas(text) {
         let part = &text[start..end];
@@ -39,7 +55,11 @@ fn parse_list(text: &str, base: usize) -> Result<Vec<Selector>, SelectorError> {
                 position: base + start,
             });
         }
-        selectors.push(parse_complex(part, base + start)?);
+        selectors.push(parse_complex_inner(
+            part,
+            base + start,
+            allow_leading_combinator,
+        )?);
     }
     if selectors.is_empty() {
         return Err(SelectorError {
@@ -93,11 +113,16 @@ fn first_top_level_comma(text: &str) -> usize {
         .map_or(text.len(), |(start, _)| start.saturating_sub(1))
 }
 
-fn parse_complex(text: &str, base: usize) -> Result<Selector, SelectorError> {
+fn parse_complex_inner(
+    text: &str,
+    base: usize,
+    allow_leading_combinator: bool,
+) -> Result<Selector, SelectorError> {
     let mut cursor = Cursor::new(text, base);
     let mut parts: Vec<(Option<Combinator>, CompoundSelector)> = Vec::new();
     let mut specificity = Specificity::default();
     let mut pending: Option<Combinator> = None;
+    let mut pseudo_element: Option<String> = None;
 
     loop {
         cursor.skip_whitespace();
@@ -111,6 +136,12 @@ fn parse_complex(text: &str, base: usize) -> Result<Selector, SelectorError> {
         let combinator_position = cursor.position();
         if let Some(combinator) = cursor.consume_combinator() {
             if parts.is_empty() {
+                if allow_leading_combinator && pending.is_none() {
+                    // A relative selector may start with a combinator; it
+                    // describes how the first compound relates to the anchor.
+                    pending = Some(combinator);
+                    continue;
+                }
                 return Err(SelectorError {
                     message: "unexpected combinator".to_string(),
                     position: combinator_position,
@@ -126,10 +157,15 @@ fn parse_complex(text: &str, base: usize) -> Result<Selector, SelectorError> {
             continue;
         }
 
-        let (compound, compound_specificity, pseudo_element) = parse_compound(&mut cursor)?;
+        let (compound, compound_specificity, compound_pseudo) = parse_compound(&mut cursor)?;
         specificity = specificity.add(compound_specificity);
+        if compound_pseudo.is_some() {
+            pseudo_element = compound_pseudo;
+        }
         if parts.is_empty() {
-            parts.push((None, compound));
+            // For relative selectors the first compound carries the leading
+            // combinator; `None` means the implicit descendant combinator.
+            parts.push((pending.take(), compound));
         } else {
             parts.push((
                 Some(pending.take().unwrap_or(Combinator::Descendant)),
@@ -137,7 +173,7 @@ fn parse_complex(text: &str, base: usize) -> Result<Selector, SelectorError> {
             ));
         }
 
-        if pseudo_element {
+        if pseudo_element.is_some() {
             cursor.skip_whitespace();
             if !cursor.at_end() {
                 return Err(cursor.error("unexpected selector after pseudo-element"));
@@ -156,15 +192,16 @@ fn parse_complex(text: &str, base: usize) -> Result<Selector, SelectorError> {
         parts,
         specificity,
         text: text.trim().to_string(),
+        pseudo_element,
     })
 }
 
 fn parse_compound(
     cursor: &mut Cursor<'_>,
-) -> Result<(CompoundSelector, Specificity, bool), SelectorError> {
+) -> Result<(CompoundSelector, Specificity, Option<String>), SelectorError> {
     let mut simples = Vec::new();
     let mut specificity = Specificity::default();
-    let mut pseudo_element = false;
+    let mut pseudo_element: Option<String> = None;
 
     match cursor.peek() {
         Some('*') => {
@@ -206,15 +243,25 @@ fn parse_compound(
                 if cursor.eat(':') {
                     let element = parse_pseudo_element(cursor)?;
                     specificity.c += 1;
+                    pseudo_element = Some(element.clone());
                     simples.push(SimpleSelector::PseudoElement(element));
-                    pseudo_element = true;
                     break;
                 }
                 match parse_pseudo(cursor)? {
                     Pseudo::Class(class) => {
                         match &class {
                             PseudoClass::Where(_) => {}
-                            PseudoClass::Not(list) | PseudoClass::Is(list) => {
+                            PseudoClass::Not(list)
+                            | PseudoClass::Is(list)
+                            | PseudoClass::Has(list) => {
+                                specificity = specificity.add(max_specificity(list));
+                            }
+                            // `:nth-child(... of S)` contributes one
+                            // pseudo-class plus the most specific selector in
+                            // its `of` argument.
+                            PseudoClass::NthChildOf(_, _, list)
+                            | PseudoClass::NthLastChildOf(_, _, list) => {
+                                specificity.b += 1;
                                 specificity = specificity.add(max_specificity(list));
                             }
                             _ => specificity.b += 1,
@@ -223,8 +270,8 @@ fn parse_compound(
                     }
                     Pseudo::Element(element) => {
                         specificity.c += 1;
+                        pseudo_element = Some(element.clone());
                         simples.push(SimpleSelector::PseudoElement(element));
-                        pseudo_element = true;
                         break;
                     }
                 }
@@ -276,15 +323,49 @@ fn parse_pseudo(cursor: &mut Cursor<'_>) -> Result<Pseudo, SelectorError> {
             "not" => PseudoClass::Not(parse_list(content, content_base)?),
             "is" => PseudoClass::Is(parse_list(content, content_base)?),
             "where" => PseudoClass::Where(parse_list(content, content_base)?),
+            "has" => PseudoClass::Has(parse_relative_list(content, content_base)?),
             "nth-child" => {
-                let (a, b) = parse_nth(content, content_base)?;
-                PseudoClass::NthChild(a, b)
+                let (formula, of) = split_nth_of(content, content_base);
+                let (a, b) = parse_nth(formula, content_base)?;
+                match of {
+                    Some((list, list_base)) => {
+                        PseudoClass::NthChildOf(a, b, parse_list(list, list_base)?)
+                    }
+                    None => PseudoClass::NthChild(a, b),
+                }
             }
             "nth-last-child" => {
+                let (formula, of) = split_nth_of(content, content_base);
+                let (a, b) = parse_nth(formula, content_base)?;
+                match of {
+                    Some((list, list_base)) => {
+                        PseudoClass::NthLastChildOf(a, b, parse_list(list, list_base)?)
+                    }
+                    None => PseudoClass::NthLastChild(a, b),
+                }
+            }
+            "nth-of-type" => {
                 let (a, b) = parse_nth(content, content_base)?;
-                PseudoClass::NthLastChild(a, b)
+                PseudoClass::NthOfType(a, b)
+            }
+            "nth-last-of-type" => {
+                let (a, b) = parse_nth(content, content_base)?;
+                PseudoClass::NthLastOfType(a, b)
             }
             "lang" => PseudoClass::Lang(unquote(content.trim()).to_string()),
+            "dir" => {
+                let value = unquote(content.trim()).to_ascii_lowercase();
+                match value.as_str() {
+                    "ltr" => PseudoClass::Dir(Direction::Ltr),
+                    "rtl" => PseudoClass::Dir(Direction::Rtl),
+                    _ => {
+                        return Err(SelectorError {
+                            message: format!("invalid direction ':dir({value})'"),
+                            position: start,
+                        });
+                    }
+                }
+            }
             _ => {
                 return Err(SelectorError {
                     message: format!("unknown pseudo-class ':{name}'"),
@@ -317,6 +398,21 @@ fn parse_pseudo(cursor: &mut Cursor<'_>) -> Result<Pseudo, SelectorError> {
         "disabled" => PseudoClass::Disabled,
         "enabled" => PseudoClass::Enabled,
         "any-link" => PseudoClass::AnyLink,
+        "target" => PseudoClass::Target,
+        "focus-visible" => PseudoClass::FocusVisible,
+        "focus-within" => PseudoClass::FocusWithin,
+        "valid" => PseudoClass::Valid,
+        "invalid" => PseudoClass::Invalid,
+        "required" => PseudoClass::Required,
+        "optional" => PseudoClass::Optional,
+        "placeholder-shown" => PseudoClass::PlaceholderShown,
+        "read-only" => PseudoClass::ReadOnly,
+        "read-write" => PseudoClass::ReadWrite,
+        "host" => PseudoClass::Host,
+        "defined" => PseudoClass::Defined,
+        "modal" => PseudoClass::Modal,
+        "autofill" => PseudoClass::Autofill,
+        "user-invalid" => PseudoClass::UserInvalid,
         _ => {
             return Err(SelectorError {
                 message: format!("unknown pseudo-class ':{name}'"),
@@ -427,14 +523,26 @@ fn parse_attribute(cursor: &mut Cursor<'_>) -> Result<SimpleSelector, SelectorEr
     })
 }
 
+/// Splits the `of S` clause off an `:nth-child()` / `:nth-last-child()`
+/// argument. The returned slice and offset describe the selector list so error
+/// positions stay relative to the original input.
+fn split_nth_of(content: &str, content_base: usize) -> (&str, Option<(&str, usize)>) {
+    let lowered = content.to_ascii_lowercase();
+    if let Some(index) = lowered.find(" of ") {
+        let list_start = index + " of ".len();
+        (
+            &content[..index],
+            Some((&content[list_start..], content_base + list_start)),
+        )
+    } else {
+        (content, None)
+    }
+}
+
+/// Parses the `an+b` part of an `:nth-*()` argument. `content` must not contain
+/// an `of S` clause; use [`split_nth_of`] first.
 fn parse_nth(content: &str, base: usize) -> Result<(i32, i32), SelectorError> {
-    let trimmed = content.trim();
-    let lowered = trimmed.to_ascii_lowercase();
-    let formula = match lowered.find(" of ") {
-        Some(index) => &trimmed[..index],
-        None => trimmed,
-    };
-    let compact: String = formula
+    let compact: String = content
         .chars()
         .filter(|character| !character.is_whitespace())
         .collect::<String>()
@@ -908,7 +1016,77 @@ mod tests {
         let parsed = selector(":nth-child(2n+1 of .item)");
         assert_eq!(
             parsed.parts[0].1.simples[0],
+            SimpleSelector::Pseudo(PseudoClass::NthChildOf(
+                2,
+                1,
+                vec![parse_selector(".item").unwrap()]
+            ))
+        );
+        // :nth-child keeps its original shape when there is no `of` clause.
+        assert_eq!(
+            selector(":nth-child(2n+1)").parts[0].1.simples[0],
             SimpleSelector::Pseudo(PseudoClass::NthChild(2, 1))
+        );
+    }
+
+    #[test]
+    fn parses_nth_of_clause_variants() {
+        let parsed = selector(":nth-last-child(2 of li.foo, div)");
+        let SimpleSelector::Pseudo(PseudoClass::NthLastChildOf(a, b, list)) =
+            &parsed.parts[0].1.simples[0]
+        else {
+            panic!("expected :nth-last-child of");
+        };
+        assert_eq!((*a, *b), (0, 2));
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].text, "li.foo");
+        assert_eq!(list[1].text, "div");
+    }
+
+    #[test]
+    fn rejects_invalid_of_clause_and_direction() {
+        assert!(parse_selector(":nth-child(2n of)").is_err());
+        assert!(parse_selector(":dir(auto)").is_err());
+        assert!(parse_selector(":dir(up)").is_err());
+    }
+
+    #[test]
+    fn parses_new_pseudo_classes() {
+        for (text, expected) in [
+            (":focus-visible", PseudoClass::FocusVisible),
+            (":focus-within", PseudoClass::FocusWithin),
+            (":valid", PseudoClass::Valid),
+            (":invalid", PseudoClass::Invalid),
+            (":required", PseudoClass::Required),
+            (":optional", PseudoClass::Optional),
+            (":placeholder-shown", PseudoClass::PlaceholderShown),
+            (":read-only", PseudoClass::ReadOnly),
+            (":read-write", PseudoClass::ReadWrite),
+            (":host", PseudoClass::Host),
+            (":defined", PseudoClass::Defined),
+            (":modal", PseudoClass::Modal),
+            (":autofill", PseudoClass::Autofill),
+            (":user-invalid", PseudoClass::UserInvalid),
+            (":dir(ltr)", PseudoClass::Dir(Direction::Ltr)),
+            (":dir(RTL)", PseudoClass::Dir(Direction::Rtl)),
+        ] {
+            assert_eq!(
+                selector(text).parts[0].1.simples[0],
+                SimpleSelector::Pseudo(expected),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn nth_of_clause_contributes_to_specificity() {
+        assert_eq!(
+            selector(":nth-child(2n of .item)").specificity,
+            Specificity::new(0, 2, 0)
+        );
+        assert_eq!(
+            selector(":nth-child(2n)").specificity,
+            Specificity::new(0, 1, 0)
         );
     }
 
@@ -927,6 +1105,88 @@ mod tests {
             selector(":where(a)").parts[0].1.simples[0],
             SimpleSelector::Pseudo(PseudoClass::Where(_))
         ));
+    }
+
+    #[test]
+    fn parses_has_relative_selectors() {
+        let parsed = selector(":has(> .child)");
+        let SimpleSelector::Pseudo(PseudoClass::Has(list)) = &parsed.parts[0].1.simples[0] else {
+            panic!("expected :has");
+        };
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].parts.len(), 1);
+        assert_eq!(list[0].parts[0].0, Some(Combinator::Child));
+        assert_eq!(
+            list[0].parts[0].1.simples,
+            vec![SimpleSelector::Class("child".into())]
+        );
+
+        let parsed = selector(":has(.a .b, + .next, ~ .later)");
+        let SimpleSelector::Pseudo(PseudoClass::Has(list)) = &parsed.parts[0].1.simples[0] else {
+            panic!("expected :has");
+        };
+        assert_eq!(list.len(), 3);
+        // Implicit descendant leading combinator is stored as `None`.
+        assert_eq!(list[0].parts[0].0, None);
+        assert_eq!(list[0].parts.len(), 2);
+        assert_eq!(list[0].parts[1].0, Some(Combinator::Descendant));
+        assert_eq!(list[1].parts[0].0, Some(Combinator::NextSibling));
+        assert_eq!(list[2].parts[0].0, Some(Combinator::SubsequentSibling));
+    }
+
+    #[test]
+    fn parses_nth_of_type_formulas() {
+        for (text, expected) in [
+            (":nth-of-type(odd)", PseudoClass::NthOfType(2, 1)),
+            (":nth-of-type(even)", PseudoClass::NthOfType(2, 0)),
+            (":nth-of-type(2n+1)", PseudoClass::NthOfType(2, 1)),
+            (":nth-of-type(0n+3)", PseudoClass::NthOfType(0, 3)),
+            (":nth-of-type(4)", PseudoClass::NthOfType(0, 4)),
+            (":nth-last-of-type(-n+2)", PseudoClass::NthLastOfType(-1, 2)),
+            (
+                ":nth-last-of-type(3n - 1)",
+                PseudoClass::NthLastOfType(3, -1),
+            ),
+        ] {
+            assert_eq!(
+                selector(text).parts[0].1.simples[0],
+                SimpleSelector::Pseudo(expected),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn parses_target_pseudo_class() {
+        assert_eq!(
+            selector("section:target").parts[0].1.simples[1],
+            SimpleSelector::Pseudo(PseudoClass::Target)
+        );
+        assert_eq!(selector(":target").specificity, Specificity::new(0, 1, 0));
+    }
+
+    #[test]
+    fn has_specificity_is_the_most_specific_argument() {
+        assert_eq!(
+            selector(":has(.a, #b)").specificity,
+            Specificity::new(1, 0, 0)
+        );
+        assert_eq!(
+            selector("div:has(> .a)").specificity,
+            Specificity::new(0, 1, 1)
+        );
+        // :where always contributes nothing, even around :has.
+        assert_eq!(
+            selector(":where(:has(#a)) div").specificity,
+            Specificity::new(0, 0, 1)
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_relative_selectors() {
+        for text in [":has(>)", ":has(a,)", ":has(+ )", ":has(> > a)"] {
+            assert!(parse_selector(text).is_err(), "{text} unexpectedly parsed");
+        }
     }
 
     #[test]
@@ -960,6 +1220,22 @@ mod tests {
             SimpleSelector::PseudoElement("part".into())
         );
         assert_eq!(selector("p::before").specificity, Specificity::new(0, 0, 2));
+    }
+
+    #[test]
+    fn stores_pseudo_element_flag_on_selector() {
+        assert_eq!(
+            selector("p::before").pseudo_element.as_deref(),
+            Some("before")
+        );
+        assert_eq!(selector("p:after").pseudo_element.as_deref(), Some("after"));
+        assert_eq!(
+            selector("div.box::first-line").pseudo_element.as_deref(),
+            Some("first-line")
+        );
+        assert_eq!(selector("p::before").pseudo_element, Some("before".into()));
+        assert_eq!(selector("p.icon").pseudo_element, None);
+        assert_eq!(selector("p:hover").pseudo_element, None);
     }
 
     #[test]

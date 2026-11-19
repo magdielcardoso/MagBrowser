@@ -38,14 +38,27 @@ impl HttpCache {
     }
 
     /// Returns a fresh cached response for `url`.
+    ///
+    /// Expired entries are kept (rather than dropped) so a stale response with
+    /// a validator can be revalidated with `If-None-Match`.
     pub fn get(&mut self, url: &str) -> Option<Response> {
         let entry = self.entries.get(url)?;
         if entry.stored_at.elapsed() >= entry.ttl {
-            let removed = self.entries.remove(url)?;
-            self.bytes = self.bytes.saturating_sub(removed.size);
             return None;
         }
         Some(entry.response.clone())
+    }
+
+    /// Returns any stored response for `url`, fresh or stale.
+    pub fn get_stored(&self, url: &str) -> Option<Response> {
+        self.entries.get(url).map(|entry| entry.response.clone())
+    }
+
+    /// Returns the `ETag` of a stored response for conditional revalidation.
+    pub fn revalidation_etag(&self, url: &str) -> Option<String> {
+        self.entries
+            .get(url)
+            .and_then(|entry| entry.response.etag().map(str::to_string))
     }
 
     /// Stores `response` if its `Cache-Control` allows caching.
@@ -53,9 +66,6 @@ impl HttpCache {
         let Some(ttl) = cache_ttl(response) else {
             return;
         };
-        if ttl.is_zero() {
-            return;
-        }
         let size = response.body.len() + 256;
         if size > self.max_bytes {
             return;
@@ -109,27 +119,37 @@ impl HttpCache {
 }
 
 /// Computes the freshness lifetime of a response, or `None` when it must not be cached.
+///
+/// A zero lifetime means the entry is stored but always revalidated: this is
+/// how `no-cache`, `max-age=0` and validator-only responses are handled.
 pub fn cache_ttl(response: &Response) -> Option<Duration> {
     if !response.is_success() {
         return None;
     }
-    let cc = response.headers.get("Cache-Control")?.to_ascii_lowercase();
-    if cc.contains("no-store") {
+    let cc = response
+        .headers
+        .get("Cache-Control")
+        .map(str::to_ascii_lowercase);
+    if cc.as_deref().is_some_and(|cc| cc.contains("no-store")) {
         return None;
     }
-    let mut ttl = Duration::ZERO;
+    let Some(cc) = cc else {
+        // ETag-only responses are still worth keeping for revalidation.
+        return response.etag().map(|_| Duration::ZERO);
+    };
+    let mut ttl = None;
     for directive in cc.split(',') {
         let directive = directive.trim();
         if directive == "no-cache" {
-            return None;
+            return Some(Duration::ZERO);
         }
         if let Some(value) = directive.strip_prefix("max-age=")
             && let Ok(secs) = value.trim().trim_matches('"').parse::<u64>()
         {
-            ttl = Duration::from_secs(secs);
+            ttl = Some(Duration::from_secs(secs));
         }
     }
-    Some(ttl)
+    Some(ttl.unwrap_or(Duration::ZERO))
 }
 
 #[cfg(test)]
@@ -159,6 +179,31 @@ mod tests {
         assert!(cache.get("http://a.test/none").is_none());
         cache.store("http://a.test/zero", &response("max-age=0"));
         assert!(cache.get("http://a.test/zero").is_none());
+    }
+
+    #[test]
+    fn stores_no_cache_responses_for_revalidation() {
+        let mut response = response("no-cache, max-age=60");
+        response.headers.insert("ETag", "\"v1\"");
+        let mut cache = HttpCache::default();
+        cache.store("http://a.test/", &response);
+        assert!(cache.get("http://a.test/").is_none());
+        assert_eq!(
+            cache.revalidation_etag("http://a.test/").as_deref(),
+            Some("\"v1\"")
+        );
+        assert_eq!(cache.get_stored("http://a.test/").unwrap().body, b"body");
+    }
+
+    #[test]
+    fn etag_only_responses_are_revalidated() {
+        let mut response = response("no-store");
+        response.headers.remove("Cache-Control");
+        response.headers.insert("ETag", "\"x\"");
+        let mut cache = HttpCache::default();
+        cache.store("http://a.test/", &response);
+        assert!(cache.get_stored("http://a.test/").is_some());
+        assert!(cache.get("http://a.test/").is_none());
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! Address bar model: the text shown to the user and the URL it resolves to.
 
 use browser_core::Browser;
+use browser_text::Font;
 
 /// The visible slice of the address text, plus the caret column inside it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -119,33 +120,48 @@ impl AddressBar {
         self.caret = self.text.chars().count();
     }
 
-    /// Computes the text slice that fits in `max_chars` characters.
+    /// Computes the visible slice that fits in `max_width` measured pixels.
     ///
-    /// The caret always stays visible; anything cut from the left is replaced
-    /// by a single ellipsis. This is what the chrome renderer draws.
-    pub fn visible(&self, max_chars: usize) -> VisibleAddress {
+    /// Uses the real (proportional) advances so a long URL never overflows the
+    /// address field, and keeps the caret in view while typing.
+    pub fn visible_width(&self, max_width: f32, font: &Font, px: f32) -> VisibleAddress {
         let chars: Vec<char> = self.text.chars().collect();
         let len = chars.len();
-        if max_chars == 0 {
+        let caret = self.caret.min(len);
+        let advances: Vec<f32> = chars.iter().map(|&ch| font.advance(ch, px)).collect();
+        let total: f32 = advances.iter().sum();
+        if max_width <= 0.0 {
             return VisibleAddress {
                 text: String::new(),
                 caret_col: 0,
             };
         }
-        if len <= max_chars {
+        if total <= max_width {
             return VisibleAddress {
                 text: self.text.clone(),
-                caret_col: self.caret.min(len),
+                caret_col: caret,
             };
         }
-        let content = max_chars.saturating_sub(1).max(1);
-        let caret = self.caret.min(len);
+        let ellipsis = font.measure("\u{2026}", px);
+        let available = (max_width - ellipsis).max(0.0);
+        let width_of =
+            |from: usize, to: usize| -> f32 { advances[from.min(len)..to.min(len)].iter().sum() };
+
         let mut start = 0;
-        let mut end = max_chars.min(len);
+        let mut end = 0;
+        while end < len && width_of(0, end + 1) <= available {
+            end += 1;
+        }
         if caret > end {
-            end = caret.max(content).min(len);
-            start = end.saturating_sub(content);
-            while end < len && end - start < content {
+            // Keep the caret visible by trimming characters from the left.
+            start = caret;
+            while start > 0 && width_of(start - 1, caret) <= available {
+                start -= 1;
+            }
+            end = caret;
+            let mut room = available - width_of(start, end);
+            while end < len && room >= advances[end] {
+                room -= advances[end];
                 end += 1;
             }
         }
@@ -203,19 +219,23 @@ mod tests {
 
     #[test]
     fn long_addresses_trim_from_the_left() {
+        let font = browser_text::Font::sans();
+        let px = 14.0;
         let mut bar = AddressBar::new();
         bar.set("0123456789");
-        let visible = bar.visible(5);
-        assert_eq!(visible.text, "\u{2026}6789");
-        assert_eq!(visible.caret_col, 5);
-        assert_eq!(visible.text.chars().count(), 5);
+        let visible = bar.visible_width(font.measure("012", px), font, px);
+        assert!(visible.text.starts_with('\u{2026}'));
+        assert!(visible.text.len() < bar.text().len());
+        assert!(font.measure(&visible.text, px) <= font.measure("0123", px) + 0.01);
     }
 
     #[test]
     fn short_addresses_are_shown_whole() {
+        let font = browser_text::Font::sans();
+        let px = 14.0;
         let mut bar = AddressBar::new();
         bar.set("mag.dev");
-        let visible = bar.visible(20);
+        let visible = bar.visible_width(200.0, font, px);
         assert_eq!(visible.text, "mag.dev");
         assert_eq!(visible.caret_col, 7);
     }

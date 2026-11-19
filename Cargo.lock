@@ -160,6 +160,7 @@ name = "browser-cli"
 version = "0.1.0"
 dependencies = [
  "browser-core",
+ "browser-css",
  "browser-dom",
  "browser-html-parser",
  "browser-layout",
@@ -230,6 +231,10 @@ name = "browser-headless"
 version = "0.1.0"
 dependencies = [
  "browser-core",
+ "browser-html-parser",
+ "browser-layout",
+ "browser-paint",
+ "browser-style",
 ]
 
 [[package]]
@@ -315,6 +320,7 @@ dependencies = [
 name = "browser-selectors"
 version = "0.1.0"
 dependencies = [
+ "browser-css",
  "browser-dom",
 ]
 

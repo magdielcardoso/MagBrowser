@@ -19,6 +19,8 @@ pub enum Punct {
     Dot,
     Colon,
     Question,
+    /// `?.` optional chaining.
+    QuestionDot,
     Arrow,
     Ellipsis,
     Plus,
@@ -78,6 +80,7 @@ impl Punct {
             Self::Dot => ".",
             Self::Colon => ":",
             Self::Question => "?",
+            Self::QuestionDot => "?.",
             Self::Arrow => "=>",
             Self::Ellipsis => "...",
             Self::Plus => "+",
@@ -750,6 +753,11 @@ impl<'a> Lexer<'a> {
             ':' => (Punct::Colon, 0),
             '?' => match next {
                 Some('?') => (Punct::QuestionQuestion, 1),
+                // `?.` is not an optional chain when a decimal digit follows the
+                // dot: `a?.3:0` is a conditional expression with the number `.3`.
+                Some('.') if !next2.is_some_and(|ch| ch.is_ascii_digit()) => {
+                    (Punct::QuestionDot, 1)
+                }
                 _ => (Punct::Question, 0),
             },
             '.' => {

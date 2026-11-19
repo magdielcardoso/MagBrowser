@@ -70,7 +70,7 @@ pub fn run(self_check: &SelfCheck) -> Result<(), String> {
 
     let tab_count = browser.tabs().len();
     chrome = ChromeLayout::new(size, tab_count, ui.status);
-    let image = render_window(&browser, &ui, &chrome);
+    let image = render_window(&browser, &ui, &chrome, 1.0);
     save_png(&image, &self_check.output)
 }
 

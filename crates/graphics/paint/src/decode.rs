@@ -32,13 +32,30 @@
 //!   zero the image is treated as fully opaque, matching the common practice of
 //!   BMP writers that leave the padding byte unset. Other bit depths and
 //!   compressed BMP variants are reported as unsupported.
+//! * **PPM / PGM** — the binary Netpbm formats `P6` (RGB) and `P5` (grey),
+//!   including header comments, 1- and 2-byte samples (`maxval` up to 65535)
+//!   and scaling to RGBA8. The ASCII variants (`P1`–`P4`) and `PAM` (`P7`) are
+//!   not supported.
+//! * **ICO** — Windows icon files. The first PNG-encoded directory entry is
+//!   decoded by the PNG decoder above; icon entries that contain a DIB instead
+//!   of a PNG are reported as unsupported.
+//! * **SVG** — XML vector images are rasterized by [`crate::svg`] into RGBA8,
+//!   including gradients and patterns referenced with `url(#id)`.
+//! * **JPEG** — baseline sequential DCT JPEG (SOF0), in greyscale and colour.
+//!   8-bit samples, 4:4:4 / 4:2:2 / 4:2:0 (and other legal 1..=4 sampling
+//!   factor combinations) with nearest-neighbour chroma upsampling, Huffman
+//!   entropy coding, restart intervals and 8- or 16-bit quantization tables
+//!   are supported. Progressive (SOF2), extended-sequential (SOF1), lossless,
+//!   arithmetic-coded and 12-bit JPEGs are reported as unsupported.
 //!
 //! # Unsupported formats
 //!
-//! JPEG and WebP are detected and reported as unsupported. Animated GIF
+//! WebP and AVIF are detected and reported as unsupported with a
+//! [`DecodeError`], never silently decoded as garbage. Progressive and other
+//! non-baseline JPEG modes are likewise reported as unsupported. Animated GIF
 //! frames after the first, APNG animation, and 16-bit PNG samples are not
-//! decoded. [`detect_format`] lets callers choose a fallback without
-//! attempting a decode.
+//! decoded. [`detect_format`] lets callers choose a fallback without attempting
+//! a decode.
 
 use std::fmt;
 
@@ -47,14 +64,16 @@ use crate::images::ImageData;
 /// Largest accepted image edge, in pixels.
 ///
 /// Anything larger is rejected before allocating so a hostile file cannot
-/// exhaust memory.
-const MAX_DIMENSION: u32 = 16_384;
+/// exhaust memory. Kept identical to the constructor cap enforced by
+/// [`ImageData::from_rgba`] so decoders fail early instead of building a large
+/// intermediate buffer that would be rejected at the end anyway.
+const MAX_DIMENSION: u32 = crate::images::MAX_IMAGE_DIMENSION;
 
 /// Largest accepted pixel count, in pixels.
 ///
-/// This is a second line of defence: a `16384x16384` image is within the
-/// per-edge limit but would need a gigabyte of RGBA, so files are also capped
-/// on total area before anything is allocated.
+/// A second line of defence on total area before anything is allocated. With a
+/// 4096-pixel edge cap the largest possible image is 16.7M pixels (64 MiB), so
+/// this bound is generous but cheap to check.
 const MAX_PIXELS: u64 = 64 * 1024 * 1024;
 
 fn check_pixel_count(width: u32, height: u32, format: &str) -> Result<(), DecodeError> {
@@ -76,10 +95,18 @@ pub enum ImageFormat {
     Gif,
     /// BMP (Windows bitmap).
     Bmp,
+    /// PPM (`P6`) or PGM (`P5`) binary Netpbm image.
+    Pnm,
+    /// ICO (Windows icon) container.
+    Ico,
     /// JPEG (JFIF/EXIF).
     Jpeg,
     /// WebP (RIFF container).
     Webp,
+    /// AVIF (ISO BMFF container).
+    Avif,
+    /// SVG (XML vector image).
+    Svg,
 }
 
 /// An error raised while detecting or decoding image data.
@@ -111,6 +138,43 @@ impl fmt::Display for DecodeError {
 
 impl std::error::Error for DecodeError {}
 
+/// Whether `bytes` looks like an SVG document.
+///
+/// SVG has no single magic number: a document may start with a UTF-8 BOM, an
+/// XML declaration, comments and whitespace before its root `<svg>` element.
+/// Only a short prefix is inspected so arbitrary text is not scanned wholesale.
+fn looks_like_svg(bytes: &[u8]) -> bool {
+    let mut rest = bytes;
+    if rest.starts_with(&[0xef, 0xbb, 0xbf]) {
+        rest = &rest[3..];
+    }
+    let prefix_end = rest.len().min(1024);
+    rest = &rest[..prefix_end];
+    loop {
+        rest = rest.trim_ascii_start();
+        if let Some(after) = rest.strip_prefix(b"<?xml") {
+            // Skip to the end of the XML declaration, if it is closed.
+            match after.windows(2).position(|window| window == b"?>") {
+                Some(index) => {
+                    rest = &after[index + 2..];
+                    continue;
+                }
+                None => return false,
+            }
+        }
+        if let Some(after) = rest.strip_prefix(b"<!--") {
+            match after.windows(3).position(|window| window == b"-->") {
+                Some(index) => {
+                    rest = &after[index + 3..];
+                    continue;
+                }
+                None => return false,
+            }
+        }
+        return rest.starts_with(b"<svg");
+    }
+}
+
 /// Detects the container format from magic bytes, or `None` when unknown.
 pub fn detect_format(bytes: &[u8]) -> Option<ImageFormat> {
     const PNG: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
@@ -126,8 +190,31 @@ pub fn detect_format(bytes: &[u8]) -> Option<ImageFormat> {
     if bytes.starts_with(b"BM") {
         return Some(ImageFormat::Bmp);
     }
+    // Binary Netpbm images: "P5" (PGM) and "P6" (PPM), followed by whitespace.
+    if bytes.len() >= 3
+        && bytes[0] == b'P'
+        && (bytes[1] == b'5' || bytes[1] == b'6')
+        && bytes[2].is_ascii_whitespace()
+    {
+        return Some(ImageFormat::Pnm);
+    }
+    // ICO: reserved = 0, type = 1 (icon). CUR images use type = 2 and are not
+    // recognised as images here.
+    if bytes.len() >= 4 && bytes.starts_with(&[0x00, 0x00, 0x01, 0x00]) {
+        return Some(ImageFormat::Ico);
+    }
     if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
         return Some(ImageFormat::Webp);
+    }
+    // AVIF is an ISO BMFF file whose `ftyp` box carries an `avif`/`avis` brand.
+    if bytes.len() >= 12
+        && &bytes[4..8] == b"ftyp"
+        && (&bytes[8..12] == b"avif" || &bytes[8..12] == b"avis")
+    {
+        return Some(ImageFormat::Avif);
+    }
+    if looks_like_svg(bytes) {
+        return Some(ImageFormat::Svg);
     }
     None
 }
@@ -138,14 +225,28 @@ pub fn decode(bytes: &[u8]) -> Result<ImageData, DecodeError> {
         Some(ImageFormat::Png) => decode_png(bytes),
         Some(ImageFormat::Bmp) => decode_bmp(bytes),
         Some(ImageFormat::Gif) => decode_gif(bytes),
-        Some(ImageFormat::Jpeg) => Err(DecodeError::unsupported(
-            "JPEG (baseline and progressive decoding are not implemented)",
-        )),
+        Some(ImageFormat::Pnm) => decode_pnm(bytes),
+        Some(ImageFormat::Ico) => decode_ico(bytes),
+        Some(ImageFormat::Jpeg) => decode_jpeg(bytes),
         Some(ImageFormat::Webp) => Err(DecodeError::unsupported(
             "WebP (VP8/VP8L decoding is not implemented)",
         )),
+        Some(ImageFormat::Avif) => Err(DecodeError::unsupported(
+            "AVIF (AV1 decoding is not implemented)",
+        )),
+        Some(ImageFormat::Svg) => decode_svg(bytes),
         None => Err(DecodeError::new("unrecognised image format")),
     }
+}
+
+/// Rasterizes an SVG payload (a `.svg` file or a sniffed SVG data URL).
+///
+/// Both the magic-byte dispatcher above and callers that already know the
+/// payload is SVG can use this entry point. Rendering failures become a
+/// [`DecodeError`] just like any other decoder failure.
+pub fn decode_svg(bytes: &[u8]) -> Result<ImageData, DecodeError> {
+    let buffer = crate::svg::rasterize_bytes(bytes)?;
+    ImageData::from_rgba(buffer.width, buffer.height, buffer.pixels)
 }
 
 // ---------------------------------------------------------------------------
@@ -1585,6 +1686,867 @@ fn decode_bmp(bytes: &[u8]) -> Result<ImageData, DecodeError> {
         }
     }
     ImageData::from_rgba(width, height, pixels)
+}
+
+// ---------------------------------------------------------------------------
+// PPM / PGM (binary Netpbm, P5 and P6)
+// ---------------------------------------------------------------------------
+
+/// Reads the whitespace-separated numeric tokens of a Netpbm header.
+struct PnmHeaderReader<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> PnmHeaderReader<'a> {
+    fn new(data: &'a [u8], pos: usize) -> Self {
+        Self { data, pos }
+    }
+
+    /// Skips ASCII whitespace and `#` comments, which run to the end of a line.
+    fn skip_space(&mut self) {
+        while let Some(&byte) = self.data.get(self.pos) {
+            match byte {
+                _ if byte.is_ascii_whitespace() => self.pos += 1,
+                b'#' => {
+                    while let Some(&comment_byte) = self.data.get(self.pos) {
+                        if comment_byte == b'\n' || comment_byte == b'\r' {
+                            break;
+                        }
+                        self.pos += 1;
+                    }
+                }
+                _ => break,
+            }
+        }
+    }
+
+    /// Reads one unsigned decimal token, rejecting missing or non-numeric data.
+    fn read_number(&mut self, name: &str) -> Result<u32, DecodeError> {
+        self.skip_space();
+        let start = self.pos;
+        while self
+            .data
+            .get(self.pos)
+            .is_some_and(|byte| byte.is_ascii_digit())
+        {
+            self.pos += 1;
+        }
+        if start == self.pos {
+            return Err(DecodeError::new(format!("missing PNM {name} value")));
+        }
+        let token = std::str::from_utf8(&self.data[start..self.pos])
+            .map_err(|_| DecodeError::new(format!("invalid PNM {name} value")))?;
+        token
+            .parse::<u32>()
+            .map_err(|_| DecodeError::new(format!("invalid PNM {name} value")))
+    }
+
+    /// Consumes the single whitespace byte separating the header from the
+    /// raster. Netpbm permits comments only before that byte, so exactly one is
+    /// consumed: the raster itself may legitimately contain whitespace bytes.
+    fn finish_header(&mut self) -> Result<usize, DecodeError> {
+        let byte = *self
+            .data
+            .get(self.pos)
+            .ok_or_else(|| DecodeError::new("missing PNM raster data"))?;
+        if !byte.is_ascii_whitespace() {
+            return Err(DecodeError::new("missing whitespace after PNM header"));
+        }
+        self.pos += 1;
+        Ok(self.pos)
+    }
+}
+
+/// Decodes a binary Netpbm image (`P5` greyscale or `P6` RGB) into RGBA8.
+fn decode_pnm(bytes: &[u8]) -> Result<ImageData, DecodeError> {
+    if bytes.len() < 3 || bytes[0] != b'P' || (bytes[1] != b'5' && bytes[1] != b'6') {
+        return Err(DecodeError::new("not a binary PPM/PGM file"));
+    }
+    let colour = bytes[1] == b'6';
+    let channels = if colour { 3_usize } else { 1 };
+
+    let mut reader = PnmHeaderReader::new(bytes, 2);
+    let width = reader.read_number("width")?;
+    let height = reader.read_number("height")?;
+    let max_value = reader.read_number("maxval")?;
+
+    if width == 0 || height == 0 {
+        return Err(DecodeError::new("PNM has a zero dimension"));
+    }
+    if width > MAX_DIMENSION || height > MAX_DIMENSION {
+        return Err(DecodeError::new(format!(
+            "PNM dimensions {width}x{height} exceed the {MAX_DIMENSION} pixel limit"
+        )));
+    }
+    check_pixel_count(width, height, "PNM")?;
+    if max_value == 0 || max_value > 65535 {
+        return Err(DecodeError::new(format!("invalid PNM maxval {max_value}")));
+    }
+
+    let raster_start = reader.finish_header()?;
+    let sample_bytes = if max_value > 255 { 2_usize } else { 1 };
+    let width_usize = width as usize;
+    let height_usize = height as usize;
+    let pixel_count = width_usize
+        .checked_mul(height_usize)
+        .ok_or_else(|| DecodeError::new("PNM image size overflow"))?;
+    let raster_len = pixel_count
+        .checked_mul(channels)
+        .and_then(|samples| samples.checked_mul(sample_bytes))
+        .ok_or_else(|| DecodeError::new("PNM raster size overflow"))?;
+    let raster_end = raster_start
+        .checked_add(raster_len)
+        .ok_or_else(|| DecodeError::new("PNM raster size overflow"))?;
+    if raster_end > bytes.len() {
+        return Err(DecodeError::new("truncated PNM raster data"));
+    }
+    let raster = &bytes[raster_start..raster_end];
+
+    let scale = |value: u32| -> u8 { ((u64::from(value) * 255) / u64::from(max_value)) as u8 };
+    let mut pixels = vec![0_u8; pixel_count * 4];
+    for pixel in 0..pixel_count {
+        let mut components = [0_u8; 3];
+        for (channel, component) in components.iter_mut().enumerate().take(channels) {
+            let offset = (pixel * channels + channel) * sample_bytes;
+            let value = if sample_bytes == 1 {
+                u32::from(raster[offset])
+            } else {
+                (u32::from(raster[offset]) << 8) | u32::from(raster[offset + 1])
+            };
+            if value > max_value {
+                return Err(DecodeError::new("PNM sample exceeds maxval"));
+            }
+            *component = scale(value);
+        }
+        let target = pixel * 4;
+        if colour {
+            pixels[target..target + 4].copy_from_slice(&[
+                components[0],
+                components[1],
+                components[2],
+                255,
+            ]);
+        } else {
+            let grey = components[0];
+            pixels[target..target + 4].copy_from_slice(&[grey, grey, grey, 255]);
+        }
+    }
+
+    ImageData::from_rgba(width, height, pixels)
+}
+
+// ---------------------------------------------------------------------------
+// ICO
+// ---------------------------------------------------------------------------
+
+/// Decodes the first PNG-encoded entry of an ICO (Windows icon) file.
+///
+/// The icon directory is only a container; the embedded PNG is handed to the
+/// PNG decoder above. Entries holding a DIB (BMP) rather than a PNG are reported
+/// as unsupported instead of being mis-parsed.
+fn decode_ico(bytes: &[u8]) -> Result<ImageData, DecodeError> {
+    if bytes.len() < 6 {
+        return Err(DecodeError::new("truncated ICO header"));
+    }
+    if bytes[0..2] != [0, 0] || u16::from_le_bytes([bytes[2], bytes[3]]) != 1 {
+        return Err(DecodeError::new("not an ICO file"));
+    }
+    let count = usize::from(u16::from_le_bytes([bytes[4], bytes[5]]));
+    if count == 0 {
+        return Err(DecodeError::new("ICO contains no image entries"));
+    }
+    let table_end = 6_usize
+        .checked_add(
+            count
+                .checked_mul(16)
+                .ok_or_else(|| DecodeError::new("ICO directory size overflow"))?,
+        )
+        .ok_or_else(|| DecodeError::new("ICO directory size overflow"))?;
+    if table_end > bytes.len() {
+        return Err(DecodeError::new("truncated ICO directory"));
+    }
+
+    let mut saw_dib = false;
+    for index in 0..count {
+        let entry_start = 6 + index * 16;
+        let entry = &bytes[entry_start..entry_start + 16];
+        let size = u32::from_le_bytes([entry[8], entry[9], entry[10], entry[11]]) as usize;
+        let offset = u32::from_le_bytes([entry[12], entry[13], entry[14], entry[15]]) as usize;
+        if size == 0 || offset == 0 {
+            continue;
+        }
+        let end = offset
+            .checked_add(size)
+            .ok_or_else(|| DecodeError::new("ICO entry size overflow"))?;
+        if end > bytes.len() {
+            return Err(DecodeError::new("ICO entry points outside the file"));
+        }
+        let payload = &bytes[offset..end];
+        if payload.starts_with(&PNG_SIGNATURE) {
+            return decode_png(payload);
+        }
+        saw_dib = true;
+    }
+
+    if saw_dib {
+        Err(DecodeError::unsupported(
+            "ICO entries that contain a DIB (BMP) instead of PNG",
+        ))
+    } else {
+        Err(DecodeError::new("ICO contains no decodable image entry"))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// JPEG (baseline sequential DCT)
+// ---------------------------------------------------------------------------
+//
+// A small, dependency-free baseline JPEG decoder. It parses the marker stream
+// up to the first scan, Huffman-decodes DC differences and AC run/size pairs,
+// dequantizes, performs a separable floating-point inverse DCT and converts
+// YCbCr to RGB. Chroma planes are upsampled with nearest-neighbour sampling
+// according to their sampling factors, which covers 4:4:4, 4:2:2 and 4:2:0.
+
+/// Zig-zag order: entry `k` is the natural (row-major) index of the `k`-th
+/// coefficient in the bit stream. Quantization tables and entropy-coded
+/// coefficients both arrive in zig-zag order.
+const JPEG_ZIGZAG: [usize; 64] = [
+    0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5, 12, 19, 26, 33, 40, 48, 41, 34, 27, 20,
+    13, 6, 7, 14, 21, 28, 35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51, 58, 59,
+    52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63,
+];
+
+fn jpeg_err(message: impl Into<String>) -> DecodeError {
+    DecodeError::new(format!("JPEG: {}", message.into()))
+}
+
+fn jpeg_unsupported(message: impl Into<String>) -> DecodeError {
+    DecodeError::unsupported(format!("JPEG {}", message.into()))
+}
+
+/// Canonical Huffman table for one JPEG DC or AC table (lengths 1..=16).
+struct JpegHuffman {
+    /// Number of codes of each length; index 0 is unused.
+    counts: [u16; 17],
+    /// Symbols in canonical (code) order.
+    symbols: Vec<u8>,
+}
+
+impl JpegHuffman {
+    fn new(counts: [u16; 17], symbols: Vec<u8>) -> Result<Self, DecodeError> {
+        let total: usize = counts.iter().map(|&count| count as usize).sum();
+        if total != symbols.len() {
+            return Err(jpeg_err("Huffman table symbol count mismatch"));
+        }
+        // Reject over-subscribed tables; incomplete tables are legal in JPEG.
+        let mut left: i32 = 1;
+        for &count in counts.iter().skip(1) {
+            left = left * 2 - i32::from(count);
+            if left < 0 {
+                return Err(jpeg_err("over-subscribed JPEG Huffman table"));
+            }
+        }
+        Ok(Self { counts, symbols })
+    }
+
+    fn decode(&self, reader: &mut JpegBitReader<'_>) -> Result<u8, DecodeError> {
+        let mut code = 0_u32;
+        let mut first = 0_u32;
+        let mut index = 0_usize;
+        for length in 1..=16_u32 {
+            code = (code << 1) | reader.read_bit()?;
+            let count = u32::from(self.counts[length as usize]);
+            if code >= first && code - first < count {
+                return self
+                    .symbols
+                    .get(index + (code - first) as usize)
+                    .copied()
+                    .ok_or_else(|| jpeg_err("invalid JPEG Huffman code"));
+            }
+            index += count as usize;
+            first = (first + count) << 1;
+        }
+        Err(jpeg_err("invalid JPEG Huffman code"))
+    }
+}
+
+/// Bit reader for the entropy-coded segment. JPEG packs bits most-significant
+/// bit first and byte-stuffs `0xff` as `ff 00`; restart markers are handled
+/// explicitly by [`JpegBitReader::restart`].
+struct JpegBitReader<'a> {
+    data: &'a [u8],
+    pos: usize,
+    buffer: u8,
+    bits: u8,
+}
+
+impl<'a> JpegBitReader<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self {
+            data,
+            pos: 0,
+            buffer: 0,
+            bits: 0,
+        }
+    }
+
+    fn read_bit(&mut self) -> Result<u32, DecodeError> {
+        if self.bits == 0 {
+            self.fill()?;
+        }
+        self.bits -= 1;
+        Ok(u32::from((self.buffer >> self.bits) & 1))
+    }
+
+    fn read_bits(&mut self, count: u8) -> Result<u32, DecodeError> {
+        let mut value = 0_u32;
+        for _ in 0..count {
+            value = (value << 1) | self.read_bit()?;
+        }
+        Ok(value)
+    }
+
+    fn fill(&mut self) -> Result<(), DecodeError> {
+        let byte = *self
+            .data
+            .get(self.pos)
+            .ok_or_else(|| jpeg_err("truncated entropy-coded data"))?;
+        self.pos += 1;
+        if byte == 0xff {
+            let next = *self
+                .data
+                .get(self.pos)
+                .ok_or_else(|| jpeg_err("truncated entropy-coded data"))?;
+            if next == 0x00 {
+                self.pos += 1; // stuffed data byte
+            } else {
+                return Err(jpeg_err("unexpected marker in entropy-coded data"));
+            }
+        }
+        self.buffer = byte;
+        self.bits = 8;
+        Ok(())
+    }
+
+    /// Aligns to the next byte, skips fill bytes and consumes restart marker
+    /// `expected` (`0xd0..=0xd7`), resetting the buffered bits.
+    fn restart(&mut self, expected: u8) -> Result<(), DecodeError> {
+        self.buffer = 0;
+        self.bits = 0;
+        loop {
+            let byte = *self
+                .data
+                .get(self.pos)
+                .ok_or_else(|| jpeg_err("missing restart marker"))?;
+            self.pos += 1;
+            if byte != 0xff {
+                return Err(jpeg_err("expected a restart marker"));
+            }
+            let marker = *self
+                .data
+                .get(self.pos)
+                .ok_or_else(|| jpeg_err("truncated restart marker"))?;
+            if marker == 0xff {
+                continue; // fill byte; the next iteration consumes it as prefix
+            }
+            self.pos += 1;
+            if marker != expected {
+                return Err(jpeg_err(format!(
+                    "unexpected restart marker 0x{marker:02x}"
+                )));
+            }
+            return Ok(());
+        }
+    }
+}
+
+/// Extends a `bits`-bit magnitude read from a Huffman-coded stream into a
+/// signed coefficient (the "receive and extend" procedure).
+fn jpeg_receive_extend(bits: usize, reader: &mut JpegBitReader<'_>) -> Result<i32, DecodeError> {
+    if bits == 0 {
+        return Ok(0);
+    }
+    if bits > 16 {
+        return Err(jpeg_err("invalid coefficient magnitude"));
+    }
+    let value = reader.read_bits(bits as u8)? as i32;
+    if value < (1_i32 << (bits - 1)) {
+        Ok(value - ((1_i32 << bits) - 1))
+    } else {
+        Ok(value)
+    }
+}
+
+/// One component of a baseline frame, with the scan's Huffman table selectors
+/// filled in once SOS has been parsed.
+struct JpegComponent {
+    h: u8,
+    v: u8,
+    quant: usize,
+    dc_table: usize,
+    ac_table: usize,
+}
+
+struct JpegFrame {
+    width: u32,
+    height: u32,
+    components: Vec<JpegComponent>,
+    quant: [[i32; 64]; 4],
+    restart_interval: u16,
+}
+
+/// Reads the next marker byte after the initial `0xff`, tolerating fill bytes.
+fn jpeg_next_marker(data: &[u8], pos: &mut usize) -> Result<u8, DecodeError> {
+    let prefix = *data.get(*pos).ok_or_else(|| jpeg_err("missing marker"))?;
+    *pos += 1;
+    if prefix != 0xff {
+        return Err(jpeg_err("expected a 0xff marker prefix"));
+    }
+    loop {
+        let marker = *data.get(*pos).ok_or_else(|| jpeg_err("truncated marker"))?;
+        *pos += 1;
+        if marker != 0xff {
+            return Ok(marker);
+        }
+    }
+}
+
+/// Returns a length-prefixed segment's payload and advances past it.
+fn jpeg_segment<'a>(data: &'a [u8], pos: &mut usize, name: &str) -> Result<&'a [u8], DecodeError> {
+    let header = data
+        .get(*pos..*pos + 2)
+        .ok_or_else(|| jpeg_err(format!("truncated {name} segment")))?;
+    let length = usize::from(u16::from_be_bytes([header[0], header[1]]));
+    if length < 2 {
+        return Err(jpeg_err(format!("invalid {name} segment length")));
+    }
+    let start = *pos + 2;
+    let end = start
+        .checked_add(length - 2)
+        .ok_or_else(|| jpeg_err(format!("invalid {name} segment length")))?;
+    let payload = data
+        .get(start..end)
+        .ok_or_else(|| jpeg_err(format!("truncated {name} segment")))?;
+    *pos = end;
+    Ok(payload)
+}
+
+fn jpeg_parse_dqt(data: &[u8], quant: &mut [[i32; 64]; 4]) -> Result<(), DecodeError> {
+    let mut pos = 0;
+    while pos < data.len() {
+        let spec = data[pos];
+        pos += 1;
+        let precision = spec >> 4;
+        let table = usize::from(spec & 0x0f);
+        if table >= 4 {
+            return Err(jpeg_err("invalid quantization table selector"));
+        }
+        let bytes_per_value = match precision {
+            0 => 1,
+            1 => 2,
+            _ => return Err(jpeg_err("invalid quantization table precision")),
+        };
+        let slice = data
+            .get(pos..pos + 64 * bytes_per_value)
+            .ok_or_else(|| jpeg_err("truncated DQT segment"))?;
+        for (zigzag, slot) in JPEG_ZIGZAG.iter().enumerate() {
+            let value = if bytes_per_value == 1 {
+                i32::from(slice[zigzag])
+            } else {
+                (i32::from(slice[2 * zigzag]) << 8) | i32::from(slice[2 * zigzag + 1])
+            };
+            if value <= 0 {
+                return Err(jpeg_err("invalid quantization value"));
+            }
+            quant[table][*slot] = value;
+        }
+        pos += 64 * bytes_per_value;
+    }
+    Ok(())
+}
+
+fn jpeg_parse_dht(
+    data: &[u8],
+    dc_tables: &mut [Option<JpegHuffman>; 4],
+    ac_tables: &mut [Option<JpegHuffman>; 4],
+) -> Result<(), DecodeError> {
+    let mut pos = 0;
+    while pos < data.len() {
+        let spec = data[pos];
+        pos += 1;
+        let class = spec >> 4;
+        let table = usize::from(spec & 0x0f);
+        if table >= 4 {
+            return Err(jpeg_err("invalid Huffman table selector"));
+        }
+        let length_bytes = data
+            .get(pos..pos + 16)
+            .ok_or_else(|| jpeg_err("truncated DHT segment"))?;
+        let mut counts = [0_u16; 17];
+        let mut total = 0_usize;
+        for (index, &count) in length_bytes.iter().enumerate() {
+            counts[index + 1] = u16::from(count);
+            total += usize::from(count);
+        }
+        pos += 16;
+        let symbol_bytes = data
+            .get(pos..pos + total)
+            .ok_or_else(|| jpeg_err("truncated DHT segment"))?;
+        let table_obj = JpegHuffman::new(counts, symbol_bytes.to_vec())?;
+        pos += total;
+        match class {
+            0 => dc_tables[table] = Some(table_obj),
+            1 => ac_tables[table] = Some(table_obj),
+            _ => return Err(jpeg_err("invalid Huffman table class")),
+        }
+    }
+    Ok(())
+}
+
+fn jpeg_parse_sof0(data: &[u8]) -> Result<JpegFrame, DecodeError> {
+    let header = data
+        .get(..6)
+        .ok_or_else(|| jpeg_err("truncated SOF0 segment"))?;
+    if header[0] != 8 {
+        return Err(jpeg_unsupported(format!(
+            "{}-bit JPEG samples (only 8-bit is supported)",
+            header[0]
+        )));
+    }
+    let height = u32::from(u16::from_be_bytes([header[1], header[2]]));
+    let width = u32::from(u16::from_be_bytes([header[3], header[4]]));
+    if width == 0 || height == 0 {
+        return Err(jpeg_err("JPEG has a zero dimension"));
+    }
+    if width > MAX_DIMENSION || height > MAX_DIMENSION {
+        return Err(jpeg_err(format!(
+            "dimensions {width}x{height} exceed the {MAX_DIMENSION} pixel limit"
+        )));
+    }
+    check_pixel_count(width, height, "JPEG")?;
+
+    let count = usize::from(header[5]);
+    if data.len() < 6 + 3 * count {
+        return Err(jpeg_err("truncated SOF0 component list"));
+    }
+    if count != 1 && count != 3 {
+        return Err(jpeg_unsupported(format!("{count}-component JPEG frames")));
+    }
+    let mut components = Vec::with_capacity(count);
+    let mut seen = [false; 256];
+    for index in 0..count {
+        let id = data[6 + 3 * index];
+        let sampling = data[7 + 3 * index];
+        let (h, v) = (sampling >> 4, sampling & 0x0f);
+        if !(1..=4).contains(&h) || !(1..=4).contains(&v) {
+            return Err(jpeg_unsupported("invalid JPEG sampling factors"));
+        }
+        if seen[usize::from(id)] {
+            return Err(jpeg_err("duplicate JPEG component identifier"));
+        }
+        seen[usize::from(id)] = true;
+        let quant = usize::from(data[8 + 3 * index]);
+        if quant >= 4 {
+            return Err(jpeg_err("invalid component quantization table selector"));
+        }
+        components.push(JpegComponent {
+            h,
+            v,
+            quant,
+            dc_table: 0,
+            ac_table: 0,
+        });
+    }
+    Ok(JpegFrame {
+        width,
+        height,
+        components,
+        quant: [[0; 64]; 4],
+        restart_interval: 0,
+    })
+}
+
+/// Decodes the baseline scan into a flat component plane per frame component.
+#[allow(clippy::needless_range_loop)]
+fn jpeg_decode_scan(
+    frame: &JpegFrame,
+    entropy: &[u8],
+    dc_tables: &[Option<JpegHuffman>; 4],
+    ac_tables: &[Option<JpegHuffman>; 4],
+    cos: &[[f32; 8]; 8],
+) -> Result<ImageData, DecodeError> {
+    let max_h = frame
+        .components
+        .iter()
+        .map(|component| component.h)
+        .max()
+        .unwrap_or(1);
+    let max_v = frame
+        .components
+        .iter()
+        .map(|component| component.v)
+        .max()
+        .unwrap_or(1);
+    let mcu_width = usize::from(max_h) * 8;
+    let mcu_height = usize::from(max_v) * 8;
+    let mcus_x = (frame.width as usize).div_ceil(mcu_width);
+    let mcus_y = (frame.height as usize).div_ceil(mcu_height);
+
+    let mut planes: Vec<Vec<u8>> = Vec::with_capacity(frame.components.len());
+    for component in &frame.components {
+        let plane_width = mcus_x * usize::from(component.h) * 8;
+        let plane_height = mcus_y * usize::from(component.v) * 8;
+        let size = plane_width
+            .checked_mul(plane_height)
+            .ok_or_else(|| jpeg_err("JPEG component plane size overflow"))?;
+        planes.push(vec![0_u8; size]);
+    }
+
+    let mut dc_predictors = vec![0_i32; frame.components.len()];
+    let mut reader = JpegBitReader::new(entropy);
+    let mut restart_index = 0_u8;
+    let mut mcu_index = 0_usize;
+
+    for mcu_y in 0..mcus_y {
+        for mcu_x in 0..mcus_x {
+            if frame.restart_interval > 0
+                && mcu_index > 0
+                && mcu_index.is_multiple_of(usize::from(frame.restart_interval))
+            {
+                reader.restart(0xd0 + restart_index)?;
+                restart_index = (restart_index + 1) % 8;
+                dc_predictors.fill(0);
+            }
+
+            for (component_index, component) in frame.components.iter().enumerate() {
+                let dc_table = dc_tables[component.dc_table]
+                    .as_ref()
+                    .ok_or_else(|| jpeg_err("missing DC Huffman table"))?;
+                let ac_table = ac_tables[component.ac_table]
+                    .as_ref()
+                    .ok_or_else(|| jpeg_err("missing AC Huffman table"))?;
+                for block_y in 0..component.v {
+                    for block_x in 0..component.h {
+                        let mut coefficients = [0_i32; 64];
+                        let category = usize::from(dc_table.decode(&mut reader)?);
+                        dc_predictors[component_index] +=
+                            jpeg_receive_extend(category, &mut reader)?;
+                        coefficients[0] = dc_predictors[component_index];
+
+                        let mut zigzag = 1_usize;
+                        while zigzag < 64 {
+                            let symbol = ac_table.decode(&mut reader)?;
+                            if symbol == 0x00 {
+                                break; // end of block
+                            }
+                            if symbol == 0xf0 {
+                                zigzag += 16; // zero run length
+                                continue;
+                            }
+                            let run = usize::from(symbol >> 4);
+                            let size = usize::from(symbol & 0x0f);
+                            if size == 0 || zigzag + run >= 64 {
+                                return Err(jpeg_err("invalid AC coefficient run"));
+                            }
+                            let value = jpeg_receive_extend(size, &mut reader)?;
+                            zigzag += run;
+                            coefficients[JPEG_ZIGZAG[zigzag]] = value;
+                            zigzag += 1;
+                        }
+
+                        let quant = &frame.quant[component.quant];
+                        for (coefficient, q) in coefficients.iter_mut().zip(quant.iter()) {
+                            *coefficient *= *q;
+                        }
+                        let block = jpeg_idct(&coefficients, cos);
+
+                        let plane = &mut planes[component_index];
+                        let plane_width = mcus_x * usize::from(component.h) * 8;
+                        let origin_x =
+                            (mcu_x * usize::from(component.h) + usize::from(block_x)) * 8;
+                        let origin_y =
+                            (mcu_y * usize::from(component.v) + usize::from(block_y)) * 8;
+                        for y in 0..8 {
+                            for x in 0..8 {
+                                plane[(origin_y + y) * plane_width + origin_x + x] = block[y][x];
+                            }
+                        }
+                    }
+                }
+            }
+            mcu_index += 1;
+        }
+    }
+
+    let width = frame.width as usize;
+    let height = frame.height as usize;
+    let mut pixels = vec![0_u8; width * height * 4];
+    #[allow(clippy::needless_range_loop)]
+    for y in 0..height {
+        for x in 0..width {
+            let sample = |index: usize| -> i32 {
+                let component = &frame.components[index];
+                let sx = x * usize::from(component.h) / usize::from(max_h);
+                let sy = y * usize::from(component.v) / usize::from(max_v);
+                let plane = &planes[index];
+                let plane_width = mcus_x * usize::from(component.h) * 8;
+                i32::from(plane[sy * plane_width + sx])
+            };
+            let target = (y * width + x) * 4;
+            if frame.components.len() == 1 {
+                let grey = sample(0).clamp(0, 255) as u8;
+                pixels[target..target + 4].copy_from_slice(&[grey, grey, grey, 255]);
+            } else {
+                let luma = sample(0) as f32;
+                let blue = sample(1) as f32 - 128.0;
+                let red = sample(2) as f32 - 128.0;
+                let r = (luma + 1.402 * red).round().clamp(0.0, 255.0) as u8;
+                let g = (luma - 0.344_136 * blue - 0.714_136 * red)
+                    .round()
+                    .clamp(0.0, 255.0) as u8;
+                let b = (luma + 1.772 * blue).round().clamp(0.0, 255.0) as u8;
+                pixels[target..target + 4].copy_from_slice(&[r, g, b, 255]);
+            }
+        }
+    }
+    ImageData::from_rgba(frame.width, frame.height, pixels)
+}
+
+/// Separable inverse DCT for one 8x8 block. `cos[x][u]` is
+/// `alpha(u) * cos((2x + 1) * u * pi / 16)` with `alpha(0) = 1/sqrt(2)`.
+#[allow(clippy::needless_range_loop)]
+fn jpeg_idct(coefficients: &[i32; 64], cos: &[[f32; 8]; 8]) -> [[u8; 8]; 8] {
+    let mut intermediate = [[0_f32; 8]; 8];
+    for row in 0..8 {
+        for x in 0..8 {
+            let mut sum = 0_f32;
+            for column in 0..8 {
+                sum += coefficients[row * 8 + column] as f32 * cos[x][column];
+            }
+            intermediate[row][x] = sum;
+        }
+    }
+    let mut block = [[0_u8; 8]; 8];
+    for y in 0..8 {
+        for x in 0..8 {
+            let mut sum = 0_f32;
+            for row in 0..8 {
+                sum += intermediate[row][x] * cos[y][row];
+            }
+            let value = (sum * 0.25 + 128.0).round().clamp(0.0, 255.0) as u8;
+            block[y][x] = value;
+        }
+    }
+    block
+}
+
+/// Precomputes the cosine factors used by [`jpeg_idct`].
+fn jpeg_idct_cosines() -> [[f32; 8]; 8] {
+    let mut cos = [[0_f32; 8]; 8];
+    for (x, row) in cos.iter_mut().enumerate() {
+        for (u, slot) in row.iter_mut().enumerate() {
+            let alpha = if u == 0 { 1.0 / 2.0_f32.sqrt() } else { 1.0 };
+            let angle = ((2 * x + 1) as f32) * (u as f32) * std::f32::consts::PI / 16.0;
+            *slot = alpha * angle.cos();
+        }
+    }
+    cos
+}
+
+/// Decodes a baseline sequential DCT (SOF0) JPEG into RGBA8.
+///
+/// Greyscale and three-component YCbCr images are supported with any legal
+/// sampling factors (including 4:4:4, 4:2:2 and 4:2:0), Huffman entropy coding,
+/// restart intervals and 8- or 16-bit quantization tables. Progressive (SOF2),
+/// extended-sequential, lossless, arithmetic-coded, 12-bit and multi-scan
+/// JPEGs are reported as unsupported via [`DecodeError::unsupported`].
+pub fn decode_jpeg(bytes: &[u8]) -> Result<ImageData, DecodeError> {
+    if !bytes.starts_with(&[0xff, 0xd8]) {
+        return Err(jpeg_err("not a JPEG file (missing SOI)"));
+    }
+    let mut pos = 2_usize;
+    let mut quant = [[0_i32; 64]; 4];
+    let mut dc_tables: [Option<JpegHuffman>; 4] = Default::default();
+    let mut ac_tables: [Option<JpegHuffman>; 4] = Default::default();
+    let mut frame: Option<JpegFrame> = None;
+    let mut restart_interval = 0_u16;
+
+    loop {
+        let marker = jpeg_next_marker(bytes, &mut pos)?;
+        match marker {
+            0xd8 => return Err(jpeg_err("unexpected SOI marker")),
+            0xd9 => return Err(jpeg_err("missing SOS marker")),
+            0x01 | 0xd0..=0xd7 => return Err(jpeg_err("unexpected restart marker in header")),
+            0xe0..=0xef | 0xfe => {
+                let _ = jpeg_segment(bytes, &mut pos, "APP/COM")?;
+            }
+            0xdb => {
+                let segment = jpeg_segment(bytes, &mut pos, "DQT")?;
+                jpeg_parse_dqt(segment, &mut quant)?;
+            }
+            0xc4 => {
+                let segment = jpeg_segment(bytes, &mut pos, "DHT")?;
+                jpeg_parse_dht(segment, &mut dc_tables, &mut ac_tables)?;
+            }
+            0xdd => {
+                let segment = jpeg_segment(bytes, &mut pos, "DRI")?;
+                let bytes = segment
+                    .get(..2)
+                    .ok_or_else(|| jpeg_err("truncated DRI segment"))?;
+                restart_interval = u16::from_be_bytes([bytes[0], bytes[1]]);
+            }
+            0xc0 => {
+                let segment = jpeg_segment(bytes, &mut pos, "SOF0")?;
+                frame = Some(jpeg_parse_sof0(segment)?);
+            }
+            0xc1 => return Err(jpeg_unsupported("extended sequential DCT (SOF1)")),
+            0xc2 => return Err(jpeg_unsupported("progressive DCT (SOF2)")),
+            0xc3 => return Err(jpeg_unsupported("lossless JPEG (SOF3)")),
+            0xc5..=0xcf => {
+                return Err(jpeg_unsupported(format!(
+                    "unsupported frame type 0x{marker:02x}"
+                )));
+            }
+            0xda => {
+                let segment = jpeg_segment(bytes, &mut pos, "SOS")?;
+                let count = segment
+                    .first()
+                    .copied()
+                    .ok_or_else(|| jpeg_err("empty SOS"))?;
+                let mut frame = frame.take().ok_or_else(|| jpeg_err("SOS before SOF"))?;
+                if usize::from(count) != frame.components.len() {
+                    return Err(jpeg_unsupported("non-interleaved or multi-scan JPEG"));
+                }
+                let header_end = 1 + 2 * usize::from(count);
+                let scan_trailer = segment
+                    .get(header_end..header_end + 3)
+                    .ok_or_else(|| jpeg_err("truncated SOS header"))?;
+                if scan_trailer != [0, 63, 0] {
+                    return Err(jpeg_unsupported(
+                        "progressive spectral selection or successive approximation",
+                    ));
+                }
+                for (index, component) in frame.components.iter_mut().enumerate() {
+                    let spec = segment
+                        .get(2 + 2 * index)
+                        .ok_or_else(|| jpeg_err("truncated SOS component list"))?;
+                    component.dc_table = usize::from(spec >> 4);
+                    component.ac_table = usize::from(spec & 0x0f);
+                    if component.dc_table >= 4 || component.ac_table >= 4 {
+                        return Err(jpeg_err("invalid scan Huffman table selector"));
+                    }
+                }
+                frame.quant = quant;
+                frame.restart_interval = restart_interval;
+                let cos = jpeg_idct_cosines();
+                return jpeg_decode_scan(&frame, &bytes[pos..], &dc_tables, &ac_tables, &cos);
+            }
+            other => {
+                return Err(jpeg_unsupported(format!("marker 0x{other:02x}")));
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3136,6 +4098,614 @@ mod tests {
                     let _ = decode_png(&repaired);
                 }
             }
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // PPM / PGM tests
+    // ---------------------------------------------------------------------
+
+    fn pnm(magic: u8, header: &[u8], raster: &[u8]) -> Vec<u8> {
+        let mut out = vec![b'P', magic];
+        out.extend_from_slice(header);
+        out.extend_from_slice(raster);
+        out
+    }
+
+    #[test]
+    fn decodes_ppm_p6() {
+        let file = pnm(b'6', b"\n2 1\n255\n", &[1, 2, 3, 4, 5, 6]);
+        assert_eq!(detect_format(&file), Some(ImageFormat::Pnm));
+        let image = decode(&file).expect("P6 should decode");
+        assert_eq!((image.width, image.height), (2, 1));
+        assert_eq!(image.get(0, 0), [1, 2, 3, 255]);
+        assert_eq!(image.get(1, 0), [4, 5, 6, 255]);
+    }
+
+    #[test]
+    fn decodes_pgm_p5_with_comments_and_scaling() {
+        // Comments before and between tokens; with maxval 15 samples scale by 17.
+        let file = pnm(b'5', b"\n# a comment\n2 # width done\n1\n15\n", &[0, 15]);
+        let image = decode(&file).expect("P5 should decode");
+        assert_eq!((image.width, image.height), (2, 1));
+        assert_eq!(image.get(0, 0), [0, 0, 0, 255]);
+        assert_eq!(image.get(1, 0), [255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn decodes_16_bit_ppm() {
+        // maxval 1023 selects two big-endian bytes per sample.
+        let file = pnm(b'6', b" 1 1 1023\n", &[0x03, 0xe8, 0, 100, 0x03, 0xff]);
+        let image = decode(&file).expect("16-bit P6 should decode");
+        assert_eq!(image.get(0, 0), [249, 24, 255, 255]);
+    }
+
+    #[test]
+    fn rejects_malformed_pnm() {
+        // maxval out of range, truncated raster, zero dimension.
+        assert!(decode(b"P6\n1 1\n70000\n\x00\x00\x00").is_err());
+        assert!(decode(b"P6\n2 1\n255\n\x01\x02\x03").is_err());
+        assert!(decode(b"P5\n0 1\n255\n").is_err());
+        // Missing whitespace between the header and the raster.
+        assert!(decode(b"P6\n1 1\n255X\x00\x00\x00").is_err());
+        // A sample larger than maxval.
+        assert!(decode(b"P5\n1 1\n15\n\xff").is_err());
+
+        let oversized = pnm(
+            b'5',
+            format!("\n{} 1\n255\n", MAX_DIMENSION + 1).as_bytes(),
+            &[0],
+        );
+        let error = decode(&oversized).expect_err("oversized PNM must be rejected");
+        assert!(error.message.contains("exceed"), "{}", error.message);
+    }
+
+    // ---------------------------------------------------------------------
+    // ICO tests
+    // ---------------------------------------------------------------------
+
+    fn ico_with_png(png: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&[0, 0, 1, 0]); // reserved = 0, type = icon
+        out.extend_from_slice(&1_u16.to_le_bytes()); // one directory entry
+        out.extend_from_slice(&[0, 0, 0, 0]); // width/height (0 = 256), colours, reserved
+        out.extend_from_slice(&1_u16.to_le_bytes()); // planes
+        out.extend_from_slice(&32_u16.to_le_bytes()); // bits per pixel
+        out.extend_from_slice(&(png.len() as u32).to_le_bytes()); // size
+        out.extend_from_slice(&22_u32.to_le_bytes()); // image offset (6 + 16)
+        out.extend_from_slice(png);
+        out
+    }
+
+    #[test]
+    fn decodes_ico_wrapping_png() {
+        let rgba: Vec<u8> = (0..16_u8)
+            .flat_map(|index| [index * 4, index * 4 + 1, index * 4 + 2, 255])
+            .collect();
+        let png = png::encode(4, 4, &rgba);
+        let file = ico_with_png(&png);
+        assert_eq!(detect_format(&file), Some(ImageFormat::Ico));
+        let image = decode(&file).expect("ICO-wrapped PNG should decode");
+        assert_eq!((image.width, image.height), (4, 4));
+        assert_eq!(image.pixels, rgba);
+    }
+
+    #[test]
+    fn rejects_malformed_icos() {
+        assert!(decode(&[0, 0, 1, 0]).is_err()); // truncated header
+        assert!(decode(&[0, 0, 2, 0, 1, 0]).is_err()); // CUR, not ICO
+        assert!(decode(&[0, 0, 1, 0, 0, 0]).is_err()); // no entries
+        assert!(decode(&[0, 0, 1, 0, 1, 0]).is_err()); // truncated directory
+
+        // An entry holding a DIB rather than PNG is reported as unsupported.
+        let mut file = ico_with_png(&png::encode(1, 1, &[1, 2, 3, 255]));
+        file[22] = 0x42; // break the embedded PNG signature
+        let error = decode(&file).expect_err("non-PNG ICO entry must be rejected");
+        assert!(error.message.contains("unsupported"), "{}", error.message);
+
+        // An entry pointing outside the file is rejected.
+        let mut file = ico_with_png(&png::encode(1, 1, &[1, 2, 3, 255]));
+        file[18..22].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(decode(&file).is_err());
+    }
+
+    // ---------------------------------------------------------------------
+    // Detected-but-unsupported formats
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn detects_avif_and_rasterizes_svg() {
+        let avif = b"\x00\x00\x00\x18ftypavif\x00\x00\x00\x00avifmif1";
+        assert_eq!(detect_format(avif), Some(ImageFormat::Avif));
+        let error = decode(avif).expect_err("AVIF must be reported as unsupported");
+        assert!(error.message.contains("AVIF"), "{}", error.message);
+
+        let avis = b"\x00\x00\x00\x18ftypavis\x00\x00\x00\x00avismif1";
+        assert_eq!(detect_format(avis), Some(ImageFormat::Avif));
+
+        for svg in [
+            &b"<svg xmlns=\"http://www.w3.org/2000/svg\"></svg>"[..],
+            &b"\xef\xbb\xbf<?xml version=\"1.0\"?><svg></svg>"[..],
+            &b"  <!-- c --><svg></svg>"[..],
+        ] {
+            assert_eq!(detect_format(svg), Some(ImageFormat::Svg));
+            // Dimension-less documents are still valid SVG bytes; the rasterizer
+            // reports the missing dimensions rather than "unsupported format".
+            assert!(decode(svg).is_err());
+        }
+    }
+
+    #[test]
+    fn decodes_svg_bytes_into_non_empty_pixels() {
+        let svg = b"<svg width='8' height='8'>\
+                      <rect width='8' height='8' fill='#336699'/>\
+                    </svg>";
+        assert_eq!(detect_format(svg), Some(ImageFormat::Svg));
+        let image = decode(svg).expect("SVG should be rasterized");
+        assert_eq!((image.width, image.height), (8, 8));
+        assert_eq!(image.pixels.len(), 8 * 8 * 4);
+        assert!(image.pixels.iter().any(|channel| *channel != 0));
+        assert_eq!(image.get(4, 4), [0x33, 0x66, 0x99, 255]);
+
+        // The explicit SVG entry point works for payloads whose format is known
+        // from a `.svg` URL even if byte sniffing is skipped.
+        let explicit = decode_svg(svg).expect("explicit SVG decode");
+        assert_eq!(explicit, image);
+    }
+
+    // ---------------------------------------------------------------------
+    // JPEG test helpers — a tiny baseline encoder used to build fixtures
+    // ---------------------------------------------------------------------
+
+    /// Writes bits most-significant bit first, stuffing `ff 00` for data bytes
+    /// equal to `0xff`. Markers are emitted separately so they are not stuffed.
+    struct JpegBitWriter {
+        out: Vec<u8>,
+        accumulator: u32,
+        bits: u32,
+    }
+
+    impl JpegBitWriter {
+        fn new() -> Self {
+            Self {
+                out: Vec::new(),
+                accumulator: 0,
+                bits: 0,
+            }
+        }
+
+        fn write(&mut self, value: u32, width: u32) {
+            for bit in (0..width).rev() {
+                self.accumulator = (self.accumulator << 1) | ((value >> bit) & 1);
+                self.bits += 1;
+                if self.bits == 8 {
+                    let byte = self.accumulator as u8;
+                    self.out.push(byte);
+                    if byte == 0xff {
+                        self.out.push(0x00);
+                    }
+                    self.accumulator = 0;
+                    self.bits = 0;
+                }
+            }
+        }
+
+        fn flush(&mut self) {
+            if self.bits > 0 {
+                let padding = 8 - self.bits;
+                self.accumulator = (self.accumulator << padding) | ((1_u32 << padding) - 1);
+                let byte = self.accumulator as u8;
+                self.out.push(byte);
+                if byte == 0xff {
+                    self.out.push(0x00);
+                }
+                self.accumulator = 0;
+                self.bits = 0;
+            }
+        }
+
+        fn marker(&mut self, marker: u8) {
+            self.flush();
+            self.out.extend_from_slice(&[0xff, marker]);
+        }
+
+        fn finish(mut self) -> Vec<u8> {
+            self.flush();
+            self.out
+        }
+    }
+
+    fn jpeg_segment(marker: u8, payload: &[u8], out: &mut Vec<u8>) {
+        out.extend_from_slice(&[0xff, marker]);
+        out.extend_from_slice(&((payload.len() + 2) as u16).to_be_bytes());
+        out.extend_from_slice(payload);
+    }
+
+    fn jpeg_bit_length(value: i32) -> u32 {
+        32 - value.unsigned_abs().leading_zeros()
+    }
+
+    fn jpeg_magnitude(value: i32, bits: u32) -> u32 {
+        if value > 0 {
+            value as u32
+        } else {
+            (value + (1_i32 << bits) - 1) as u32
+        }
+    }
+
+    /// DC uses 16 symbols of length 4 (code == symbol); AC uses `symbols` of
+    /// length 8 (code == position in the list).
+    fn jpeg_ac_code(symbols: &[u8], symbol: u8) -> u32 {
+        symbols
+            .iter()
+            .position(|&candidate| candidate == symbol)
+            .expect("AC symbol must be present in the table") as u32
+    }
+
+    fn jpeg_encode_diff(writer: &mut JpegBitWriter, diff: i32) {
+        let bits = jpeg_bit_length(diff);
+        if bits == 0 {
+            writer.write(0, 4);
+            return;
+        }
+        writer.write(bits, 4);
+        writer.write(jpeg_magnitude(diff, bits), bits);
+    }
+
+    /// Builds a complete baseline JPEG. `mcu_blocks[mcu][component][block]` holds
+    /// 64 quantized coefficients in zig-zag order.
+    #[allow(clippy::too_many_arguments)]
+    fn jpeg_build(
+        width: u16,
+        height: u16,
+        components: &[(u8, u8, u8)], // id, h, v (quantization table 0)
+        quant: &[i32; 64],           // zig-zag order
+        ac_symbols: &[u8],
+        restart_interval: u16,
+        mcu_blocks: &[Vec<Vec<[i32; 64]>>],
+    ) -> Vec<u8> {
+        let mut out = vec![0xff, 0xd8];
+
+        let mut dqt = vec![0_u8; 65];
+        for (index, &value) in quant.iter().enumerate() {
+            dqt[1 + index] = value.clamp(1, 255) as u8;
+        }
+        jpeg_segment(0xdb, &dqt, &mut out);
+
+        let mut sof = vec![8_u8];
+        sof.extend_from_slice(&height.to_be_bytes());
+        sof.extend_from_slice(&width.to_be_bytes());
+        sof.push(components.len() as u8);
+        for &(id, h, v) in components {
+            sof.extend_from_slice(&[id, (h << 4) | v, 0]);
+        }
+        jpeg_segment(0xc0, &sof, &mut out);
+
+        let mut dht_dc = vec![0_u8; 33];
+        dht_dc[4] = 16; // 16 codes of length 4
+        for (index, symbol) in dht_dc[17..].iter_mut().enumerate() {
+            *symbol = index as u8;
+        }
+        jpeg_segment(0xc4, &dht_dc, &mut out);
+
+        let mut dht_ac = vec![0_u8; 17 + ac_symbols.len()];
+        dht_ac[0] = 0x10; // AC table 0
+        dht_ac[8] = ac_symbols.len() as u8; // codes of length 8
+        dht_ac[17..].copy_from_slice(ac_symbols);
+        jpeg_segment(0xc4, &dht_ac, &mut out);
+
+        if restart_interval > 0 {
+            jpeg_segment(0xdd, &restart_interval.to_be_bytes(), &mut out);
+        }
+
+        let mut sos = vec![components.len() as u8];
+        for &(id, _, _) in components {
+            sos.extend_from_slice(&[id, 0x00]); // DC table 0, AC table 0
+        }
+        sos.extend_from_slice(&[0, 63, 0]);
+        jpeg_segment(0xda, &sos, &mut out);
+
+        let mut writer = JpegBitWriter::new();
+        let mut predictors = vec![0_i32; components.len()];
+        let mut restart_index = 0_u8;
+        for (mcu_index, blocks) in mcu_blocks.iter().enumerate() {
+            if restart_interval > 0
+                && mcu_index > 0
+                && mcu_index % usize::from(restart_interval) == 0
+            {
+                writer.marker(0xd0 + restart_index);
+                restart_index = (restart_index + 1) % 8;
+                predictors.fill(0);
+            }
+            for (component_index, component_blocks) in blocks.iter().enumerate() {
+                for coefficients in component_blocks {
+                    jpeg_encode_diff(&mut writer, coefficients[0] - predictors[component_index]);
+                    predictors[component_index] = coefficients[0];
+                    let mut zero_run = 0_usize;
+                    for &value in coefficients.iter().skip(1) {
+                        if value == 0 {
+                            zero_run += 1;
+                            continue;
+                        }
+                        while zero_run > 15 {
+                            writer.write(jpeg_ac_code(ac_symbols, 0xf0), 8);
+                            zero_run -= 16;
+                        }
+                        let bits = jpeg_bit_length(value);
+                        let symbol = ((zero_run as u8) << 4) | bits as u8;
+                        writer.write(jpeg_ac_code(ac_symbols, symbol), 8);
+                        writer.write(jpeg_magnitude(value, bits), bits);
+                        zero_run = 0;
+                    }
+                    if zero_run > 0 {
+                        writer.write(jpeg_ac_code(ac_symbols, 0x00), 8);
+                    }
+                }
+            }
+        }
+        out.extend_from_slice(&writer.finish());
+        out.extend_from_slice(&[0xff, 0xd9]);
+        out
+    }
+
+    fn dc_block(value: i32) -> [i32; 64] {
+        let mut block = [0_i32; 64];
+        block[0] = value;
+        block
+    }
+
+    #[test]
+    fn decodes_grayscale_baseline_jpeg() {
+        let quant = [1_i32; 64];
+        let file = jpeg_build(
+            8,
+            8,
+            &[(1, 1, 1)],
+            &quant,
+            &[0x00],
+            0,
+            &[vec![vec![dc_block(8)]]],
+        );
+        assert_eq!(detect_format(&file), Some(ImageFormat::Jpeg));
+        let image = decode(&file).expect("greyscale JPEG should decode");
+        assert_eq!((image.width, image.height), (8, 8));
+        for y in 0..8 {
+            for x in 0..8 {
+                assert_eq!(image.get(x, y), [129, 129, 129, 255], "at {x},{y}");
+            }
+        }
+        assert_eq!(ImageData::decode(&file).expect("convenience decode"), image);
+    }
+
+    #[test]
+    fn decodes_ac_coefficient_in_baseline_jpeg() {
+        // A single F(0, 1) coefficient produces a horizontal cosine ramp.
+        let mut block = [0_i32; 64];
+        block[1] = 64;
+        let file = jpeg_build(
+            8,
+            8,
+            &[(1, 1, 1)],
+            &[1_i32; 64],
+            &[0x00, 0x07],
+            0,
+            &[vec![vec![block]]],
+        );
+        let image = decode(&file).expect("AC coefficient should decode");
+        let alpha = 1.0 / 2.0_f32.sqrt();
+        for x in 0..8_u32 {
+            let cosine = ((2 * x + 1) as f32 * std::f32::consts::PI / 16.0).cos();
+            let expected = (128.0 + 0.25 * 64.0 * cosine * alpha).round() as u8;
+            for y in 0..8 {
+                assert_eq!(
+                    image.get(x, y),
+                    [expected, expected, expected, 255],
+                    "at {x},{y}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn decodes_444_baseline_jpeg() {
+        // Y=100, Cb=150, Cr=200, all flat.
+        let file = jpeg_build(
+            8,
+            8,
+            &[(1, 1, 1), (2, 1, 1), (3, 1, 1)],
+            &[1_i32; 64],
+            &[0x00],
+            0,
+            &[vec![
+                vec![dc_block(-224)],
+                vec![dc_block(176)],
+                vec![dc_block(576)],
+            ]],
+        );
+        let image = decode(&file).expect("4:4:4 JPEG should decode");
+        let y = 100_f32;
+        let cb = 22_f32;
+        let cr = 72_f32;
+        let expected = [
+            (y + 1.402 * cr).round().clamp(0.0, 255.0) as u8,
+            (y - 0.344_136 * cb - 0.714_136 * cr)
+                .round()
+                .clamp(0.0, 255.0) as u8,
+            (y + 1.772 * cb).round().clamp(0.0, 255.0) as u8,
+            255,
+        ];
+        for row in 0..8 {
+            for column in 0..8 {
+                assert_eq!(image.get(column, row), expected, "at {column},{row}");
+            }
+        }
+    }
+
+    #[test]
+    fn decodes_422_subsampled_jpeg() {
+        // One 16x8 MCU: Y has two horizontal blocks (128 then 138), chroma is
+        // flat grey. Nearest-neighbour upsampling must map x=0..8 to the first
+        // block and x=8..16 to the second.
+        let file = jpeg_build(
+            16,
+            8,
+            &[(1, 2, 1), (2, 1, 1), (3, 1, 1)],
+            &[1_i32; 64],
+            &[0x00],
+            0,
+            &[vec![
+                vec![dc_block(0), dc_block(80)],
+                vec![dc_block(0)],
+                vec![dc_block(0)],
+            ]],
+        );
+        let image = decode(&file).expect("4:2:2 JPEG should decode");
+        assert_eq!((image.width, image.height), (16, 8));
+        for x in 0..16_u32 {
+            let value = if x < 8 { 128 } else { 138 };
+            for y in 0..8 {
+                assert_eq!(image.get(x, y), [value, value, value, 255], "at {x},{y}");
+            }
+        }
+    }
+
+    #[test]
+    fn decodes_420_subsampled_jpeg() {
+        // One 16x16 MCU: the Y plane is four 8x8 blocks. Only the top-left
+        // block differs, so upsampling must confine it to the top-left quadrant.
+        let file = jpeg_build(
+            16,
+            16,
+            &[(1, 2, 2), (2, 1, 1), (3, 1, 1)],
+            &[1_i32; 64],
+            &[0x00],
+            0,
+            &[vec![
+                vec![dc_block(0), dc_block(80), dc_block(80), dc_block(80)],
+                vec![dc_block(0)],
+                vec![dc_block(0)],
+            ]],
+        );
+        let image = decode(&file).expect("4:2:0 JPEG should decode");
+        assert_eq!((image.width, image.height), (16, 16));
+        for y in 0..16_u32 {
+            for x in 0..16_u32 {
+                let value = if x < 8 && y < 8 { 128 } else { 138 };
+                assert_eq!(image.get(x, y), [value, value, value, 255], "at {x},{y}");
+            }
+        }
+    }
+
+    #[test]
+    fn decodes_jpeg_with_restart_interval() {
+        // Four MCUs, a restart after each. Absolute DC values are chosen so
+        // that missing the predictor reset would decode the wrong rows.
+        let mcus: Vec<Vec<Vec<[i32; 64]>>> = [0, 80, 160, 240]
+            .iter()
+            .map(|&dc| vec![vec![dc_block(dc)]])
+            .collect();
+        let file = jpeg_build(8, 32, &[(1, 1, 1)], &[1_i32; 64], &[0x00], 1, &mcus);
+        let image = decode(&file).expect("JPEG with restarts should decode");
+        for (mcu, &value) in [128_u8, 138, 148, 158].iter().enumerate() {
+            for y in (mcu * 8) as u32..((mcu + 1) * 8) as u32 {
+                for x in 0..8 {
+                    assert_eq!(image.get(x, y), [value, value, value, 255], "at {x},{y}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_progressive_and_other_non_baseline_jpegs() {
+        let base = jpeg_build(
+            8,
+            8,
+            &[(1, 1, 1)],
+            &[1_i32; 64],
+            &[0x00],
+            0,
+            &[vec![vec![dc_block(0)]]],
+        );
+        let sof = base
+            .windows(2)
+            .position(|window| window == [0xff, 0xc0])
+            .expect("SOF0 marker");
+
+        // SOF2: progressive DCT.
+        let mut progressive = base.clone();
+        progressive[sof + 1] = 0xc2;
+        let error = decode(&progressive).expect_err("progressive JPEG must be rejected");
+        assert!(error.message.contains("progressive"), "{}", error.message);
+        assert!(error.message.contains("unsupported"), "{}", error.message);
+
+        // SOF1: extended sequential DCT.
+        let mut extended = base.clone();
+        extended[sof + 1] = 0xc1;
+        let error = decode(&extended).expect_err("extended JPEG must be rejected");
+        assert!(error.message.contains("unsupported"), "{}", error.message);
+
+        // 12-bit precision in SOF0.
+        let mut deep = base.clone();
+        deep[sof + 4] = 12;
+        let error = decode(&deep).expect_err("12-bit JPEG must be rejected");
+        assert!(error.message.contains("unsupported"), "{}", error.message);
+    }
+
+    #[test]
+    fn rejects_oversized_jpeg_dimensions() {
+        let mut file = jpeg_build(
+            8,
+            8,
+            &[(1, 1, 1)],
+            &[1_i32; 64],
+            &[0x00],
+            0,
+            &[vec![vec![dc_block(0)]]],
+        );
+        let sof = file
+            .windows(2)
+            .position(|window| window == [0xff, 0xc0])
+            .expect("SOF0 marker");
+        let width_offset = sof + 4 + 3;
+        file[width_offset..width_offset + 2].copy_from_slice(&5000_u16.to_be_bytes());
+        let error = decode(&file).expect_err("oversized JPEG must be rejected");
+        assert!(error.message.contains("exceed"), "{}", error.message);
+    }
+
+    #[test]
+    fn jpeg_never_panics_on_random_or_mutated_data() {
+        let valid = jpeg_build(
+            8,
+            8,
+            &[(1, 1, 1)],
+            &[1_i32; 64],
+            &[0x00],
+            0,
+            &[vec![vec![dc_block(0)]]],
+        );
+        let mut state = 0xdead_beef_1234_5678_u64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 33) as u8
+        };
+        for _ in 0..400 {
+            let mut bytes = vec![0xff, 0xd8];
+            for _ in 0..64 {
+                bytes.push(next());
+            }
+            let _ = decode(&bytes);
+
+            let mut file = valid.clone();
+            let mutations = 1 + (next() as usize % 5);
+            for _ in 0..mutations {
+                let index = (next() as usize) % file.len();
+                file[index] ^= next();
+            }
+            let _ = decode(&file);
+            let cut = (next() as usize) % file.len();
+            let _ = decode(&file[..cut]);
         }
     }
 }

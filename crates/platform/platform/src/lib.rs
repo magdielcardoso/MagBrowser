@@ -8,6 +8,9 @@
 //! * [`input`] — modifier state, key events and click tracking.
 //! * [`clipboard`] — in-memory and file-backed clipboards.
 //! * [`filesystem`] — direct and sandboxed filesystem access.
+//! * [`download`] — deterministic, stateful download queue.
+//! * [`history`] — bounded browsing history.
+//! * [`bookmarks`] — flat bookmark collection.
 //!
 //! ```
 //! use browser_platform::{Clipboard, MemoryClipboard, VirtualWindowBackend, WindowBackend,
@@ -24,13 +27,19 @@
 
 #![forbid(unsafe_code)]
 
+pub mod bookmarks;
 pub mod clipboard;
+pub mod download;
 pub mod filesystem;
+pub mod history;
 pub mod input;
 pub mod window;
 
+pub use bookmarks::{Bookmark, Bookmarks};
 pub use clipboard::{Clipboard, FileClipboard, MemoryClipboard};
+pub use download::{Download, DownloadError, DownloadManager, DownloadState};
 pub use filesystem::{FileSystem, SandboxedFileSystem, StdFileSystem};
+pub use history::{History, Visit};
 pub use input::{InputState, Key, KeyEvent, Modifiers, NamedKey};
 pub use window::{
     BackendRequest, ButtonState, MouseButton, VirtualWindowBackend, WindowBackend, WindowEvent,
@@ -71,5 +80,24 @@ impl std::error::Error for PlatformError {}
 impl From<std::io::Error> for PlatformError {
     fn from(error: std::io::Error) -> Self {
         Self::Io(error.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_send_sync<T: Send + Sync>() {}
+
+    #[test]
+    fn public_models_are_send_and_sync() {
+        assert_send_sync::<Download>();
+        assert_send_sync::<DownloadState>();
+        assert_send_sync::<DownloadError>();
+        assert_send_sync::<DownloadManager>();
+        assert_send_sync::<Visit>();
+        assert_send_sync::<History>();
+        assert_send_sync::<Bookmark>();
+        assert_send_sync::<Bookmarks>();
     }
 }

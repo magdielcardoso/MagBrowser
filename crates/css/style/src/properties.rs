@@ -2,7 +2,10 @@
 
 use browser_css::Color;
 
-use crate::computed::{ComputedValue, Dim, LineHeight};
+use crate::computed::{
+    AspectRatio, BorderRadius, ComputedValue, Dim, FilterList, LineHeight, ObjectFit, ShadowList,
+    TransformList,
+};
 
 /// A CSS longhand property.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -139,6 +142,26 @@ pub enum Property {
     GridTemplateColumns,
     /// `grid-template-rows`
     GridTemplateRows,
+    /// `grid-template-areas`
+    GridTemplateAreas,
+    /// `grid-column`
+    GridColumn,
+    /// `grid-row`
+    GridRow,
+    /// `grid-area`
+    GridArea,
+    /// `grid-auto-rows`
+    GridAutoRows,
+    /// `grid-auto-columns`
+    GridAutoColumns,
+    /// `grid-auto-flow`
+    GridAutoFlow,
+    /// `justify-items`
+    JustifyItems,
+    /// `justify-self`
+    JustifySelf,
+    /// `align-content`
+    AlignContent,
     /// `table-layout`
     TableLayout,
     /// `border-collapse`
@@ -151,6 +174,21 @@ pub enum Property {
     Cursor,
     /// `direction`
     Direction,
+    /// `border-radius` (kept as one compound value: four corners, each with an
+    /// optional second radius after `/`).
+    BorderRadius,
+    /// `box-shadow` (a comma-separated list of shadow layers).
+    BoxShadow,
+    /// `transform` (a space-separated list of transform functions).
+    Transform,
+    /// `aspect-ratio` (`auto` or a width / height ratio).
+    AspectRatio,
+    /// `object-fit` (how replaced content is fitted to its box).
+    ObjectFit,
+    /// `filter` (a space-separated list of filter functions, or `none`).
+    Filter,
+    /// `text-shadow` (a comma-separated list of shadow layers).
+    TextShadow,
 }
 
 impl Property {
@@ -222,12 +260,29 @@ impl Property {
         Property::ColumnGap,
         Property::GridTemplateColumns,
         Property::GridTemplateRows,
+        Property::GridTemplateAreas,
+        Property::GridColumn,
+        Property::GridRow,
+        Property::GridArea,
+        Property::GridAutoRows,
+        Property::GridAutoColumns,
+        Property::GridAutoFlow,
+        Property::JustifyItems,
+        Property::JustifySelf,
+        Property::AlignContent,
         Property::TableLayout,
         Property::BorderCollapse,
         Property::VerticalAlign,
         Property::ListStyleType,
         Property::Cursor,
         Property::Direction,
+        Property::BorderRadius,
+        Property::BoxShadow,
+        Property::Transform,
+        Property::AspectRatio,
+        Property::ObjectFit,
+        Property::Filter,
+        Property::TextShadow,
     ];
 
     /// The CSS name of the property.
@@ -299,12 +354,29 @@ impl Property {
             Property::ColumnGap => "column-gap",
             Property::GridTemplateColumns => "grid-template-columns",
             Property::GridTemplateRows => "grid-template-rows",
+            Property::GridTemplateAreas => "grid-template-areas",
+            Property::GridColumn => "grid-column",
+            Property::GridRow => "grid-row",
+            Property::GridArea => "grid-area",
+            Property::GridAutoRows => "grid-auto-rows",
+            Property::GridAutoColumns => "grid-auto-columns",
+            Property::GridAutoFlow => "grid-auto-flow",
+            Property::JustifyItems => "justify-items",
+            Property::JustifySelf => "justify-self",
+            Property::AlignContent => "align-content",
             Property::TableLayout => "table-layout",
             Property::BorderCollapse => "border-collapse",
             Property::VerticalAlign => "vertical-align",
             Property::ListStyleType => "list-style-type",
             Property::Cursor => "cursor",
             Property::Direction => "direction",
+            Property::BorderRadius => "border-radius",
+            Property::BoxShadow => "box-shadow",
+            Property::Transform => "transform",
+            Property::AspectRatio => "aspect-ratio",
+            Property::ObjectFit => "object-fit",
+            Property::Filter => "filter",
+            Property::TextShadow => "text-shadow",
         }
     }
 
@@ -407,12 +479,30 @@ pub fn initial_value(property: Property) -> Option<ComputedValue> {
         Property::GridTemplateColumns | Property::GridTemplateRows => {
             ComputedValue::keyword("none")
         }
+        // Placement values are kept as raw text so the grid layout engine can
+        // parse line numbers, `span`, named lines and `/` separators itself.
+        // `auto` is the spec initial value for every placement longhand.
+        Property::GridColumn
+        | Property::GridRow
+        | Property::GridArea
+        | Property::GridAutoRows
+        | Property::GridAutoColumns
+        | Property::JustifySelf => ComputedValue::keyword("auto"),
+        Property::GridTemplateAreas => ComputedValue::keyword("none"),
+        Property::GridAutoFlow => ComputedValue::keyword("row"),
+        Property::JustifyItems | Property::AlignContent => ComputedValue::keyword("normal"),
         Property::TableLayout => ComputedValue::keyword("auto"),
         Property::BorderCollapse => ComputedValue::keyword("separate"),
         Property::VerticalAlign => ComputedValue::keyword("baseline"),
         Property::ListStyleType => ComputedValue::keyword("disc"),
         Property::Cursor => ComputedValue::keyword("auto"),
         Property::Direction => ComputedValue::keyword("ltr"),
+        Property::BorderRadius => ComputedValue::BorderRadius(BorderRadius::default()),
+        Property::BoxShadow | Property::TextShadow => ComputedValue::Shadows(ShadowList::default()),
+        Property::Transform => ComputedValue::Transform(TransformList::default()),
+        Property::AspectRatio => ComputedValue::AspectRatio(AspectRatio::Auto),
+        Property::ObjectFit => ComputedValue::ObjectFit(ObjectFit::default()),
+        Property::Filter => ComputedValue::Filter(FilterList::default()),
     };
     Some(value)
 }
@@ -442,6 +532,30 @@ mod tests {
     fn all_properties_have_initial_values() {
         for property in Property::ALL {
             assert!(initial_value(*property).is_some(), "{property:?}");
+        }
+    }
+
+    #[test]
+    fn grid_properties_are_recognised_and_not_inherited() {
+        let grid = [
+            ("grid-column", Property::GridColumn),
+            ("grid-row", Property::GridRow),
+            ("grid-area", Property::GridArea),
+            ("grid-template-areas", Property::GridTemplateAreas),
+            ("grid-auto-rows", Property::GridAutoRows),
+            ("grid-auto-columns", Property::GridAutoColumns),
+            ("grid-auto-flow", Property::GridAutoFlow),
+            ("justify-content", Property::JustifyContent),
+            ("justify-items", Property::JustifyItems),
+            ("justify-self", Property::JustifySelf),
+            ("align-self", Property::AlignSelf),
+            ("align-content", Property::AlignContent),
+        ];
+        for (name, property) in grid {
+            assert_eq!(Property::from_name(name), Some(property), "{name}");
+            assert_eq!(property.name(), name);
+            assert!(!property.is_inherited(), "{name}");
+            assert!(initial_value(property).is_some(), "{name}");
         }
     }
 }

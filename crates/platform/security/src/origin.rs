@@ -79,6 +79,91 @@ impl OriginPolicy {
     pub fn validate(&self) -> Result<(), OriginError> {
         validate(self)
     }
+
+    /// Classifies a resolved subresource URL relative to this document origin.
+    ///
+    /// `blob:` URLs are unwrapped to the origin they inherit; other non-tuple
+    /// URLs (`data:`, `file:`, ...) are opaque.
+    pub fn classify_resource(&self, resource: &Url) -> SubresourceOrigin {
+        if self.is_opaque() {
+            return SubresourceOrigin::Opaque;
+        }
+        let resource = resource_origin(resource);
+        if resource.is_opaque() {
+            SubresourceOrigin::Opaque
+        } else if self.origin.same_origin(&resource) {
+            SubresourceOrigin::SameOrigin
+        } else {
+            SubresourceOrigin::CrossOrigin
+        }
+    }
+
+    /// True when a subresource URL is same-origin with this document.
+    ///
+    /// Cross-origin and opaque subresources are not automatically unsafe (CORS
+    /// and CSP may allow them), but they must not be granted same-origin
+    /// privileges such as direct DOM or storage access.
+    pub fn allows_subresource(&self, resource: &Url) -> bool {
+        self.classify_resource(resource) == SubresourceOrigin::SameOrigin
+    }
+}
+
+/// Where a subresource sits relative to a document origin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubresourceOrigin {
+    /// Same scheme, host and port as the document.
+    SameOrigin,
+    /// A different tuple origin; CORS/CSP may still permit the load.
+    CrossOrigin,
+    /// No comparable origin (`data:`, `file:`, an opaque document, ...).
+    Opaque,
+}
+
+impl SubresourceOrigin {
+    /// True only for same-origin subresources.
+    pub const fn is_same_origin(self) -> bool {
+        matches!(self, Self::SameOrigin)
+    }
+}
+
+/// The effective origin of a subresource URL.
+///
+/// `blob:` URLs inherit the origin of the tuple URL they encode; everything else
+/// uses the URL crate's origin computation, which returns an opaque origin for
+/// non-special schemes.
+pub fn resource_origin(url: &Url) -> Origin {
+    if url.scheme().eq_ignore_ascii_case("blob") {
+        let mut segments = url.path_segments().iter();
+        if let (Some(scheme), Some(authority)) = (segments.next(), segments.next())
+            && let Some(scheme) = scheme.strip_suffix(':')
+            && let Ok(inner) = Url::parse(&format!("{scheme}://{authority}/"))
+        {
+            let origin = inner.origin();
+            if !origin.is_opaque() {
+                return origin;
+            }
+        }
+    }
+    url.origin()
+}
+
+/// True when following a redirect did not change the origin.
+pub fn same_origin_redirect(original: &Url, final_url: &Url) -> bool {
+    let original = resource_origin(original);
+    !original.is_opaque() && original.same_origin(&resource_origin(final_url))
+}
+
+/// True when every URL in a redirect chain stays on the given origin.
+///
+/// An empty chain trivially stays on the origin. Each element is checked, so a
+/// chain that leaves the origin and comes back is still rejected.
+pub fn redirect_stays_same_origin(origin: &OriginPolicy, chain: &[Url]) -> bool {
+    if origin.is_opaque() {
+        return false;
+    }
+    chain
+        .iter()
+        .all(|url| origin.origin.same_origin(&resource_origin(url)))
 }
 
 impl fmt::Display for OriginPolicy {
@@ -412,5 +497,79 @@ mod tests {
                 .to_string()
                 .contains('x')
         );
+    }
+
+    #[test]
+    fn subresources_are_classified_by_origin() {
+        let document = policy("https://app.example/page");
+        assert_eq!(
+            document.classify_resource(&Url::parse("https://app.example/a.js").unwrap()),
+            SubresourceOrigin::SameOrigin
+        );
+        assert_eq!(
+            document.classify_resource(&Url::parse("https://app.example:443/a.js").unwrap()),
+            SubresourceOrigin::SameOrigin
+        );
+        assert_eq!(
+            document.classify_resource(&Url::parse("https://cdn.example/a.js").unwrap()),
+            SubresourceOrigin::CrossOrigin
+        );
+        assert_eq!(
+            document.classify_resource(&Url::parse("http://app.example/a.js").unwrap()),
+            SubresourceOrigin::CrossOrigin
+        );
+        assert_eq!(
+            document.classify_resource(&Url::parse("data:text/plain,hi").unwrap()),
+            SubresourceOrigin::Opaque
+        );
+        assert!(
+            document.allows_subresource(&Url::parse("https://app.example/a.js?x=1#y").unwrap())
+        );
+        assert!(!document.allows_subresource(&Url::parse("https://cdn.example/a.js").unwrap()));
+    }
+
+    #[test]
+    fn opaque_documents_have_no_same_origin_subresources() {
+        let document = OriginPolicy::opaque();
+        assert_eq!(
+            document.classify_resource(&Url::parse("https://app.example/a.js").unwrap()),
+            SubresourceOrigin::Opaque
+        );
+        assert!(!document.allows_subresource(&Url::parse("https://app.example/a.js").unwrap()));
+    }
+
+    #[test]
+    fn blob_urls_inherit_the_inner_origin() {
+        let document = policy("https://app.example/page");
+        assert!(document.allows_subresource(&Url::parse("blob:https://app.example/uuid").unwrap()));
+        assert!(
+            !document.allows_subresource(&Url::parse("blob:https://cdn.example/uuid").unwrap())
+        );
+        assert_eq!(
+            resource_origin(&Url::parse("blob:https://cdn.example:8443/uuid").unwrap()).serialize(),
+            "https://cdn.example:8443"
+        );
+        assert!(resource_origin(&Url::parse("blob:null/uuid").unwrap()).is_opaque());
+    }
+
+    #[test]
+    fn redirect_chains_must_stay_on_the_origin() {
+        let original = Url::parse("https://app.example/start").unwrap();
+        let same = Url::parse("https://app.example:443/end").unwrap();
+        let cross = Url::parse("https://cdn.example/end").unwrap();
+        assert!(same_origin_redirect(&original, &same));
+        assert!(!same_origin_redirect(&original, &cross));
+
+        let document = policy("https://app.example/");
+        assert!(redirect_stays_same_origin(
+            &document,
+            &[original.clone(), same.clone()]
+        ));
+        assert!(redirect_stays_same_origin(&document, &[]));
+        assert!(!redirect_stays_same_origin(
+            &document,
+            &[original, cross, same]
+        ));
+        assert!(!redirect_stays_same_origin(&OriginPolicy::opaque(), &[]));
     }
 }

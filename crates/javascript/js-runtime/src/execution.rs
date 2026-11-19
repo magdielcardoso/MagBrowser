@@ -1,6 +1,6 @@
 //! Completion values and statement helpers shared by the interpreter.
 
-use browser_js_parser::{ForInit, ForTarget, Stmt};
+use browser_js_parser::{ExportKind, ForInit, ForTarget, Stmt};
 
 use crate::value::Value;
 
@@ -106,6 +106,13 @@ pub(crate) fn collect_var_names(stmts: &[Stmt], out: &mut Vec<String>) {
             Stmt::Labeled { body, .. } => {
                 collect_var_names(std::slice::from_ref(body), out);
             }
+            Stmt::Import(_) => {}
+            Stmt::Export(export) => match &export.kind {
+                ExportKind::Decl(inner) | ExportKind::DefaultDecl(inner) => {
+                    collect_var_names(std::slice::from_ref(inner), out);
+                }
+                _ => {}
+            },
             _ => {}
         }
     }

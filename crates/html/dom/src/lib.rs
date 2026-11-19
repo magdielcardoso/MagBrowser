@@ -21,6 +21,7 @@
 pub mod attributes;
 pub mod document;
 pub mod element;
+pub mod limits;
 pub mod mutation;
 pub mod node;
 pub mod serialize;
@@ -29,5 +30,6 @@ pub mod traversal;
 
 pub use attributes::Attributes;
 pub use document::Document;
+pub use limits::Limits;
 pub use node::{ElementData, Namespace, Node, NodeData, NodeId, TextData};
 pub use serialize::{escape_attr, escape_text, serialize, serialize_children, serialize_outer};

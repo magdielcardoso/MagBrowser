@@ -21,7 +21,7 @@ crates/
   html/selectors      selector parsing and matching
   css/css-parser      CSS tokenizer → stylesheet AST, component values
   css/style           cascade, inheritance, var(), media queries, computed style
-  layout/text         bitmap font metrics, shaping information, line breaking
+  layout/text         Inter outline metrics, anti-aliased rasterization, line breaking
   layout/layout       box tree, block/inline/flex layout, scrolling, fragments
   graphics/paint      display list + software rasterizer + PNG encoder
   graphics/compositor layers, tiles, damage, clip stack, animation clocks
@@ -120,15 +120,16 @@ the JS bindings never need a second node identity.
 3. **Display list as the boundary.** The rasterizer and the GPU backend consume the
    same commands, which makes screenshot tests exact and gives the future `wgpu`
    backend a contract that is already exercised.
-4. **Deterministic rendering.** The built-in monospace bitmap font, the software
+4. **Deterministic rendering.** The embedded Inter outline font, the software
    rasterizer and the PNG encoder produce byte-identical output for identical input,
    with no system fonts, no GPU and no threads in the render path.
 5. **Explicit errors, no panics on untrusted input.** The HTML tokenizer recovers
    from malformed markup, CSS skips invalid declarations, and network errors become
    `HttpError`/`BrowserError` values.
-6. **Honest scope.** Unsupported features (floats, grid, full table formatting,
-   regex literals, native GPU path) are recorded in `docs/roadmap.md` and in code
-   doc comments rather than silently faked.
+6. **Honest scope.** Partially implemented features (full grid placement, advanced
+   table formatting, transforms and filters) are recorded in `docs/roadmap.md` and
+   in code doc comments rather than silently faked; floats, regex literals and the
+   native GPU path are implemented.
 
 ## Concurrency and Git workflow
 

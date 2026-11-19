@@ -3,19 +3,39 @@
 //! Supported:
 //! - `grid-template-columns` / `grid-template-rows` track lists made of fixed
 //!   lengths (`px`), percentages (resolved against the grid content width),
-//!   `fr` units, `auto`, and `repeat(n, ...)`.
-//! - `gap`, `row-gap` and `column-gap`.
-//! - Row-major automatic placement of the children into the defined columns.
-//! - Auto rows sized to the tallest child in the row.
+//!   `fr` units, `auto`, and `repeat(n, ...)`. Named grid lines such as
+//!   `[main-start] 1fr [main-end]` are accepted and remembered.
+//! - Named areas via `grid-template-areas` (quoted rows), including the
+//!   implicit `<area>-start` / `<area>-end` named lines.
+//! - Explicit placement via `grid-column` / `grid-row` (`1 / 3`, `span 2`,
+//!   `<name>-start / <name>-end`, negative line numbers) and `grid-area`
+//!   (`<name>` or `row-start / col-start / row-end / col-end`).
+//! - Implicit tracks created by placements beyond the explicit grid, sized by
+//!   `grid-auto-rows` / `grid-auto-columns` (default `auto`).
+//! - Sparse row-major (or `grid-auto-flow: column`) auto placement that skips
+//!   cells occupied by explicitly placed items.
+//! - `gap`, `row-gap` and `column-gap`; per-track `auto` sizing from items.
+//! - `minmax(min, max)`: a flexible (`Nfr`) or definite (length / percentage)
+//!   `max` determines the track size; intrinsic maxima (and `fit-content()`,
+//!   `min-content`, `max-content`) are modelled as `auto`.
+//! - Item alignment: `justify-items` / `align-items` on the container and
+//!   `justify-self` / `align-self` on items (`start`, `center`, `end`,
+//!   `stretch`).
 //!
-//! Not supported (documented limitations): explicit `grid-column` /
-//! `grid-row` placement, named lines/areas, `grid-auto-flow: column`,
-//! `minmax()` beyond treating it as `auto`, `justify-items`/`align-items`, and
-//! grid item spanning. Malformed track lists fall back to a single `auto`
-//! column instead of failing.
+//! Placement, track lists, gaps and alignment are all read from computed
+//! style, so they work from stylesheets as well as inline `style` attributes.
+//!
+//! Limitations:
+//! - Dense packing, baseline alignment and `subgrid` are not implemented.
+//!   Intrinsic track keywords (`fit-content`, `min-content`, `max-content`)
+//!   behave as `auto`. Malformed track lists fall back to a single `auto`
+//!   column instead of failing.
+
+use std::collections::HashMap;
 
 use browser_dom::Document;
-use browser_style::{BoxSizing, Dim};
+use browser_style::interpret::is_intrinsic_sizing;
+use browser_style::{AlignItems, BoxSizing, ComputedValue, Dim, Property};
 
 use crate::block::{layout_box, resolve, shrink_to_fit};
 use crate::position::translate_subtree;
@@ -33,6 +53,106 @@ enum Track {
     Auto,
 }
 
+/// A parsed track list together with the line names declared around tracks.
+#[derive(Debug, Clone, Default)]
+struct TrackList {
+    tracks: Vec<Track>,
+    /// `line_names[i]` are the names on grid line `i` (0-based). There is one
+    /// more entry than tracks (the line after the last track).
+    line_names: Vec<Vec<String>>,
+}
+
+impl TrackList {
+    fn is_empty(&self) -> bool {
+        self.tracks.is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.tracks.len()
+    }
+}
+
+/// Named areas parsed from `grid-template-areas`. Rectangles are stored as
+/// 1-based grid line numbers `(row_start, col_start, row_end, col_end)`.
+#[derive(Debug, Default)]
+struct GridAreas {
+    rects: HashMap<String, (usize, usize, usize, usize)>,
+    rows: usize,
+    cols: usize,
+}
+
+/// A single `grid-column` / `grid-row` component.
+#[derive(Debug, Clone, Default, PartialEq)]
+enum LineValue {
+    #[default]
+    Auto,
+    Number(i32),
+    Ident(String),
+    Span(usize),
+    SpanIdent(String),
+}
+
+#[derive(Debug, Clone, Default)]
+struct AxisPlacement {
+    start: LineValue,
+    end: LineValue,
+}
+
+#[derive(Debug, Clone, Default)]
+struct RawPlacement {
+    col: AxisPlacement,
+    row: AxisPlacement,
+    area: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ResolvedAxis {
+    start: Option<usize>,
+    span: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ResolvedPlacement {
+    col: ResolvedAxis,
+    row: ResolvedAxis,
+}
+
+/// The cell (0-based track start and span) assigned to an item.
+#[derive(Debug, Clone, Copy)]
+struct Cell {
+    col: usize,
+    row: usize,
+    col_span: usize,
+    row_span: usize,
+}
+
+impl Default for Cell {
+    fn default() -> Self {
+        Self {
+            col: 0,
+            row: 0,
+            col_span: 1,
+            row_span: 1,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum InlineAlign {
+    Start,
+    Center,
+    End,
+    Stretch,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum BlockAlign {
+    Start,
+    Center,
+    End,
+    Stretch,
+}
+
 /// Lays out a grid container's children and returns the content height.
 pub fn layout_grid(tree: &mut LayoutTree, doc: &Document, index: usize) -> f32 {
     let style = tree.boxes[index].style.clone();
@@ -45,44 +165,122 @@ pub fn layout_grid(tree: &mut LayoutTree, doc: &Document, index: usize) -> f32 {
         .collect();
     let column_gap = style.column_gap().max(0.0);
     let row_gap = style.row_gap().max(0.0);
-
-    let mut columns = parse_track_list(style.grid_template_columns().as_deref());
-    if columns.is_empty() {
-        // `none` (or an unparseable track list) behaves like a single
-        // stretched column.
-        columns.push(Track::Fr(1.0));
-    }
-    let column_count = columns.len();
-
-    let needed_rows = children.len().div_ceil(column_count).max(1);
-    let mut rows = parse_track_list(style.grid_template_rows().as_deref());
-    if rows.len() < needed_rows {
-        rows.resize(needed_rows, Track::Auto);
-    }
-    let row_count = rows.len();
-
     let available = content.width.max(0.0);
+    let item_count = children.len();
+
+    // --- Templates ---------------------------------------------------------
+    let mut col_tracks = parse_track_list(style.grid_template_columns().as_deref());
+    let mut row_tracks = parse_track_list(style.grid_template_rows().as_deref());
+    if col_tracks.is_empty() {
+        col_tracks.tracks.push(Track::Fr(1.0));
+        ensure_line_names(&mut col_tracks, 1);
+    }
+    if row_tracks.is_empty() {
+        ensure_line_names(&mut row_tracks, 0);
+    }
+
+    let areas = parse_grid_areas(style.grid_template_areas().as_deref());
+    inject_area_lines(&mut col_tracks, &mut row_tracks, &areas);
+
+    let mut auto_cols = parse_track_list(style.grid_auto_columns().as_deref()).tracks;
+    let mut auto_rows = parse_track_list(style.grid_auto_rows().as_deref()).tracks;
+    if auto_cols.is_empty() {
+        auto_cols.push(Track::Auto);
+    }
+    if auto_rows.is_empty() {
+        auto_rows.push(Track::Auto);
+    }
+    let auto_flow_column = style.grid_auto_flow().is_some_and(|value| {
+        value
+            .split_whitespace()
+            .any(|k| k.eq_ignore_ascii_case("column"))
+    });
+
+    // --- Per-item placement declarations -----------------------------------
+    let mut raw_placements: Vec<Option<RawPlacement>> = Vec::with_capacity(item_count);
+    for &child in &children {
+        if !crate::budget::try_step() {
+            break;
+        }
+        let child_style = &tree.boxes[child].style;
+        let area = child_style.grid_area().as_deref().map(parse_area_value);
+        let col = child_style.grid_column().as_deref().map(parse_axis_value);
+        let row = child_style.grid_row().as_deref().map(parse_axis_value);
+        // `grid-column` / `grid-row` override the corresponding `grid-area`
+        // components, so merge them into the area placement when present.
+        let mut placement = area.unwrap_or_default();
+        if let Some(col) = col {
+            placement.col = col;
+            placement.area = None;
+        }
+        if let Some(row) = row {
+            placement.row = row;
+            placement.area = None;
+        }
+        raw_placements.push(Some(placement));
+    }
+    raw_placements.resize(item_count, None);
+
+    // Ensure the explicit grid covers at least the number of items when there
+    // are no explicit rows (mirrors the original row-major behaviour).
+    let min_rows = item_count.div_ceil(col_tracks.len().max(1)).max(1);
+    ensure_row_track(&mut row_tracks, &auto_rows, min_rows.saturating_sub(1));
+
+    let cells = place_items(
+        &raw_placements,
+        &areas,
+        &mut col_tracks,
+        &mut row_tracks,
+        &auto_cols,
+        &auto_rows,
+        auto_flow_column,
+    );
+
+    let column_count = col_tracks.len();
+    let row_count = row_tracks.len();
 
     // --- Column sizing -----------------------------------------------------
-    let mut auto_widths = vec![0.0_f32; column_count];
-    for (position, child) in children.iter().enumerate() {
-        let column = position % column_count;
-        if !matches!(columns[column], Track::Auto) {
-            continue;
+    let mut intrinsic = vec![0.0_f32; item_count];
+    for (position, &child) in children.iter().enumerate() {
+        if !crate::budget::try_step() {
+            break;
         }
-        let child_style = tree.boxes[*child].style.clone();
-        let width = match child_style.width() {
-            Dim::Auto => shrink_to_fit(tree, doc, *child, available),
+        let b = &tree.boxes[child];
+        let width = match b.style.width() {
+            Dim::Auto => shrink_to_fit(tree, child, available),
             dim => resolve(dim, available),
         }
         .max(0.0);
-        auto_widths[column] = auto_widths[column].max(width);
+        intrinsic[position] = width + b.margins.horizontal();
+    }
+
+    let mut auto_widths = vec![0.0_f32; column_count];
+    for (position, cell) in cells.iter().enumerate() {
+        if !crate::budget::try_step() {
+            break;
+        }
+        let auto_span = col_tracks
+            .tracks
+            .iter()
+            .take((cell.col + cell.col_span).min(column_count))
+            .skip(cell.col)
+            .filter(|track| matches!(track, Track::Auto))
+            .count();
+        if auto_span == 0 {
+            continue;
+        }
+        let per = intrinsic[position] / auto_span as f32;
+        for column in cell.col..(cell.col + cell.col_span).min(column_count) {
+            if matches!(col_tracks.tracks[column], Track::Auto) {
+                auto_widths[column] = auto_widths[column].max(per);
+            }
+        }
     }
 
     let gaps_width = column_gap * column_count.saturating_sub(1) as f32;
     let mut fixed_width = gaps_width;
-    let mut fr_units = 0.0;
-    for (column, track) in columns.iter().enumerate() {
+    let mut fr_units = 0.0_f32;
+    for (column, track) in col_tracks.tracks.iter().enumerate() {
         match track {
             Track::Fixed(px) => fixed_width += px.max(0.0),
             Track::Percent(percent) => fixed_width += (available * percent / 100.0).max(0.0),
@@ -96,7 +294,8 @@ pub fn layout_grid(tree: &mut LayoutTree, doc: &Document, index: usize) -> f32 {
     } else {
         0.0
     };
-    let widths: Vec<f32> = columns
+    let widths: Vec<f32> = col_tracks
+        .tracks
         .iter()
         .enumerate()
         .map(|(column, track)| match track {
@@ -107,32 +306,74 @@ pub fn layout_grid(tree: &mut LayoutTree, doc: &Document, index: usize) -> f32 {
         })
         .collect();
 
+    // --- Child layout (needed for row sizing) ------------------------------
+    let justify_items = inline_align(style.justify_items().as_deref());
+    for (position, &child) in children.iter().enumerate() {
+        if !crate::budget::try_step() {
+            break;
+        }
+        let cell = cells[position];
+        let cell_width: f32 = (cell.col..(cell.col + cell.col_span).min(column_count))
+            .map(|c| widths[c])
+            .sum::<f32>()
+            + column_gap * cell.col_span.saturating_sub(1) as f32;
+        let justify_self = tree.boxes[child].style.justify_self();
+        let effective_inline = inline_align_inherit(justify_self.as_deref(), justify_items);
+        // An intrinsic width (`fit-content`, `min-content`, `max-content`) is
+        // stored as raw text and reads back as `Dim::Auto`, but unlike a real
+        // `auto` it must not stretch to fill the grid cell.
+        let width_is_intrinsic = matches!(
+            tree.boxes[child].style.get(Property::Width),
+            Some(ComputedValue::Str(text)) if is_intrinsic_sizing(text)
+        );
+        let child_width_auto = tree.boxes[child].style.width() == Dim::Auto && !width_is_intrinsic;
+        let layout_width = if effective_inline == InlineAlign::Stretch && child_width_auto {
+            cell_width
+        } else {
+            intrinsic[position]
+        };
+        let _ = layout_box(tree, doc, child, 0.0, 0.0, layout_width.max(1.0));
+    }
+
     // --- Row sizing --------------------------------------------------------
     let definite_height = definite_content_height(tree, index);
-    let mut row_content = vec![0.0_f32; row_count];
-    for (position, child) in children.iter().enumerate() {
-        let column = position % column_count;
-        let row = position / column_count;
-        let width = widths.get(column).copied().unwrap_or(0.0);
-        let _ = layout_box(tree, doc, *child, 0.0, 0.0, width.max(1.0));
-        if let Some(slot) = row_content.get_mut(row) {
-            let b = &tree.boxes[*child];
-            let height = b.rect.height + b.margins.vertical();
-            *slot = slot.max(height);
+    let mut auto_heights = vec![0.0_f32; row_count];
+    for (position, &child) in children.iter().enumerate() {
+        if !crate::budget::try_step() {
+            break;
+        }
+        let cell = cells[position];
+        let b = &tree.boxes[child];
+        let height = b.rect.height + b.margins.vertical();
+        let auto_span = row_tracks
+            .tracks
+            .iter()
+            .take((cell.row + cell.row_span).min(row_count))
+            .skip(cell.row)
+            .filter(|track| matches!(track, Track::Auto))
+            .count();
+        if auto_span == 0 {
+            continue;
+        }
+        let per = height / auto_span as f32;
+        for row in cell.row..(cell.row + cell.row_span).min(row_count) {
+            if matches!(row_tracks.tracks[row], Track::Auto) {
+                auto_heights[row] = auto_heights[row].max(per);
+            }
         }
     }
 
     let mut row_heights = vec![0.0_f32; row_count];
     let mut fixed_height = 0.0_f32;
     let mut fr_row_units = 0.0_f32;
-    for (row, track) in rows.iter().enumerate() {
+    for (row, track) in row_tracks.tracks.iter().enumerate() {
         let base = match track {
             Track::Fixed(px) => px.max(0.0),
             Track::Percent(percent) => {
                 let base = definite_height.unwrap_or(available);
                 (base * percent / 100.0).max(0.0)
             }
-            Track::Auto | Track::Fr(_) => row_content.get(row).copied().unwrap_or(0.0),
+            Track::Auto | Track::Fr(_) => auto_heights[row],
         };
         row_heights[row] = base;
         match track {
@@ -146,7 +387,7 @@ pub fn layout_grid(tree: &mut LayoutTree, doc: &Document, index: usize) -> f32 {
         let gaps_height = row_gap * row_count.saturating_sub(1) as f32;
         let remaining = (height - fixed_height - gaps_height).max(0.0);
         let unit = remaining / fr_row_units;
-        for (row, track) in rows.iter().enumerate() {
+        for (row, track) in row_tracks.tracks.iter().enumerate() {
             if let Track::Fr(factor) = track {
                 row_heights[row] = row_heights[row].max(unit * factor.max(0.0));
             }
@@ -167,14 +408,46 @@ pub fn layout_grid(tree: &mut LayoutTree, doc: &Document, index: usize) -> f32 {
         y += height + row_gap;
     }
 
-    for (position, child) in children.iter().enumerate() {
-        let column = position % column_count;
-        let row = position / column_count;
-        let (Some(cell_x), Some(cell_y)) = (column_x.get(column), row_y.get(row)) else {
+    let align_items = block_align_from_style(style.align_items());
+    for (position, &child) in children.iter().enumerate() {
+        if !crate::budget::try_step() {
+            break;
+        }
+        let cell = cells[position];
+        let (Some(cell_x), Some(cell_y)) = (column_x.get(cell.col), row_y.get(cell.row)) else {
             continue;
         };
-        let rect = tree.boxes[*child].rect;
-        translate_subtree(tree, *child, cell_x - rect.x, cell_y - rect.y);
+        let cell_width: f32 = (cell.col..(cell.col + cell.col_span).min(column_count))
+            .map(|c| widths[c])
+            .sum::<f32>()
+            + column_gap * cell.col_span.saturating_sub(1) as f32;
+        let cell_height: f32 = (cell.row..(cell.row + cell.row_span).min(row_count))
+            .map(|r| row_heights[r])
+            .sum::<f32>()
+            + row_gap * cell.row_span.saturating_sub(1) as f32;
+
+        let inline = inline_align_inherit(
+            tree.boxes[child].style.justify_self().as_deref(),
+            justify_items,
+        );
+        let block =
+            block_align_inherit(tree.boxes[child].style.align_self().as_deref(), align_items);
+
+        let rect = tree.boxes[child].rect;
+        let dx = match inline {
+            InlineAlign::Start | InlineAlign::Stretch => 0.0,
+            InlineAlign::Center => (cell_width - rect.width) / 2.0,
+            InlineAlign::End => cell_width - rect.width,
+        };
+        let dy = match block {
+            BlockAlign::Start | BlockAlign::Stretch => 0.0,
+            BlockAlign::Center => (cell_height - rect.height) / 2.0,
+            BlockAlign::End => cell_height - rect.height,
+        };
+        if block == BlockAlign::Stretch && cell_height > rect.height {
+            tree.boxes[child].rect.height = cell_height;
+        }
+        translate_subtree(tree, child, cell_x + dx - rect.x, cell_y + dy - rect.y);
     }
 
     let total: f32 = row_heights.iter().sum::<f32>() + row_gap * row_count.saturating_sub(1) as f32;
@@ -198,28 +471,59 @@ fn definite_content_height(tree: &LayoutTree, index: usize) -> Option<f32> {
             // content width is used as the percentage base (documented).
             Some((b.content.width * percent / 100.0).max(0.0))
         }
+        Dim::Calc { percent, px } => Some((b.content.width * percent / 100.0 + px).max(0.0)),
     }
 }
 
-fn parse_track_list(raw: Option<&str>) -> Vec<Track> {
+// --- Track parsing ----------------------------------------------------------
+
+fn parse_track_list(raw: Option<&str>) -> TrackList {
     let Some(raw) = raw else {
-        return Vec::new();
+        return TrackList::default();
     };
-    let mut tracks = Vec::new();
-    parse_tracks(raw, &mut tracks);
-    tracks
+    let mut out = TrackList::default();
+    append_tracks(raw, &mut out);
+    out
 }
 
-fn parse_tracks(input: &str, out: &mut Vec<Track>) {
-    for token in split_top_level(input) {
-        if out.len() >= MAX_TRACKS {
-            break;
-        }
-        let token = token.trim().to_ascii_lowercase();
-        if token.is_empty() || token == "none" {
+fn ensure_line_names(list: &mut TrackList, line: usize) {
+    while list.line_names.len() <= line {
+        list.line_names.push(Vec::new());
+    }
+}
+
+fn append_tracks(input: &str, out: &mut TrackList) {
+    let mut pending_names: Vec<String> = Vec::new();
+    for raw_token in split_top_level(input) {
+        let token = raw_token.trim();
+        if token.is_empty() {
             continue;
         }
-        if let Some(inner) = token
+        if token.starts_with('[') {
+            let mut rest = token;
+            while let Some(after) = rest.strip_prefix('[') {
+                let Some((names, tail)) = after.split_once(']') else {
+                    break;
+                };
+                for name in names.split_whitespace() {
+                    let name = name.trim().to_ascii_lowercase();
+                    if !name.is_empty() {
+                        pending_names.push(name);
+                    }
+                }
+                rest = tail.trim();
+                if rest.is_empty() {
+                    break;
+                }
+            }
+            continue;
+        }
+        let line = out.tracks.len();
+        ensure_line_names(out, line);
+        out.line_names[line].append(&mut pending_names);
+
+        let lower = token.to_ascii_lowercase();
+        if let Some(inner) = lower
             .strip_prefix("repeat(")
             .and_then(|value| value.strip_suffix(')'))
         {
@@ -232,34 +536,50 @@ fn parse_tracks(input: &str, out: &mut Vec<Track>) {
                 .ok()
                 .unwrap_or(0)
                 .min(MAX_TRACKS);
-            let mut inner_tracks = Vec::new();
-            parse_tracks(list, &mut inner_tracks);
-            if inner_tracks.is_empty() {
+            let mut inner_list = TrackList::default();
+            append_tracks(list, &mut inner_list);
+            if inner_list.tracks.is_empty() {
                 continue;
             }
             for _ in 0..count {
-                if out.len() + inner_tracks.len() > MAX_TRACKS {
+                if out.tracks.len() + inner_list.tracks.len() > MAX_TRACKS {
                     break;
                 }
-                out.extend_from_slice(&inner_tracks);
+                let base = out.tracks.len();
+                for (index, track) in inner_list.tracks.iter().enumerate() {
+                    ensure_line_names(out, base + index);
+                    if let Some(names) = inner_list.line_names.get(index) {
+                        out.line_names[base + index].extend(names.iter().cloned());
+                    }
+                    out.tracks.push(*track);
+                }
+                ensure_line_names(out, out.tracks.len());
+                if let Some(names) = inner_list.line_names.last() {
+                    out.line_names[out.tracks.len()].extend(names.iter().cloned());
+                }
             }
             continue;
         }
-        if let Some(track) = parse_track(&token) {
-            out.push(track);
+        if let Some(track) = parse_track(&lower) {
+            out.tracks.push(track);
         }
     }
+    ensure_line_names(out, out.tracks.len());
+    out.line_names[out.tracks.len()].append(&mut pending_names);
 }
 
 fn split_top_level(input: &str) -> Vec<&str> {
     let mut out = Vec::new();
     let mut depth = 0_i32;
+    let mut brackets = 0_i32;
     let mut start = 0_usize;
     for (index, character) in input.char_indices() {
         match character {
             '(' => depth += 1,
             ')' => depth = (depth - 1).max(0),
-            c if c.is_whitespace() && depth == 0 => {
+            '[' => brackets += 1,
+            ']' => brackets = (brackets - 1).max(0),
+            c if c.is_whitespace() && depth == 0 && brackets == 0 => {
                 if index > start {
                     out.push(&input[start..index]);
                 }
@@ -287,11 +607,10 @@ fn split_once_top_level(input: &str) -> Option<(&str, &str)> {
     None
 }
 
-fn parse_track(token: &str) -> Option<Track> {
+/// Parses a definite (non-intrinsic) track size: an `fr`, length or percentage
+/// value. Shared by [`parse_track`] and [`parse_minmax`].
+fn parse_definite_track(token: &str) -> Option<Track> {
     let token = token.trim();
-    if token.is_empty() {
-        return None;
-    }
     if let Some(prefix) = token.strip_suffix("fr") {
         let value = prefix.trim().parse::<f32>().ok()?;
         return value.is_finite().then_some(Track::Fr(value.max(0.0)));
@@ -307,18 +626,620 @@ fn parse_track(token: &str) -> Option<Track> {
     if token == "0" {
         return Some(Track::Fixed(0.0));
     }
-    if matches!(token, "auto" | "min-content" | "max-content")
-        || token.starts_with("minmax(")
-        || token.starts_with("fit-content(")
+    None
+}
+
+/// Parses `minmax(min, max)`, preferring a definite `max` (`Nfr`, a length or a
+/// percentage) because it is the most faithful sizing the subset can express.
+/// An intrinsic `max` falls back to a definite, positive `min`, otherwise the
+/// track is sized from its items like `auto`.
+fn parse_minmax(inner: &str) -> Option<Track> {
+    let (min, max) = split_once_top_level(inner)?;
+    // A bare `0` is not a useful maximum (it would collapse the track).
+    if let Some(track) = parse_definite_track(max)
+        && !matches!(track, Track::Fixed(0.0))
+    {
+        return Some(track);
+    }
+    if let Some(track) = parse_definite_track(min)
+        && !matches!(
+            track,
+            Track::Fixed(0.0) | Track::Percent(0.0) | Track::Fr(0.0)
+        )
+    {
+        return Some(track);
+    }
+    // `min-content`, `max-content`, `auto` and `fit-content()` are all modelled
+    // as `auto` by this subset.
+    Some(Track::Auto)
+}
+
+fn parse_track(token: &str) -> Option<Track> {
+    let token = token.trim();
+    if token.is_empty() || token == "none" {
+        return None;
+    }
+    if let Some(track) = parse_definite_track(token) {
+        return Some(track);
+    }
+    if let Some(inner) = token
+        .strip_prefix("minmax(")
+        .and_then(|value| value.strip_suffix(')'))
+    {
+        return parse_minmax(inner);
+    }
+    if matches!(
+        token,
+        "auto" | "min-content" | "max-content" | "fit-content"
+    ) || token.starts_with("fit-content(")
     {
         return Some(Track::Auto);
     }
     None
 }
 
+// --- Named areas ------------------------------------------------------------
+
+fn parse_grid_areas(raw: Option<&str>) -> GridAreas {
+    let Some(raw) = raw else {
+        return GridAreas::default();
+    };
+    let bytes = raw.as_bytes();
+    let mut rows: Vec<Vec<&str>> = Vec::new();
+    let mut i = 0_usize;
+    while i < bytes.len() {
+        let quote = bytes[i];
+        if quote == b'"' || quote == b'\'' {
+            i += 1;
+            let start = i;
+            while i < bytes.len() && bytes[i] != quote {
+                i += 1;
+            }
+            let row: Vec<&str> = raw[start..i].split_whitespace().collect();
+            if !row.is_empty() {
+                rows.push(row);
+            }
+        }
+        i += 1;
+    }
+    if rows.is_empty() {
+        return GridAreas::default();
+    }
+    let cols = rows.iter().map(Vec::len).max().unwrap_or(0);
+    let mut rects = HashMap::new();
+    for (row, cells) in rows.iter().enumerate() {
+        for (col, cell) in cells.iter().enumerate() {
+            if *cell == "." || cell.eq_ignore_ascii_case("null") {
+                continue;
+            }
+            let name = cell.to_ascii_lowercase();
+            if rects.contains_key(&name) {
+                continue;
+            }
+            let (end_row, end_col) = area_rect(&rows, row, col, cols);
+            rects.insert(name, (row + 1, col + 1, end_row + 1, end_col + 1));
+        }
+    }
+    GridAreas {
+        rects,
+        rows: rows.len(),
+        cols,
+    }
+}
+
+/// Finds the rectangular extent (exclusive end row/column) of an area cell,
+/// as required by CSS. Ragged rows are treated as empty (`.`) beyond their end.
+fn area_rect(rows: &[Vec<&str>], row: usize, col: usize, cols: usize) -> (usize, usize) {
+    let name = rows[row][col];
+    let mut end_col = col + 1;
+    while end_col < cols && rows[row].get(end_col).copied() == Some(name) {
+        end_col += 1;
+    }
+    let mut end_row = row + 1;
+    'rows: while end_row < rows.len() {
+        for c in col..end_col {
+            if rows[end_row].get(c).copied() != Some(name) {
+                break 'rows;
+            }
+        }
+        end_row += 1;
+    }
+    let mut final_col = col + 1;
+    'cols: while final_col < cols {
+        for cells in rows.iter().take(end_row).skip(row) {
+            if cells.get(final_col).copied() != Some(name) {
+                break 'cols;
+            }
+        }
+        final_col += 1;
+    }
+    (end_row, final_col)
+}
+
+fn inject_area_lines(cols: &mut TrackList, rows: &mut TrackList, areas: &GridAreas) {
+    for (name, &(row_start, col_start, row_end, col_end)) in &areas.rects {
+        let col_begin = col_start.saturating_sub(1);
+        let col_finish = col_end.saturating_sub(1);
+        ensure_line_names(cols, col_finish);
+        cols.line_names[col_begin].push(format!("{name}-start"));
+        cols.line_names[col_finish].push(format!("{name}-end"));
+
+        let row_begin = row_start.saturating_sub(1);
+        let row_finish = row_end.saturating_sub(1);
+        ensure_line_names(rows, row_finish);
+        rows.line_names[row_begin].push(format!("{name}-start"));
+        rows.line_names[row_finish].push(format!("{name}-end"));
+    }
+    while cols.len() < areas.cols && cols.len() < MAX_TRACKS {
+        cols.tracks.push(Track::Auto);
+        ensure_line_names(cols, cols.len());
+    }
+    while rows.len() < areas.rows && rows.len() < MAX_TRACKS {
+        rows.tracks.push(Track::Auto);
+        ensure_line_names(rows, rows.len());
+    }
+}
+
+// --- Placement parsing ------------------------------------------------------
+
+fn parse_line_value(value: &str) -> LineValue {
+    let value = value.trim();
+    if value.is_empty() || value.eq_ignore_ascii_case("auto") {
+        return LineValue::Auto;
+    }
+    let mut words = value.split_whitespace();
+    if words.next().is_some_and(|w| w.eq_ignore_ascii_case("span"))
+        && let Some(rest) = words.next()
+    {
+        if let Ok(count) = rest.parse::<usize>() {
+            return LineValue::Span(count.max(1));
+        }
+        return LineValue::SpanIdent(rest.to_ascii_lowercase());
+    }
+    if let Ok(number) = value.parse::<i32>() {
+        return LineValue::Number(number);
+    }
+    LineValue::Ident(value.to_ascii_lowercase())
+}
+
+fn parse_axis_value(raw: &str) -> AxisPlacement {
+    let mut parts = raw.split('/').map(str::trim);
+    AxisPlacement {
+        start: parts
+            .next()
+            .map(parse_line_value)
+            .unwrap_or(LineValue::Auto),
+        end: parts
+            .next()
+            .map(parse_line_value)
+            .unwrap_or(LineValue::Auto),
+    }
+}
+
+fn parse_area_value(raw: &str) -> RawPlacement {
+    let parts: Vec<&str> = raw.split('/').map(str::trim).collect();
+    let is_name = parts.len() == 1
+        && !parts[0].is_empty()
+        && !parts[0].eq_ignore_ascii_case("auto")
+        && parts[0].parse::<i32>().is_err()
+        && !parts[0].to_ascii_lowercase().starts_with("span");
+    if is_name {
+        return RawPlacement {
+            area: Some(parts[0].to_ascii_lowercase()),
+            ..RawPlacement::default()
+        };
+    }
+    RawPlacement {
+        col: AxisPlacement {
+            start: parts
+                .get(1)
+                .map(|v| parse_line_value(v))
+                .unwrap_or(LineValue::Auto),
+            end: parts
+                .get(3)
+                .map(|v| parse_line_value(v))
+                .unwrap_or(LineValue::Auto),
+        },
+        row: AxisPlacement {
+            start: parts
+                .first()
+                .map(|v| parse_line_value(v))
+                .unwrap_or(LineValue::Auto),
+            end: parts
+                .get(2)
+                .map(|v| parse_line_value(v))
+                .unwrap_or(LineValue::Auto),
+        },
+        area: None,
+    }
+}
+
+fn line_to_index(number: i32, track_count: usize) -> usize {
+    // Lines are numbered 1..=N+1; a negative number counts back from the end
+    // line, so -1 is the (N+1)th line. Return the 0-based track index.
+    let total_lines = (track_count + 1) as i32;
+    let line = if number > 0 {
+        number
+    } else {
+        total_lines + number + 1
+    };
+    (line - 1).clamp(0, track_count as i32) as usize
+}
+
+fn resolve_line_name(name: &str, list: &TrackList) -> Option<usize> {
+    list.line_names
+        .iter()
+        .position(|names| names.iter().any(|candidate| candidate == name))
+}
+
+fn resolve_axis(value: &AxisPlacement, list: &TrackList) -> ResolvedAxis {
+    let leading_span = match &value.start {
+        LineValue::Span(count) => Some(*count),
+        _ => None,
+    };
+    let mut start = match &value.start {
+        LineValue::Number(number) => Some(line_to_index(*number, list.len())),
+        LineValue::Ident(name) => resolve_line_name(name, list),
+        LineValue::Auto | LineValue::Span(_) | LineValue::SpanIdent(_) => None,
+    };
+    let mut end = match &value.end {
+        LineValue::Number(number) => Some(line_to_index(*number, list.len())),
+        LineValue::Ident(name) => resolve_line_name(name, list),
+        LineValue::Auto | LineValue::Span(_) | LineValue::SpanIdent(_) => None,
+    };
+    let trailing_span = match &value.end {
+        LineValue::Span(count) => Some(*count),
+        _ => None,
+    };
+    if let (Some(s), Some(e)) = (start, end)
+        && e < s
+    {
+        std::mem::swap(&mut start, &mut end);
+    }
+    let span = if let Some(count) = leading_span.or(trailing_span) {
+        count.max(1)
+    } else if let (Some(s), Some(e)) = (start, end) {
+        e.saturating_sub(s).max(1)
+    } else {
+        1
+    };
+    if start.is_none() {
+        start = end.map(|e| e.saturating_sub(1));
+    }
+    ResolvedAxis { start, span }
+}
+
+fn resolve_area(name: &str, areas: &GridAreas) -> Option<ResolvedPlacement> {
+    let &(row_start, col_start, row_end, col_end) = areas.rects.get(name)?;
+    let col_begin = col_start.saturating_sub(1);
+    let col_finish = col_end.saturating_sub(1);
+    let row_begin = row_start.saturating_sub(1);
+    let row_finish = row_end.saturating_sub(1);
+    Some(ResolvedPlacement {
+        col: ResolvedAxis {
+            start: Some(col_begin),
+            span: col_finish.saturating_sub(col_begin).max(1),
+        },
+        row: ResolvedAxis {
+            start: Some(row_begin),
+            span: row_finish.saturating_sub(row_begin).max(1),
+        },
+    })
+}
+
+// --- Placement engine -------------------------------------------------------
+
+fn ensure_col_track(tracks: &mut TrackList, auto: &[Track], index: usize) {
+    while tracks.len() <= index && tracks.len() < MAX_TRACKS {
+        let track = auto
+            .get(tracks.len() % auto.len().max(1))
+            .copied()
+            .unwrap_or(Track::Auto);
+        tracks.tracks.push(track);
+        ensure_line_names(tracks, tracks.len());
+    }
+}
+
+fn ensure_row_track(tracks: &mut TrackList, auto: &[Track], index: usize) {
+    while tracks.len() <= index && tracks.len() < MAX_TRACKS {
+        let track = auto
+            .get(tracks.len() % auto.len().max(1))
+            .copied()
+            .unwrap_or(Track::Auto);
+        tracks.tracks.push(track);
+        ensure_line_names(tracks, tracks.len());
+    }
+}
+
+fn is_free(
+    occupied: &[Vec<bool>],
+    row: usize,
+    col: usize,
+    row_span: usize,
+    col_span: usize,
+) -> bool {
+    for r in row..row + row_span {
+        for c in col..col + col_span {
+            if occupied
+                .get(r)
+                .and_then(|cells| cells.get(c))
+                .copied()
+                .unwrap_or(false)
+            {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn occupy(
+    occupied: &mut Vec<Vec<bool>>,
+    cols: &mut TrackList,
+    rows: &mut TrackList,
+    auto_cols: &[Track],
+    auto_rows: &[Track],
+    cell: Cell,
+) {
+    ensure_col_track(cols, auto_cols, cell.col + cell.col_span - 1);
+    ensure_row_track(rows, auto_rows, cell.row + cell.row_span - 1);
+    while occupied.len() < rows.len() {
+        occupied.push(vec![false; occupied.first().map_or(0, Vec::len)]);
+    }
+    for row in occupied.iter_mut() {
+        row.resize(cols.len(), false);
+    }
+    for row in occupied
+        .iter_mut()
+        .take((cell.row + cell.row_span).min(rows.len()))
+        .skip(cell.row)
+    {
+        for slot in row
+            .iter_mut()
+            .take((cell.col + cell.col_span).min(cols.len()))
+            .skip(cell.col)
+        {
+            *slot = true;
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn find_slot(
+    occupied: &[Vec<bool>],
+    want_col: Option<usize>,
+    want_row: Option<usize>,
+    col_span: usize,
+    row_span: usize,
+    cursor: (usize, usize),
+    column_flow: bool,
+    col_limit: usize,
+    row_limit: usize,
+) -> Option<(usize, usize)> {
+    if let Some(col) = want_col {
+        // A definite column may need new rows, regardless of flow direction.
+        for row in cursor.0..MAX_TRACKS {
+            if row + row_span > MAX_TRACKS {
+                break;
+            }
+            if is_free(occupied, row, col, row_span, col_span) {
+                return Some((row, col));
+            }
+        }
+        for row in 0..cursor.0.min(MAX_TRACKS) {
+            if is_free(occupied, row, col, row_span, col_span) {
+                return Some((row, col));
+            }
+        }
+        return None;
+    }
+    if let Some(row) = want_row {
+        // A definite row may need new columns, regardless of flow direction.
+        for col in cursor.1..MAX_TRACKS {
+            if col + col_span > MAX_TRACKS {
+                break;
+            }
+            if is_free(occupied, row, col, row_span, col_span) {
+                return Some((row, col));
+            }
+        }
+        for col in 0..cursor.1.min(MAX_TRACKS) {
+            if is_free(occupied, row, col, row_span, col_span) {
+                return Some((row, col));
+            }
+        }
+        return None;
+    }
+    if column_flow {
+        // Columns are the flow axis: new columns may be created, but rows are
+        // bounded by the existing grid (new rows only come from row flow).
+        for col in cursor.1..col_limit {
+            let first_row = if col == cursor.1 { cursor.0 } else { 0 };
+            for row in first_row..row_limit {
+                if row + row_span > row_limit {
+                    break;
+                }
+                if is_free(occupied, row, col, row_span, col_span) {
+                    return Some((row, col));
+                }
+            }
+        }
+    } else {
+        // Rows are the flow axis: new rows may be created, but columns are
+        // bounded by the existing explicit grid.
+        for row in cursor.0..row_limit {
+            let first_col = if row == cursor.0 { cursor.1 } else { 0 };
+            for col in first_col..col_limit {
+                if col + col_span > col_limit {
+                    break;
+                }
+                if is_free(occupied, row, col, row_span, col_span) {
+                    return Some((row, col));
+                }
+            }
+        }
+    }
+    None
+}
+
+fn place_items(
+    placements: &[Option<RawPlacement>],
+    areas: &GridAreas,
+    cols: &mut TrackList,
+    rows: &mut TrackList,
+    auto_cols: &[Track],
+    auto_rows: &[Track],
+    column_flow: bool,
+) -> Vec<Cell> {
+    let count = placements.len();
+    let mut cells = vec![Cell::default(); count];
+    let mut placed = vec![false; count];
+    let mut resolved: Vec<Option<ResolvedPlacement>> = vec![None; count];
+
+    for (index, raw) in placements.iter().enumerate() {
+        if !crate::budget::try_step() {
+            break;
+        }
+        let Some(raw) = raw else { continue };
+        resolved[index] = if let Some(name) = &raw.area {
+            resolve_area(name, areas)
+        } else {
+            Some(ResolvedPlacement {
+                col: resolve_axis(&raw.col, cols),
+                row: resolve_axis(&raw.row, rows),
+            })
+        };
+    }
+
+    let mut occupied: Vec<Vec<bool>> = vec![vec![false; cols.len()]; rows.len()];
+
+    // Definitely placed items occupy their cells first.
+    for index in 0..count {
+        if !crate::budget::try_step() {
+            break;
+        }
+        let Some(placement) = resolved[index] else {
+            continue;
+        };
+        let (Some(col), Some(row)) = (placement.col.start, placement.row.start) else {
+            continue;
+        };
+        let cell = Cell {
+            col: col.min(MAX_TRACKS.saturating_sub(1)),
+            row: row.min(MAX_TRACKS.saturating_sub(1)),
+            col_span: placement.col.span.max(1),
+            row_span: placement.row.span.max(1),
+        };
+        occupy(&mut occupied, cols, rows, auto_cols, auto_rows, cell);
+        cells[index] = cell;
+        placed[index] = true;
+    }
+
+    // Auto (and semi-auto) items fill the remaining free cells.
+    let mut cursor = (0_usize, 0_usize);
+    for index in 0..count {
+        if !crate::budget::try_step() {
+            break;
+        }
+        if placed[index] {
+            continue;
+        }
+        let (want_col, want_row, col_span, row_span) = match resolved[index] {
+            Some(placement) => (
+                placement.col.start,
+                placement.row.start,
+                placement.col.span.max(1),
+                placement.row.span.max(1),
+            ),
+            None => (None, None, 1, 1),
+        };
+        let Some((row, col)) = find_slot(
+            &occupied,
+            want_col,
+            want_row,
+            col_span,
+            row_span,
+            cursor,
+            column_flow,
+            if column_flow { MAX_TRACKS } else { cols.len() },
+            if column_flow { rows.len() } else { MAX_TRACKS },
+        ) else {
+            continue;
+        };
+        let cell = Cell {
+            col,
+            row,
+            col_span,
+            row_span,
+        };
+        occupy(&mut occupied, cols, rows, auto_cols, auto_rows, cell);
+        cells[index] = cell;
+        cursor = if column_flow {
+            (row + row_span, col)
+        } else {
+            (row, col + col_span)
+        };
+    }
+    cells
+}
+
+// --- Alignment helpers ------------------------------------------------------
+
+fn inline_align(value: Option<&str>) -> InlineAlign {
+    match value.unwrap_or("").trim().to_ascii_lowercase().as_str() {
+        "start" | "left" | "flex-start" | "self-start" => InlineAlign::Start,
+        "end" | "right" | "flex-end" | "self-end" => InlineAlign::End,
+        "center" => InlineAlign::Center,
+        _ => InlineAlign::Stretch,
+    }
+}
+
+fn inline_align_inherit(value: Option<&str>, parent: InlineAlign) -> InlineAlign {
+    match value {
+        None => parent,
+        Some(raw) if raw.trim().eq_ignore_ascii_case("auto") => parent,
+        Some(raw) => inline_align(Some(raw)),
+    }
+}
+
+fn inline_block_align(value: Option<&str>) -> BlockAlign {
+    match value.unwrap_or("").trim().to_ascii_lowercase().as_str() {
+        "start" | "flex-start" | "self-start" | "baseline" => BlockAlign::Start,
+        "end" | "flex-end" | "self-end" => BlockAlign::End,
+        "center" => BlockAlign::Center,
+        _ => BlockAlign::Stretch,
+    }
+}
+
+fn block_align_inherit(value: Option<&str>, parent: BlockAlign) -> BlockAlign {
+    match value {
+        None => parent,
+        Some(raw) if raw.trim().eq_ignore_ascii_case("auto") => parent,
+        Some(raw) => inline_block_align(Some(raw)),
+    }
+}
+
+fn block_align_from_style(align: AlignItems) -> BlockAlign {
+    match align {
+        AlignItems::FlexStart | AlignItems::Baseline => BlockAlign::Start,
+        AlignItems::FlexEnd => BlockAlign::End,
+        AlignItems::Center => BlockAlign::Center,
+        AlignItems::Stretch => BlockAlign::Stretch,
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use browser_dom::Document;
+    use browser_style::{Origin, StyleEngine, Viewport};
+
     use crate::test_util::layout_grid;
+    use crate::{LayoutTree, Size, layout};
+
+    use super::{
+        GridAreas, TrackList, inline_align, line_to_index, parse_area_value, parse_axis_value,
+        parse_grid_areas, parse_track_list, resolve_axis,
+    };
 
     fn approx(actual: f32, expected: f32) {
         assert!(
@@ -327,13 +1248,95 @@ mod tests {
         );
     }
 
+    /// Like `test_util::layout_grid`, but grid-specific declarations live in
+    /// the inline `style` attribute (which the style engine computes into the
+    /// same computed properties a stylesheet rule would set).
+    fn layout_grid_inline(
+        grid_css: &str,
+        items: &[(&str, &str)],
+    ) -> (Document, LayoutTree, Vec<browser_dom::NodeId>) {
+        let mut doc = Document::new();
+        let html = doc.create_element("html");
+        let body = doc.create_element("body");
+        doc.append_child(doc.root(), html);
+        doc.append_child(html, body);
+        let grid = doc.create_element("div");
+        doc.set_attr(grid, "id", "g");
+        doc.set_attr(grid, "style", grid_css);
+        doc.append_child(body, grid);
+        let mut ids = vec![grid];
+        for (id, style) in items {
+            let child = doc.create_element("div");
+            doc.set_attr(child, "id", id);
+            doc.set_attr(child, "style", style);
+            doc.append_child(grid, child);
+            ids.push(child);
+        }
+        let mut engine = StyleEngine::new(Viewport {
+            width: 800.0,
+            height: 600.0,
+        });
+        engine.add_css("body { margin: 0; }", Origin::Author);
+        let styled = engine.compute(&doc);
+        let tree = layout(
+            &doc,
+            &styled,
+            Size {
+                width: 800.0,
+                height: 600.0,
+            },
+        );
+        (doc, tree, ids)
+    }
+
+    /// Like `layout_grid_inline`, but each item receives a text child so
+    /// intrinsic (shrink-to-fit) widths are measurable.
+    fn layout_grid_with_item_text(
+        grid_css: &str,
+        items: &[(&str, &str, &str)],
+    ) -> (Document, LayoutTree, Vec<browser_dom::NodeId>) {
+        let mut doc = Document::new();
+        let html = doc.create_element("html");
+        let body = doc.create_element("body");
+        doc.append_child(doc.root(), html);
+        doc.append_child(html, body);
+        let grid = doc.create_element("div");
+        doc.set_attr(grid, "id", "g");
+        doc.set_attr(grid, "style", grid_css);
+        doc.append_child(body, grid);
+        let mut ids = vec![grid];
+        for (id, style, text) in items {
+            let child = doc.create_element("div");
+            doc.set_attr(child, "id", id);
+            doc.set_attr(child, "style", style);
+            doc.append_child(grid, child);
+            let text_node = doc.create_text(text);
+            doc.append_child(child, text_node);
+            ids.push(child);
+        }
+        let mut engine = StyleEngine::new(Viewport {
+            width: 800.0,
+            height: 600.0,
+        });
+        engine.add_css("body { margin: 0; }", Origin::Author);
+        let styled = engine.compute(&doc);
+        let tree = layout(
+            &doc,
+            &styled,
+            Size {
+                width: 800.0,
+                height: 600.0,
+            },
+        );
+        (doc, tree, ids)
+    }
+
     #[test]
     fn two_fixed_columns() {
         let (doc, tree, ids) = layout_grid(
             "body { margin: 0; } #g { display: grid; width: 400px; grid-template-columns: 100px 200px; }",
             &[("div", "a", ""), ("div", "b", "")],
         );
-        // ids: body, g, a, b
         let a = tree.find_node(ids[2]).unwrap();
         let b = tree.find_node(ids[3]).unwrap();
         approx(a.rect.width, 100.0);
@@ -448,7 +1451,6 @@ mod tests {
             "body { margin: 0; width: 200px; } #g { display: grid; grid-template-columns: 1fr 1fr; }",
             &[("div", "a", ""), ("div", "b", "")],
         );
-        // ids: body, g, a, b
         let a = tree.find_node(ids[2]).unwrap();
         let b = tree.find_node(ids[3]).unwrap();
         approx(a.rect.width, 100.0);
@@ -491,8 +1493,6 @@ mod tests {
         let g = tree.find_node(ids[1]).unwrap();
         assert_eq!(g.rect.height, 10.0);
         let a = tree.find_node(ids[2]).unwrap();
-        // Malformed input must not panic; the fallback keeps the item inside
-        // the grid.
         assert!(a.rect.width > 0.0);
         assert!(a.rect.right() <= 300.0 + 0.01);
         let _ = doc;
@@ -525,6 +1525,365 @@ mod tests {
         approx(b.rect.y, 30.0);
         let g = tree.find_node(ids[1]).unwrap();
         approx(g.content.height, 90.0);
+        let _ = doc;
+    }
+
+    // --- New tests: named lines, areas and spans --------------------------
+
+    #[test]
+    fn placement_from_stylesheet_rule() {
+        let (doc, tree, ids) = layout_grid(
+            "body { margin: 0; } \
+             #g { display: grid; width: 300px; grid-template-columns: 100px 100px 100px; \
+                  grid-template-rows: 20px 20px; } \
+             #a { grid-column: 2; grid-row: 1; height: 5px; } \
+             #b { grid-column: 3; grid-row: 2; height: 5px; }",
+            &[("div", "a", ""), ("div", "b", "")],
+        );
+        let a = tree.find_node(ids[2]).unwrap();
+        let b = tree.find_node(ids[3]).unwrap();
+        approx(a.rect.x, 100.0);
+        approx(a.rect.y, 0.0);
+        approx(b.rect.x, 200.0);
+        approx(b.rect.y, 20.0);
+        let _ = doc;
+    }
+
+    #[test]
+    fn explicit_line_placement() {
+        let (doc, tree, ids) = layout_grid_inline(
+            "display: grid; width: 300px; grid-template-columns: repeat(3, 100px);",
+            &[
+                ("a", "grid-column: 1 / 3; height: 10px;"),
+                ("b", "grid-column: 3 / 4; height: 10px;"),
+            ],
+        );
+        let a = tree.find_node(ids[1]).unwrap();
+        let b = tree.find_node(ids[2]).unwrap();
+        approx(a.rect.x, 0.0);
+        approx(a.rect.width, 200.0);
+        approx(b.rect.x, 200.0);
+        let _ = doc;
+    }
+
+    #[test]
+    fn span_two_columns() {
+        let (doc, tree, ids) = layout_grid_inline(
+            "display: grid; width: 300px; grid-template-columns: repeat(3, 1fr);",
+            &[
+                ("a", "grid-column: span 2; height: 10px;"),
+                ("b", "height: 10px;"),
+            ],
+        );
+        let a = tree.find_node(ids[1]).unwrap();
+        let b = tree.find_node(ids[2]).unwrap();
+        approx(a.rect.width, 200.0);
+        approx(b.rect.x, 200.0);
+        approx(b.rect.width, 100.0);
+        let _ = doc;
+    }
+
+    #[test]
+    fn auto_placement_skips_explicit_items() {
+        let (doc, tree, ids) = layout_grid_inline(
+            "display: grid; width: 300px; grid-template-columns: repeat(2, 150px);",
+            &[
+                ("a", "grid-column: 2; height: 10px;"),
+                ("b", "height: 10px;"),
+                ("c", "height: 10px;"),
+            ],
+        );
+        let a = tree.find_node(ids[1]).unwrap();
+        let b = tree.find_node(ids[2]).unwrap();
+        let c = tree.find_node(ids[3]).unwrap();
+        approx(a.rect.x, 150.0);
+        approx(b.rect.x, 0.0);
+        approx(b.rect.y, 10.0);
+        approx(c.rect.x, 150.0);
+        approx(c.rect.y, 10.0);
+        let _ = doc;
+    }
+
+    #[test]
+    fn named_areas_place_items() {
+        let (doc, tree, ids) = layout_grid_inline(
+            "display: grid; width: 300px; grid-template-columns: 1fr 1fr; grid-template-rows: 20px 20px; \
+             grid-template-areas: \"head head\" \"side main\";",
+            &[
+                ("head", "grid-area: head; height: 5px;"),
+                ("side", "grid-area: side; height: 5px;"),
+                ("main", "grid-area: main; height: 5px;"),
+            ],
+        );
+        let head = tree.find_node(ids[1]).unwrap();
+        let side = tree.find_node(ids[2]).unwrap();
+        let main = tree.find_node(ids[3]).unwrap();
+        approx(head.rect.x, 0.0);
+        approx(head.rect.y, 0.0);
+        approx(head.rect.width, 300.0);
+        approx(side.rect.x, 0.0);
+        approx(side.rect.y, 20.0);
+        approx(side.rect.width, 150.0);
+        approx(main.rect.x, 150.0);
+        approx(main.rect.y, 20.0);
+        let _ = doc;
+    }
+
+    #[test]
+    fn named_area_lines_resolve_to_spans() {
+        let (doc, tree, ids) = layout_grid_inline(
+            "display: grid; width: 300px; grid-template-columns: 1fr 1fr; \
+             grid-template-areas: \"head head\" \"foot foot\";",
+            &[("a", "grid-column: head-start / head-end; height: 5px;")],
+        );
+        let a = tree.find_node(ids[1]).unwrap();
+        approx(a.rect.x, 0.0);
+        approx(a.rect.width, 300.0);
+        let _ = doc;
+    }
+
+    #[test]
+    fn implicit_rows_use_grid_auto_rows() {
+        let (doc, tree, ids) = layout_grid_inline(
+            "display: grid; width: 300px; grid-template-columns: 1fr; grid-auto-rows: 25px;",
+            &[("a", "grid-row: 3; height: 5px;"), ("b", "height: 5px;")],
+        );
+        let a = tree.find_node(ids[1]).unwrap();
+        let b = tree.find_node(ids[2]).unwrap();
+        approx(a.rect.y, 50.0);
+        // The auto-placement cursor has advanced past the explicit item, so
+        // the following item lands in the next implicit (25px) row.
+        approx(b.rect.y, 75.0);
+        let _ = doc;
+    }
+
+    #[test]
+    fn justify_self_aligns_item_within_cell() {
+        let (doc, tree, ids) = layout_grid_inline(
+            "display: grid; width: 300px; grid-template-columns: 300px;",
+            &[
+                (
+                    "a",
+                    "grid-column: 1; width: 100px; justify-self: end; height: 5px;",
+                ),
+                ("b", "width: 100px; justify-self: center; height: 5px;"),
+            ],
+        );
+        let a = tree.find_node(ids[1]).unwrap();
+        let b = tree.find_node(ids[2]).unwrap();
+        approx(a.rect.x, 200.0);
+        approx(b.rect.x, 100.0);
+        let _ = doc;
+    }
+
+    #[test]
+    fn justify_items_aligns_every_item() {
+        let (doc, tree, ids) = layout_grid_inline(
+            "display: grid; width: 300px; grid-template-columns: 300px; justify-items: center;",
+            &[
+                ("a", "width: 100px; height: 5px;"),
+                ("b", "width: 100px; height: 5px;"),
+            ],
+        );
+        let a = tree.find_node(ids[1]).unwrap();
+        let b = tree.find_node(ids[2]).unwrap();
+        approx(a.rect.x, 100.0);
+        approx(b.rect.x, 100.0);
+        let _ = doc;
+    }
+
+    #[test]
+    fn align_self_aligns_item_vertically() {
+        let (doc, tree, ids) = layout_grid_inline(
+            "display: grid; width: 300px; grid-template-columns: 300px; grid-template-rows: 40px 40px;",
+            &[
+                ("a", "grid-row: 1; height: 10px; align-self: end;"),
+                ("b", "grid-row: 2; height: 10px; align-self: center;"),
+            ],
+        );
+        let a = tree.find_node(ids[1]).unwrap();
+        let b = tree.find_node(ids[2]).unwrap();
+        approx(a.rect.y, 30.0);
+        approx(b.rect.y, 55.0);
+        let _ = doc;
+    }
+
+    #[test]
+    fn column_flow_places_down_then_across() {
+        let (doc, tree, ids) = layout_grid_inline(
+            "display: grid; width: 300px; grid-template-columns: 150px 150px; grid-auto-flow: column;",
+            &[
+                ("a", "height: 10px;"),
+                ("b", "height: 10px;"),
+                ("c", "height: 10px;"),
+                ("d", "height: 10px;"),
+            ],
+        );
+        let a = tree.find_node(ids[1]).unwrap();
+        let b = tree.find_node(ids[2]).unwrap();
+        let c = tree.find_node(ids[3]).unwrap();
+        let d = tree.find_node(ids[4]).unwrap();
+        approx(a.rect.x, 0.0);
+        approx(a.rect.y, 0.0);
+        approx(b.rect.x, 0.0);
+        approx(b.rect.y, 10.0);
+        approx(c.rect.x, 150.0);
+        approx(c.rect.y, 0.0);
+        approx(d.rect.x, 150.0);
+        approx(d.rect.y, 10.0);
+        let _ = doc;
+    }
+
+    #[test]
+    fn negative_line_places_from_the_end() {
+        let (doc, tree, ids) = layout_grid_inline(
+            "display: grid; width: 300px; grid-template-columns: repeat(3, 100px);",
+            &[("a", "grid-column: -2 / -1; height: 5px;")],
+        );
+        let a = tree.find_node(ids[1]).unwrap();
+        approx(a.rect.x, 200.0);
+        approx(a.rect.width, 100.0);
+        let _ = doc;
+    }
+
+    #[test]
+    fn parse_tracks_with_named_lines() {
+        let list = parse_track_list(Some("[a] 1fr [b c] 100px [d]"));
+        assert_eq!(list.len(), 2);
+        assert_eq!(list.line_names[0], ["a"]);
+        assert_eq!(list.line_names[1], ["b", "c"]);
+        assert_eq!(list.line_names[2], ["d"]);
+    }
+
+    #[test]
+    fn parse_negative_and_named_lines() {
+        let list = parse_track_list(Some("[start] 1fr 1fr [end]"));
+        assert_eq!(line_to_index(-1, 2), 2);
+        assert_eq!(line_to_index(1, 2), 0);
+        assert_eq!(super::resolve_line_name("start", &list), Some(0));
+        assert_eq!(super::resolve_line_name("end", &list), Some(2));
+    }
+
+    #[test]
+    fn parse_area_shorthand_and_span_values() {
+        let area = parse_area_value("header");
+        assert_eq!(area.area.as_deref(), Some("header"));
+        let four = parse_area_value("1 / 2 / 3 / 4");
+        assert!(four.area.is_none());
+        let axis = parse_axis_value("2 / span 3");
+        assert_eq!(axis.start, super::LineValue::Number(2));
+        assert_eq!(axis.end, super::LineValue::Span(3));
+    }
+
+    #[test]
+    fn resolve_axis_handles_span_and_named_lines() {
+        let list = parse_track_list(Some("[a] 1fr 1fr 1fr [z]"));
+        let span = resolve_axis(
+            &parse_axis_value("span 2"),
+            &TrackList {
+                tracks: list.tracks.clone(),
+                line_names: list.line_names.clone(),
+            },
+        );
+        assert_eq!(span.span, 2);
+        assert_eq!(span.start, None);
+        let named = resolve_axis(&parse_axis_value("a / z"), &list);
+        assert_eq!(named.start, Some(0));
+        assert_eq!(named.span, 3);
+    }
+
+    #[test]
+    fn parse_areas_builds_rectangles() {
+        let areas: GridAreas = parse_grid_areas(Some("\"a a b\" \"a a b\" \"c c c\""));
+        assert_eq!(areas.rects.get("a"), Some(&(1, 1, 3, 3)));
+        assert_eq!(areas.rects.get("b"), Some(&(1, 3, 3, 4)));
+        assert_eq!(areas.rects.get("c"), Some(&(3, 1, 4, 4)));
+    }
+
+    #[test]
+    fn inline_align_defaults_to_stretch() {
+        assert_eq!(inline_align(None), super::InlineAlign::Stretch);
+        assert_eq!(inline_align(Some("center")), super::InlineAlign::Center);
+        assert_eq!(inline_align(Some("end")), super::InlineAlign::End);
+    }
+
+    // --- New tests: minmax(), span and intrinsic widths --------------------
+
+    #[test]
+    fn parse_repeat_minmax_zero_fr_as_six_equal_fr_tracks() {
+        let list = parse_track_list(Some("repeat(6, minmax(0, 1fr))"));
+        assert_eq!(list.len(), 6);
+        assert!(
+            list.tracks
+                .iter()
+                .all(|track| *track == super::Track::Fr(1.0)),
+            "expected six 1fr tracks, got {:?}",
+            list.tracks
+        );
+    }
+
+    #[test]
+    fn repeated_minmax_fr_columns_are_equal_width() {
+        let (doc, tree, ids) = layout_grid_inline(
+            "display: grid; width: 600px; grid-template-columns: repeat(6, minmax(0, 1fr));",
+            &[
+                ("a", "height: 5px;"),
+                ("b", "height: 5px;"),
+                ("c", "height: 5px;"),
+                ("d", "height: 5px;"),
+                ("e", "height: 5px;"),
+                ("f", "height: 5px;"),
+            ],
+        );
+        for (index, id) in ids.iter().enumerate().skip(1) {
+            let box_ref = tree.find_node(*id).unwrap();
+            approx(box_ref.rect.width, 100.0);
+            approx(box_ref.rect.x, (index as f32 - 1.0) * 100.0);
+        }
+        let _ = doc;
+    }
+
+    #[test]
+    fn grid_column_span_two_occupies_two_minmax_tracks() {
+        let (doc, tree, ids) = layout_grid_inline(
+            "display: grid; width: 600px; grid-template-columns: repeat(6, minmax(0, 1fr));",
+            &[
+                ("a", "grid-column: span 2; height: 5px;"),
+                ("b", "height: 5px;"),
+                ("c", "height: 5px;"),
+            ],
+        );
+        let a = tree.find_node(ids[1]).unwrap();
+        let b = tree.find_node(ids[2]).unwrap();
+        let c = tree.find_node(ids[3]).unwrap();
+        approx(a.rect.x, 0.0);
+        approx(a.rect.width, 200.0);
+        approx(b.rect.x, 200.0);
+        approx(b.rect.width, 100.0);
+        approx(c.rect.x, 300.0);
+        approx(c.rect.width, 100.0);
+        let _ = doc;
+    }
+
+    #[test]
+    fn fit_content_width_does_not_stretch() {
+        let (doc, tree, ids) = layout_grid_with_item_text(
+            "display: grid; width: 600px; grid-template-columns: repeat(2, minmax(0, 1fr));",
+            &[
+                ("a", "width: fit-content; height: 10px;", "short"),
+                ("b", "height: 10px;", ""),
+            ],
+        );
+        let a = tree.find_node(ids[1]).unwrap();
+        let b = tree.find_node(ids[2]).unwrap();
+        assert!(
+            a.rect.width > 0.0 && a.rect.width < 300.0,
+            "fit-content item should shrink to its content, got width {}",
+            a.rect.width
+        );
+        // The sibling has ordinary `auto` width and still stretches to its cell.
+        approx(b.rect.x, 300.0);
+        approx(b.rect.width, 300.0);
         let _ = doc;
     }
 }

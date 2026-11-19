@@ -3,8 +3,8 @@
 use browser_dom::{Document, Namespace, NodeData, NodeId, serialize, serialize_children};
 
 use crate::{
-    ParseOptions, Token, Tokenizer, TreeBuilder, parse_document, parse_document_with,
-    parse_fragment,
+    DEFAULT_MAX_DEPTH, DEFAULT_MAX_INPUT_BYTES, DEFAULT_MAX_NODES, ParseError, ParseOptions, Token,
+    Tokenizer, TreeBuilder, parse_document, parse_document_with, parse_fragment,
 };
 
 fn parsed(input: &str) -> Document {
@@ -723,4 +723,126 @@ fn parse_document_with_and_without_options_agree_on_valid_input() {
         serialize_children(&b, body_b)
     );
     assert_eq!(a.title, b.title);
+}
+
+// -------------------------------------------------------------------------
+// Defensive limits and stress (large real pages must not freeze the GUI)
+// -------------------------------------------------------------------------
+
+/// Iterative depth measurement so the test itself cannot overflow the stack.
+fn tree_depth(doc: &Document, root: NodeId) -> usize {
+    let mut deepest = 0;
+    let mut stack = vec![(root, 0usize)];
+    while let Some((id, depth)) = stack.pop() {
+        deepest = deepest.max(depth);
+        for child in doc.children(id) {
+            stack.push((*child, depth + 1));
+        }
+    }
+    deepest
+}
+
+fn has_error_containing(errors: &[ParseError], fragment: &str) -> bool {
+    errors.iter().any(|error| error.message.contains(fragment))
+}
+
+#[test]
+fn huge_input_is_truncated_and_reported() {
+    // The trailing markup sits past the 8 MiB cap and must never be parsed.
+    let input = format!("{}<p>tail</p>", "x".repeat(DEFAULT_MAX_INPUT_BYTES + 1024));
+    let result = parse_document_with(&input, &ParseOptions::default());
+    assert!(result.document.document_element().is_some());
+    assert!(
+        has_error_containing(&result.errors, "truncated"),
+        "expected a truncation error, got {:?}",
+        result.errors
+    );
+    assert!(result.document.get_elements_by_tag_name("p").is_empty());
+    let html = result.document.document_element().unwrap();
+    assert!(result.document.text_content(html).len() <= DEFAULT_MAX_INPUT_BYTES);
+}
+
+#[test]
+fn input_within_the_cap_is_left_intact() {
+    let input = format!("<p>{}</p>", "x".repeat(4096));
+    let result = parse_document_with(&input, &ParseOptions::default());
+    assert!(!has_error_containing(&result.errors, "truncated"));
+    assert_eq!(body_html(&input), input);
+}
+
+#[test]
+fn tokenizer_reports_truncation_at_a_character_boundary() {
+    let input = format!("{}\u{1f600}tail", "a".repeat(DEFAULT_MAX_INPUT_BYTES - 2));
+    let mut tokenizer = Tokenizer::with_max_input_bytes(&input, DEFAULT_MAX_INPUT_BYTES);
+    assert!(tokenizer.input_truncated());
+    // No panic: the first token is a text run within the cap.
+    assert!(matches!(tokenizer.next_token(), Token::Text(_)));
+}
+
+#[test]
+fn pathological_deep_nesting_finishes_quickly_and_stays_bounded() {
+    let input = format!("{}x", "<div>".repeat(50_000));
+    let result = parse_document_with(&input, &ParseOptions::default());
+    let html = result.document.document_element().expect("html element");
+    assert_eq!(result.document.text_content(html), "x");
+    assert!(has_error_containing(&result.errors, "depth"));
+    let depth = tree_depth(&result.document, html);
+    assert!(
+        depth <= DEFAULT_MAX_DEPTH + 4,
+        "tree depth {depth} exceeded the cap"
+    );
+    assert!(result.document.node_count() < DEFAULT_MAX_NODES);
+}
+
+#[test]
+fn node_cap_stops_growth_and_keeps_the_tree_well_formed() {
+    let input = "<span>x</span>".repeat(50_000);
+    let result = parse_document_with(
+        &input,
+        &ParseOptions {
+            max_nodes: 100,
+            ..ParseOptions::default()
+        },
+    );
+    assert!(
+        result.document.node_count() <= 110,
+        "allocated {} nodes",
+        result.document.node_count()
+    );
+    assert!(result.document.document_element().is_some());
+    assert!(result.document.head_and_body().1.is_some());
+    assert!(has_error_containing(&result.errors, "node"));
+}
+
+#[test]
+fn repeated_named_references_stay_bounded_and_decode_fully() {
+    let input = "&amp;".repeat(200_000);
+    let result = parse_document_with(&input, &ParseOptions::default());
+    let html = result.document.document_element().unwrap();
+    let text = result.document.text_content(html);
+    assert_eq!(text.len(), 200_000);
+    assert!(text.chars().all(|c| c == '&'));
+}
+
+#[test]
+fn pathological_numeric_reference_digits_do_not_hang() {
+    // A huge run of zero-padded digits must be consumed without a large parse,
+    // while still decoding correctly because significant digits are capped.
+    let input = format!("&#{}65;", "0".repeat(200_000));
+    let doc = parsed(&input);
+    let html = doc.document_element().unwrap();
+    assert_eq!(doc.text_content(html), "A");
+}
+
+#[test]
+fn malformed_input_still_recovers_under_the_limits() {
+    for input in [
+        format!("{}<div", "<p>x".repeat(20_000)),
+        format!("{}</div>", "<div>".repeat(5_000)),
+        format!("{}&notanentity;", "&amp;".repeat(20_000)),
+    ] {
+        let result = parse_document_with(&input, &ParseOptions::default());
+        assert!(result.document.document_element().is_some());
+        assert!(result.document.head_and_body().1.is_some());
+    }
 }

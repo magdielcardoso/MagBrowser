@@ -1,5 +1,7 @@
 //! `browser-headless`: deterministic rendering of local pages to PNG.
 
+mod trace;
+
 use std::io::Read;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -24,6 +26,7 @@ OPTIONS:
   --script          enable inline JavaScript
   --json            print a JSON snapshot to stdout
   --text            print the page text to stdout
+  --trace           report per-stage timings (parse/style/layout/paint) to stderr
   -h, --help        show this help
 ";
 
@@ -51,6 +54,7 @@ fn run() -> Result<(), String> {
     let mut settings = Settings::headless();
     let mut json = false;
     let mut text = false;
+    let mut trace_enabled = false;
 
     let mut index = 0;
     while index < args.len() {
@@ -82,14 +86,17 @@ fn run() -> Result<(), String> {
             "--script" => settings.enable_scripting = true,
             "--json" => json = true,
             "--text" => text = true,
+            "--trace" => trace_enabled = true,
             other => return Err(format!("unknown option `{other}` (try --help)")),
         }
         index += 1;
     }
 
     let mut browser = Browser::new(settings);
+    let source_html;
     if let Some(url) = &url {
         browser.navigate(url).map_err(|err| err.to_string())?;
+        source_html = browser.page().body_html();
     } else {
         let (source, base) = if stdin {
             let mut buffer = String::new();
@@ -107,9 +114,14 @@ fn run() -> Result<(), String> {
         } else {
             return Err("provide --html, --url or --stdin".to_string());
         };
+        source_html = source.clone();
         browser
             .load_html(&source, base.as_deref())
             .map_err(|err| err.to_string())?;
+    }
+
+    if trace_enabled {
+        trace::PipelineTrace::replay(browser.page(), &source_html).print();
     }
 
     let snapshot = browser.snapshot();

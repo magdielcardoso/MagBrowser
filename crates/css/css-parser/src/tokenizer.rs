@@ -812,4 +812,86 @@ mod tests {
             matches!(&values[2], crate::values::ComponentValue::Function(name, _) if name == "calc")
         );
     }
+
+    #[test]
+    fn tokenizes_math_functions_as_generic_functions() {
+        for name in ["min", "max", "clamp", "calc"] {
+            assert_eq!(
+                kinds(&format!("{name}(1, 2)")),
+                vec![
+                    Token::Function(name.into()),
+                    Token::Number(1.0),
+                    Token::Comma,
+                    Token::Whitespace,
+                    Token::Number(2.0),
+                    Token::RightParen,
+                ],
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn builds_math_function_component_values() {
+        let values = to_component_values(&tokenize(
+            "MIN(1px, 2px) max(10%, 20px) clamp(1rem, 2vw, 3rem)",
+        ));
+        let names: Vec<&str> = values
+            .iter()
+            .filter_map(|component| match component {
+                crate::values::ComponentValue::Function(name, _) => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(names, ["min", "max", "clamp"]);
+
+        let crate::values::ComponentValue::Function(_, args) = &values[2] else {
+            panic!("expected a function");
+        };
+        assert!(args.contains(&crate::values::ComponentValue::Comma));
+        assert!(args.contains(&crate::values::ComponentValue::Percentage(10.0)));
+        assert!(args.contains(&crate::values::ComponentValue::Dimension(20.0, "px".into())));
+    }
+
+    #[test]
+    fn preserves_calc_operators_and_nested_parentheses() {
+        let tokens = tokenize("calc((100% - 10px) * 2 / 3)");
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Function("calc".into()),
+                Token::LeftParen,
+                Token::Percentage(100.0),
+                Token::Whitespace,
+                Token::Delim('-'),
+                Token::Whitespace,
+                Token::Dimension(10.0, "px".into()),
+                Token::RightParen,
+                Token::Whitespace,
+                Token::Delim('*'),
+                Token::Whitespace,
+                Token::Number(2.0),
+                Token::Whitespace,
+                Token::Delim('/'),
+                Token::Whitespace,
+                Token::Number(3.0),
+                Token::RightParen,
+            ]
+        );
+
+        let values = to_component_values(&tokens);
+        let crate::values::ComponentValue::Function(name, args) = &values[0] else {
+            panic!("expected a function");
+        };
+        assert_eq!(name, "calc");
+        assert!(
+            args.iter().any(|component| matches!(
+                component,
+                crate::values::ComponentValue::Function(inner_name, _) if inner_name.is_empty()
+            )),
+            "nested parentheses must become an empty-named function"
+        );
+        assert!(args.contains(&crate::values::ComponentValue::Delim('*')));
+        assert!(args.contains(&crate::values::ComponentValue::Delim('/')));
+    }
 }

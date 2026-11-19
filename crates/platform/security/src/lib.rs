@@ -27,11 +27,15 @@
 //!   `postMessage` target-origin checks are not implemented here.
 //! * CORS credentials are inferred from `Cookie`/`Authorization`; an explicit
 //!   credentials mode is available through
-//!   [`cors::evaluate_response_with_credentials`]. `Vary: Origin` is not enforced.
+//!   [`cors::evaluate_response_with_credentials`]. `Vary: Origin` is parsed by
+//!   [`cors::CorsResponse::varies_on_origin`] but caching is the caller's job.
 //! * CSP supports the fetch directives listed in [`csp`], with `'self'`, `'none'`,
-//!   `'unsafe-inline'`, `*`, scheme sources and host sources. Nonces, hashes,
-//!   `'strict-dynamic'`, report-only policies, reports and `frame-ancestors` are
-//!   not yet enforced.
+//!   `'unsafe-inline'`, `*`, scheme sources, host sources, nonces, hashes and
+//!   `'strict-dynamic'`. Hash digests are computed by the caller; this crate only
+//!   matches them. Report-only policies, reports and `frame-ancestors` are not
+//!   enforced.
+//! * Mixed content is classified from plain URLs by [`mixed_content`]; the
+//!   caller must apply the returned upgrade or block decision to the load.
 //! * The permission store is in-memory and per process; persistence and a user
 //!   prompt UI belong to higher layers.
 //! * Sandbox supports the six capability tokens modelled in [`sandbox`]; tokens
@@ -50,6 +54,7 @@
 
 pub mod cors;
 pub mod csp;
+pub mod mixed_content;
 pub mod origin;
 pub mod permissions;
 pub mod sandbox;
@@ -58,8 +63,19 @@ pub use browser_url::Origin;
 pub use cors::{
     CorsDecision, CorsError, CorsRequest, CorsResponse, RequestKind, evaluate_request,
     evaluate_response, evaluate_response_with_credentials, is_simple_header, is_simple_method,
+    parse_header_list,
 };
-pub use csp::{CspList, HostSource, Policy, SourceExpression};
-pub use origin::{OriginError, OriginHeader, OriginPolicy, allows_read, same_origin, validate};
+pub use csp::{
+    ContentCheck, ContentHash, CspList, HashAlgorithm, HashSource, HostSource, Policy,
+    SourceExpression, decode_base64, encode_base64,
+};
+pub use mixed_content::{
+    MixedContentDecision, MixedContentMode, SubresourceKind, allows as mixed_content_allows,
+    check as check_mixed_content, check_with_context, check_with_mode, upgraded_url,
+};
+pub use origin::{
+    OriginError, OriginHeader, OriginPolicy, SubresourceOrigin, allows_read,
+    redirect_stays_same_origin, resource_origin, same_origin, same_origin_redirect, validate,
+};
 pub use permissions::{Permission, PermissionState, PermissionStore};
 pub use sandbox::{Sandbox, SandboxCapability, SandboxFlags, parse_sandbox_attribute};

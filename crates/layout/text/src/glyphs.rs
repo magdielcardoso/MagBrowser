@@ -1,158 +1,153 @@
-//! Glyph access and font metrics for the built-in bitmap face.
+//! Font metrics and glyph access for the embedded Inter face.
+//!
+//! The engine ships one open-licensed typeface (SIL OFL 1.1). It is a real
+//! outline font with proportional advances, so text no longer has the chunky
+//! 8x8 terminal look: every glyph is rasterised with anti-aliasing at the
+//! requested size by [`crate::raster`].
+//!
+//! [`Font::monospace`] is kept as an alias for callers that used the old
+//! built-in face; it now returns this proportional face.
 
 use std::sync::OnceLock;
 
-use crate::fonts;
+use crate::truetype::{Face, OutlineGlyph, OutlinePoint};
 
-/// A single rasterised glyph from the built-in monospace face.
-///
-/// `rows` holds one byte per scanline, top row first. Bit 7 of each byte is the
-/// leftmost pixel and only the low `width` bits are meaningful (the face is
-/// 8 pixels wide, so all eight bits are used). `advance` is the horizontal
-/// advance in font units at the design size (16 pixels), i.e. 8.0 for every
-/// covered character.
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// A resolved outline glyph together with the character it renders.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Glyph {
-    /// The character this glyph renders. For the fallback box this is the
-    /// requested character, not `U+FFFD`.
+    /// The character this glyph renders.
     pub code: char,
-    /// Bitmap width in pixels.
-    pub width: u8,
-    /// Bitmap height in pixels.
-    pub height: u8,
-    /// Horizontal advance in font units at the design size.
-    pub advance: f32,
-    /// Bitmap rows, one byte per row, top row first, bit 7 leftmost.
-    pub rows: &'static [u8],
+    /// Horizontal advance in font units.
+    pub advance: u16,
+    /// Closed contours in font units (y up).
+    pub contours: Vec<Vec<OutlinePoint>>,
 }
 
-/// The engine's built-in monospace font.
-///
-/// This is the only font the engine currently has: an 8x16 bitmap cell with an
-/// 8x8 printable-ASCII glyph set (see the `fonts` module). Instances are
-/// obtained from [`Font::monospace`]; the type deliberately has no constructor
-/// that could describe a font the renderer cannot draw.
+impl Glyph {
+    /// Bounding box of the outline in font units.
+    pub fn bounds(&self) -> Option<(i16, i16, i16, i16)> {
+        OutlineGlyph {
+            advance: self.advance,
+            contours: self.contours.clone(),
+        }
+        .bounds()
+    }
+}
+
+/// The engine's embedded proportional typeface.
 #[derive(Debug)]
 pub struct Font {
-    cell_width: f32,
-    cell_height: f32,
-    ascent_ratio: f32,
+    face: &'static Face,
 }
 
 impl Font {
-    /// Returns the shared monospace face.
-    ///
-    /// The font is initialised once, lazily, and is identical for every caller.
-    pub fn monospace() -> &'static Font {
+    /// Returns the shared embedded face.
+    pub fn sans() -> &'static Font {
         static FONT: OnceLock<Font> = OnceLock::new();
         FONT.get_or_init(|| Font {
-            cell_width: fonts::CELL_WIDTH,
-            cell_height: fonts::CELL_HEIGHT,
-            ascent_ratio: 0.75,
+            face: Face::embedded(),
         })
     }
 
-    /// Width of one character cell in font units (8.0).
+    /// Compatibility alias for [`Self::sans`].
+    pub fn monospace() -> &'static Font {
+        Self::sans()
+    }
+
+    /// Parsed TrueType face backing this font.
+    pub fn face(&self) -> &'static Face {
+        self.face
+    }
+
+    /// Design units per em.
+    pub fn units_per_em(&self) -> f32 {
+        f32::from(self.face.units_per_em)
+    }
+
+    /// Nominal advance of an `M` in font units (kept for legacy callers).
     pub fn cell_width(&self) -> f32 {
-        self.cell_width
+        f32::from(self.face.outline('M').advance)
     }
 
-    /// Height of one character cell in font units (16.0).
+    /// Em size in font units (kept for legacy callers).
     pub fn cell_height(&self) -> f32 {
-        self.cell_height
+        f32::from(self.face.units_per_em)
     }
 
-    /// Looks up the glyph for `c`.
+    /// Looks up the outline for `c`.
     ///
-    /// Returns `None` for control characters (including `\n` and `\t`, which are
-    /// handled by layout rather than rasterised). Every other character is
-    /// drawable: printable ASCII has its own bitmap, and any other (non-ASCII)
-    /// code point falls back to the hollow box glyph in the `fonts` module,
-    /// whose `code` is the requested character.
+    /// Control characters have no drawable glyph. Every other character maps
+    /// to a real outline; unsupported code points use the font's `.notdef`.
     pub fn glyph(&self, c: char) -> Option<Glyph> {
-        if let Some(rows) = fonts::ascii_rows(c) {
-            return Some(Glyph {
-                code: c,
-                width: fonts::GLYPH_WIDTH,
-                height: fonts::GLYPH_HEIGHT,
-                advance: self.cell_width,
-                rows,
-            });
-        }
         if c.is_control() {
             return None;
         }
+        let outline = self.face.outline(c);
         Some(Glyph {
             code: c,
-            width: fonts::GLYPH_WIDTH,
-            height: fonts::GLYPH_HEIGHT,
-            advance: self.cell_width,
-            rows: fonts::FALLBACK_GLYPH.as_slice(),
+            advance: outline.advance,
+            contours: outline.contours,
         })
     }
 
     /// Horizontal advance of `c` at pixel size `px`.
-    ///
-    /// The face is monospace, so this is the scaled cell width for every
-    /// drawable character and 0.0 for control characters. A tab advances one
-    /// cell so that measurement is stable (layout still owns real tab stops).
     pub fn advance(&self, c: char, px: f32) -> f32 {
+        if px <= 0.0 {
+            return 0.0;
+        }
         if c == '\t' {
-            return self.scaled_cell_width(px);
+            return px;
         }
-        if self.glyph(c).is_some() {
-            self.scaled_cell_width(px)
-        } else {
-            0.0
+        if c.is_control() {
+            return 0.0;
         }
+        f32::from(self.face.advance(self.face.glyph_index(c))) * px / self.units_per_em()
     }
 
-    /// Line height in pixels at `px`: the full em cell (16 pixels at 16px).
+    /// Line height in pixels (ascender + descender + line gap).
     pub fn line_height(&self, px: f32) -> f32 {
-        px.max(0.0)
+        if px <= 0.0 {
+            return 0.0;
+        }
+        let units = f32::from(self.face.ascender - self.face.descender + self.face.line_gap);
+        units.max(0.0) * px / self.units_per_em()
     }
 
-    /// Distance from the baseline to the top of the line box in pixels.
-    ///
-    /// Always `0.75 * px`, so `ascent + descent == line_height`.
+    /// Distance from the baseline to the top of the line box, in pixels.
     pub fn ascent(&self, px: f32) -> f32 {
-        px.max(0.0) * self.ascent_ratio
+        if px <= 0.0 {
+            return 0.0;
+        }
+        f32::from(self.face.ascender.max(0)) * px / self.units_per_em()
     }
 
-    /// Distance from the baseline to the bottom of the line box in pixels.
-    ///
-    /// Always `0.25 * px`, so `ascent + descent == line_height`.
+    /// Distance from the baseline to the bottom of the line box, in pixels.
     pub fn descent(&self, px: f32) -> f32 {
-        px.max(0.0) * (1.0 - self.ascent_ratio)
+        if px <= 0.0 {
+            return 0.0;
+        }
+        f32::from((-self.face.descender).max(0)) * px / self.units_per_em()
     }
 
-    /// Advances the whole string, in pixels.
+    /// Sum of advances for every character in `text`, in pixels.
     pub fn measure(&self, text: &str, px: f32) -> f32 {
         text.chars().map(|c| self.advance(c, px)).sum()
     }
 
-    /// Advances `text[start..end]` in pixels.
+    /// Sum of advances for `text[start..end]` in pixels.
     ///
-    /// Indices are byte offsets. Out-of-range or non-boundary indices are
-    /// clamped to the nearest character boundary so the function never panics.
+    /// Byte offsets are clamped to the nearest UTF-8 boundary so the function
+    /// never panics on malformed ranges.
     pub fn measure_range(&self, text: &str, px: f32, start: usize, end: usize) -> f32 {
         let start = clamp_boundary(text, start);
         let end = clamp_boundary(text, end);
         if end <= start {
             return 0.0;
         }
-        text[start..end].chars().map(|c| self.advance(c, px)).sum()
-    }
-
-    fn scaled_cell_width(&self, px: f32) -> f32 {
-        if px <= 0.0 {
-            return 0.0;
-        }
-        self.cell_width * (px / self.cell_height)
+        self.measure(&text[start..end], px)
     }
 }
 
-/// Clamps `index` into `0..=text.len()` and back to a UTF-8 boundary.
 fn clamp_boundary(text: &str, mut index: usize) -> usize {
     index = index.min(text.len());
     while !text.is_char_boundary(index) {
@@ -170,43 +165,31 @@ mod tests {
     }
 
     #[test]
-    fn font_is_shared() {
-        assert!(std::ptr::eq(Font::monospace(), Font::monospace()));
+    fn font_is_shared_and_aliased() {
+        assert!(std::ptr::eq(Font::sans(), Font::sans()));
+        assert!(std::ptr::eq(Font::monospace(), Font::sans()));
     }
 
     #[test]
-    fn cell_metrics_are_8x16() {
-        assert_eq!(font().cell_width(), 8.0);
-        assert_eq!(font().cell_height(), 16.0);
-        assert_eq!(font().line_height(16.0), 16.0);
+    fn metrics_follow_the_embedded_face() {
+        let font = font();
+        assert_eq!(font.cell_height(), font.face().units_per_em as f32);
+        assert!((font.ascent(16.0) / 16.0 - 0.96875).abs() < 0.01);
+        assert!((font.line_height(16.0) - font.ascent(16.0) - font.descent(16.0)).abs() < 1e-4);
     }
 
     #[test]
-    fn glyph_metrics_for_uppercase_a() {
-        let glyph = font().glyph('A').expect("A is supported");
-        assert_eq!(glyph.code, 'A');
-        assert_eq!(glyph.width, 8);
-        assert_eq!(glyph.height, 8);
-        assert_eq!(glyph.advance, 8.0);
-        assert_eq!(glyph.rows.len(), 8);
-        // Row 1 of 'A' is `.####...`: 0x78 with bit 7 leftmost.
-        assert_eq!(glyph.rows[1], 0x78);
+    fn advances_are_proportional() {
+        let font = font();
+        assert!(font.advance('i', 16.0) < font.advance('M', 16.0));
+        assert!(font.measure("iii", 16.0) < font.measure("MMM", 16.0));
     }
 
     #[test]
-    fn space_has_width_and_no_pixels() {
-        let glyph = font().glyph(' ').expect("space is supported");
-        assert_eq!(glyph.width, 8);
-        assert!(glyph.rows.iter().all(|&row| row == 0));
-        assert_eq!(font().advance(' ', 16.0), 8.0);
-    }
-
-    #[test]
-    fn ascii_is_fully_covered() {
-        for code in 0x20u32..=0x7E {
-            let c = char::from_u32(code).unwrap();
-            let glyph = font().glyph(c).unwrap_or_else(|| panic!("missing {c:?}"));
-            assert_eq!(glyph.rows.len(), 8);
+    fn non_ascii_has_real_outlines() {
+        for ch in ['ç', 'ã', 'ó', 'é', '—', '…'] {
+            let glyph = font().glyph(ch).unwrap();
+            assert!(!glyph.contours.is_empty(), "missing outline for {ch:?}");
         }
     }
 
@@ -214,71 +197,37 @@ mod tests {
     fn control_characters_have_no_glyph() {
         assert!(font().glyph('\n').is_none());
         assert!(font().glyph('\0').is_none());
-        assert!(font().glyph('\u{7f}').is_none());
         assert_eq!(font().advance('\n', 16.0), 0.0);
     }
 
     #[test]
-    fn non_ascii_falls_back_to_box_glyph() {
-        let glyph = font().glyph('→').expect("fallback glyph");
-        assert_eq!(glyph.code, '→');
-        assert_eq!(glyph.rows, fonts::FALLBACK_GLYPH.as_slice());
-        assert_eq!(glyph.advance, 8.0);
-        assert_eq!(font().advance('→', 16.0), 8.0);
+    fn tab_advances_one_em() {
+        assert_eq!(font().advance('\t', 16.0), 16.0);
+        assert_eq!(font().advance('\t', 32.0), 32.0);
     }
 
     #[test]
-    fn tab_advances_one_cell() {
-        assert_eq!(font().advance('\t', 16.0), 8.0);
-        assert_eq!(font().advance('\t', 32.0), 16.0);
-    }
-
-    #[test]
-    fn monospace_advance_invariant() {
-        for c in "abcXYZ019!?~{}".chars() {
-            assert_eq!(font().advance(c, 16.0), 8.0);
-        }
-    }
-
-    #[test]
-    fn measure_counts_characters_not_bytes() {
-        assert_eq!(font().measure("", 16.0), 0.0);
-        assert_eq!(font().measure("abc", 16.0), 24.0);
-        assert_eq!(font().measure("héllo", 16.0), 40.0);
-    }
-
-    #[test]
-    fn measure_scales_with_pixel_size() {
-        assert_eq!(font().measure("abc", 8.0), 12.0);
-        assert_eq!(font().measure("abc", 32.0), 48.0);
-        assert_eq!(font().measure("abc", 0.0), 0.0);
+    fn measure_scales_and_clamps() {
+        let font = font();
+        let wide = font.measure("abc", 32.0);
+        let narrow = font.measure("abc", 16.0);
+        assert!((wide - 2.0 * narrow).abs() < 0.01);
+        assert_eq!(font.measure("abc", 0.0), 0.0);
+        assert_eq!(font.measure("", 16.0), 0.0);
     }
 
     #[test]
     fn measure_range_uses_byte_offsets() {
         let text = "héllo";
-        // 'é' encodes as two bytes, so bytes 0..2 are one character.
-        assert_eq!(font().measure_range(text, 16.0, 0, 2), 8.0);
-        assert_eq!(font().measure_range(text, 16.0, 0, text.len()), 40.0);
-    }
-
-    #[test]
-    fn measure_range_clamps_odd_indices() {
-        let text = "héllo";
-        // Byte 1 is inside 'é' and snaps back to 0.
-        assert_eq!(font().measure_range(text, 16.0, 1, 3), 8.0);
+        assert!(font().measure_range(text, 16.0, 0, 2) > 0.0);
+        // Byte 1 is a character boundary (start of `é`); byte 3 is the start of
+        // the following `l`, so both ranges cover different characters.
+        assert_eq!(
+            font().measure_range(text, 16.0, 1, 3),
+            font().measure("é", 16.0)
+        );
         assert_eq!(font().measure_range(text, 16.0, 99, 200), 0.0);
         assert_eq!(font().measure_range(text, 16.0, 4, 2), 0.0);
-    }
-
-    #[test]
-    fn ascent_plus_descent_equals_line_height() {
-        for px in [8.0, 12.0, 16.0, 20.0, 33.5] {
-            let font = font();
-            assert!((font.ascent(px) + font.descent(px) - font.line_height(px)).abs() < 1e-6);
-        }
-        assert_eq!(font().ascent(16.0), 12.0);
-        assert_eq!(font().descent(16.0), 4.0);
     }
 
     #[test]

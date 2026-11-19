@@ -1,9 +1,8 @@
 //! Text shaping: turning a string into positioned glyphs.
 //!
-//! The engine's only face is monospace, so shaping is pure advance layout: no
-//! kerning, ligatures or bidirectional reordering. The API is shaped like a
-//! real shaper's so a future TrueType backend can replace it without changing
-//! callers.
+//! Shaping is pure advance layout over the embedded proportional face: no
+//! kerning, ligatures or bidirectional reordering yet. The API is shaped like a
+//! real shaper's so those features can be added without changing callers.
 
 use crate::glyphs::Font;
 
@@ -32,8 +31,7 @@ pub struct ShapedRun {
 /// Shapes `text` into a run of horizontally positioned glyphs.
 ///
 /// Characters without a glyph (controls such as `\n`) advance nothing and are
-/// omitted from `glyphs`; everything else, including non-ASCII characters that
-/// use the fallback box, produces exactly one entry.
+/// omitted from `glyphs`; every drawable character produces exactly one entry.
 pub fn shape(font: &Font, text: &str, px: f32) -> ShapedRun {
     let mut x = 0.0;
     let mut glyphs = Vec::with_capacity(text.chars().count());
@@ -57,38 +55,40 @@ mod tests {
     use super::*;
 
     #[test]
-    fn shapes_monospace_run() {
-        let font = Font::monospace();
+    fn shapes_proportional_run() {
+        let font = Font::sans();
         let run = shape(font, "abc", 16.0);
         assert_eq!(run.text, "abc");
-        assert_eq!(run.width, 24.0);
+        assert!((run.width - font.measure("abc", 16.0)).abs() < 1e-4);
         assert_eq!(run.glyphs.len(), 3);
         assert_eq!(
             run.glyphs[0],
             PositionedGlyph {
                 ch: 'a',
                 x: 0.0,
-                advance: 8.0
+                advance: font.advance('a', 16.0),
             }
         );
-        assert_eq!(run.glyphs[2].x, 16.0);
+        assert!((run.glyphs[2].x - font.measure("ab", 16.0)).abs() < 1e-4);
     }
 
     #[test]
     fn shaping_skips_control_characters() {
-        let run = shape(Font::monospace(), "a\nb", 16.0);
+        let font = Font::sans();
+        let run = shape(font, "a\nb", 16.0);
         assert_eq!(run.glyphs.len(), 2);
-        assert_eq!(run.width, 16.0);
+        assert!((run.width - font.measure("ab", 16.0)).abs() < 1e-4);
         assert_eq!(run.glyphs[1].ch, 'b');
-        assert_eq!(run.glyphs[1].x, 8.0);
+        assert!((run.glyphs[1].x - font.advance('a', 16.0)).abs() < 1e-4);
     }
 
     #[test]
-    fn shaping_keeps_fallback_glyph() {
-        let run = shape(Font::monospace(), "✓", 16.0);
+    fn shaping_keeps_unmapped_glyph() {
+        let font = Font::sans();
+        let run = shape(font, "✓", 16.0);
         assert_eq!(run.glyphs.len(), 1);
         assert_eq!(run.glyphs[0].ch, '✓');
-        assert_eq!(run.width, 8.0);
+        assert!((run.width - font.advance('✓', 16.0)).abs() < 1e-4);
     }
 
     #[test]
@@ -108,10 +108,10 @@ mod tests {
 
     #[test]
     fn shaping_scales_positions() {
-        let font = Font::monospace();
+        let font = Font::sans();
         let run = shape(font, "ab", 32.0);
-        assert_eq!(run.glyphs[1].x, 16.0);
-        assert_eq!(run.glyphs[1].advance, 16.0);
-        assert_eq!(run.width, 32.0);
+        assert!((run.glyphs[1].x - font.advance('a', 32.0)).abs() < 1e-4);
+        assert!((run.glyphs[1].advance - font.advance('b', 32.0)).abs() < 1e-4);
+        assert!((run.width - font.measure("ab", 32.0)).abs() < 1e-4);
     }
 }

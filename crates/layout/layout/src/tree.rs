@@ -2,11 +2,19 @@
 
 use std::collections::HashMap;
 
-use browser_dom::{Document, NodeId};
+use browser_dom::{Document, NodeId, escape_attr, escape_text};
 use browser_style::{ComputedStyle, Dim, Display, StyledTree};
 
 use crate::box_model::{Edges, Rect};
 use crate::inline::LineBox;
+
+/// Maximum byte length of a serialized inline `<svg>` source kept on a layout
+/// box. Bounding this keeps the paint-side rasterizer's input (and the work
+/// spent walking the SVG subtree) finite on hostile pages.
+pub const MAX_SVG_SOURCE_BYTES: usize = 256 * 1024;
+
+/// Maximum nesting depth walked while serializing an inline `<svg>` subtree.
+const MAX_SVG_DEPTH: usize = 128;
 
 /// The formatting role of a layout box.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,7 +39,8 @@ pub enum BoxType {
     TableRow,
     /// Table cell.
     TableCell,
-    /// Image box.
+    /// Image box. Also used for atomic inline `<svg>` elements, which carry
+    /// their serialized source in [`LayoutBox::svg_source`].
     Image,
     /// `<br>` line break.
     LineBreak,
@@ -79,6 +88,9 @@ pub struct LayoutBox {
     pub children: Vec<usize>,
     /// Text content for text boxes.
     pub text: String,
+    /// Serialized SVG source for atomic inline `<svg>` boxes. When `Some`, the
+    /// paint side rasterizes this string instead of using a decoded bitmap.
+    pub svg_source: Option<String>,
     /// Line boxes produced by inline layout.
     pub lines: Vec<LineBox>,
     /// Clip rectangle for scroll containers.
@@ -91,6 +103,10 @@ pub struct LayoutBox {
     pub z_index: i32,
     /// True when the box is out of flow.
     pub positioned: bool,
+    /// Document y captured at layout time, before any sticky adjustment.
+    /// Used by `position::update_sticky` to compute the sticky offset without
+    /// accumulating error across scroll updates.
+    pub sticky_static_y: f32,
 }
 
 impl LayoutBox {
@@ -107,12 +123,14 @@ impl LayoutBox {
             paddings: Edges::default(),
             children: Vec::new(),
             text: String::new(),
+            svg_source: None,
             lines: Vec::new(),
             clip: None,
             scroll_offset: (0.0, 0.0),
             scroll_height: 0.0,
             z_index: 0,
             positioned: false,
+            sticky_static_y: 0.0,
         }
     }
 
@@ -149,6 +167,9 @@ pub struct LayoutTree {
     pub root: Option<usize>,
     /// Total document height.
     pub document_height: f32,
+    /// True when the per-layout work budget was exhausted and some subtrees
+    /// were skipped, so this tree is a partial rendering of the document.
+    pub truncated: bool,
     /// Node → box index mapping.
     node_map: HashMap<NodeId, usize>,
 }
@@ -244,10 +265,18 @@ impl LayoutTree {
     }
 
     /// Bounding height of the document content.
+    ///
+    /// Only in-flow boxes contribute. Absolutely and fixed positioned boxes
+    /// are taken out of flow: their offsets may be relative to a scrolled or
+    /// transformed ancestor, so letting them extend the document height makes
+    /// a small page look endlessly tall (and paints an enormous area). Boxes
+    /// with non-finite geometry are ignored for the same reason.
     pub fn content_height(&self) -> f32 {
         self.boxes
             .iter()
+            .filter(|b| !b.positioned)
             .map(|b| b.rect.bottom().max(b.rect.y))
+            .filter(|bottom| bottom.is_finite())
             .fold(0.0_f32, f32::max)
     }
 }
@@ -271,10 +300,16 @@ impl<'a> TreeBuilder<'a> {
 
     /// Builds and returns the tree (without geometry; call `layout` afterwards).
     pub fn build(mut self) -> LayoutTree {
+        // `layout()` begins the budget before calling us; only harvest the
+        // truncation flag here when building standalone.
+        let started_budget = crate::budget::ensure_active();
         let root_node = self.doc.document_element().unwrap_or(self.doc.root());
         let initial = ComputedStyle::initial();
         if let Some(index) = self.build_node(root_node, &initial) {
             self.tree.root = Some(index);
+        }
+        if started_budget {
+            self.tree.truncated = crate::budget::finish();
         }
         self.tree
     }
@@ -286,11 +321,44 @@ impl<'a> TreeBuilder<'a> {
             .unwrap_or_else(|| parent.clone())
     }
 
+    /// Synthesizes an inline text box for a `::before`/`::after` pseudo-element.
+    ///
+    /// Returns `None` when the host has no such pseudo-element (or its
+    /// `content` is not a string) or when the per-layout box budget is
+    /// exhausted. The pseudo box counts toward the same budget as real boxes.
+    fn build_pseudo(&mut self, node: NodeId, name: &str) -> Option<usize> {
+        let (content, style) = {
+            let pseudo = self.styled.pseudo(node, name)?;
+            (pseudo.content.clone(), pseudo.style.clone())
+        };
+        if !crate::budget::try_create_box() {
+            return None;
+        }
+        let mut b = LayoutBox::new(None, BoxType::Text, style);
+        b.text = content;
+        Some(self.tree.push(b))
+    }
+
     fn build_node(&mut self, node: NodeId, parent_style: &ComputedStyle) -> Option<usize> {
+        // Budget checks: stop creating boxes and skip the remaining subtrees
+        // once the work limits are reached. Both the flat box count and the
+        // recursion depth are bounded so neither time nor stack is unbounded.
+        if !crate::budget::try_create_box() {
+            return None;
+        }
+        let depth = crate::budget::DepthGuard::enter();
+        if !depth.entered() {
+            return None;
+        }
         let dom_node = self.doc.node(node);
-        let style = self.style_for(node, parent_style);
+        let mut style = self.style_for(node, parent_style);
         match &dom_node.data {
             browser_dom::NodeData::Text(text) => {
+                if !crate::budget::consume_inline_items(crate::budget::estimate_inline_items(
+                    &text.data,
+                )) {
+                    return None;
+                }
                 let mut b = LayoutBox::new(Some(node), BoxType::Text, style);
                 b.text = text.data.clone();
                 Some(self.tree.push(b))
@@ -300,17 +368,77 @@ impl<'a> TreeBuilder<'a> {
                     return None;
                 }
                 let name = self.doc.element_name(node).unwrap_or("");
+                // Inline `<svg>` is a replaced/atomic box, just like `<img>`.
+                // The SVG source is serialized onto the box for the paint side.
+                let is_svg = name.eq_ignore_ascii_case("svg");
                 let mut box_type = match name {
                     "br" => BoxType::LineBreak,
-                    "img" => BoxType::Image,
+                    "img" | "svg" => BoxType::Image,
                     _ => box_type_from_display(style.display()),
                 };
                 // `float` blockifies the box, so a floated inline element takes part
-                // in block flow (CSS 2.1 §9.7).
-                if style.float() != browser_style::Float::None {
+                // in block flow (CSS 2.1 §9.7). Replaced SVG keeps its atomic type
+                // so it remains paintable.
+                if style.float() != browser_style::Float::None && !is_svg {
                     box_type = BoxType::Block;
                 }
+
+                // A text-like `<input size="N">` gets a presentational hint of
+                // roughly `N` average character widths (≈ 8px each). This is a
+                // low-priority UA declaration, so it only applies when no CSS
+                // `width` won the cascade — an author rule such as
+                // `.Ucigb { width: 458px }` must always take precedence.
+                if name == "input"
+                    && style.width().is_auto()
+                    && let Some(raw) = self.doc.attr(node, "size")
+                    && let Ok(size) = raw.trim().parse::<f32>()
+                    && size > 0.0
+                {
+                    style.set(
+                        browser_style::Property::Width,
+                        browser_style::ComputedValue::Px(size * 8.0),
+                    );
+                }
+
+                // An inline `<svg>` gets a definite size from its `width`/`height`
+                // attributes (a presentational hint, so author CSS wins), falling
+                // back to the CSS replaced-element default of 300x150. A viewBox
+                // supplies the aspect ratio when only one edge is declared.
+                let mut svg_source = None;
+                if is_svg {
+                    let (width, height, view_box) = svg_box_dimensions(self.doc, node);
+                    if style.width().is_auto() {
+                        style.set(
+                            browser_style::Property::Width,
+                            browser_style::ComputedValue::Px(width),
+                        );
+                    }
+                    if style.height().is_auto() {
+                        style.set(
+                            browser_style::Property::Height,
+                            browser_style::ComputedValue::Px(height),
+                        );
+                    }
+                    if let Some((vb_w, vb_h)) = view_box {
+                        style.set(
+                            browser_style::Property::AspectRatio,
+                            browser_style::ComputedValue::AspectRatio(
+                                browser_style::AspectRatio::Ratio(vb_w, vb_h),
+                            ),
+                        );
+                    }
+                    // Serialize the SVG subtree (bounded in size and depth) and
+                    // charge the per-layout work budget for the bytes produced.
+                    if let Some(source) = serialize_svg_source(self.doc, node, width, height) {
+                        let cost = (source.len() / 64).max(1);
+                        if crate::budget::consume_inline_items(cost) {
+                            svg_source = Some(source);
+                        }
+                    }
+                }
+
                 let mut b = LayoutBox::new(Some(node), box_type, style.clone());
+                b.svg_source = svg_source;
                 b.z_index = self.style_for(node, parent_style).z_index();
                 b.positioned = matches!(
                     self.style_for(node, parent_style).position(),
@@ -318,7 +446,13 @@ impl<'a> TreeBuilder<'a> {
                 );
                 let index = self.tree.push(b);
 
-                let child_nodes: Vec<NodeId> = dom_node.children.clone();
+                // A replaced SVG paints from its serialized source; its DOM
+                // children are not laid out as boxes.
+                let child_nodes: Vec<NodeId> = if is_svg {
+                    Vec::new()
+                } else {
+                    dom_node.children.clone()
+                };
                 let block_container = matches!(
                     box_type,
                     BoxType::Block
@@ -329,6 +463,9 @@ impl<'a> TreeBuilder<'a> {
                         | BoxType::TableCell
                         | BoxType::TableRow
                 );
+                // Used to decide whether generated text needs its own inline
+                // formatting context: a bare text box in block flow is dropped.
+                let has_block_children = self.has_block_sibling(&style, &style, &child_nodes);
 
                 let mut children: Vec<usize> = Vec::new();
                 let mut inline_run: Vec<usize> = Vec::new();
@@ -374,6 +511,51 @@ impl<'a> TreeBuilder<'a> {
                 if !inline_run.is_empty() {
                     let anon = self.wrap_anonymous(inline_run, &style);
                     children.push(anon);
+                }
+                // Form controls are replaced elements: their label lives in a
+                // `value` (or `placeholder`) attribute, not in a DOM text node.
+                // Synthesize a text child so buttons and filled fields paint it.
+                if name == "input" {
+                    let kind = self
+                        .doc
+                        .attr(node, "type")
+                        .unwrap_or("text")
+                        .to_ascii_lowercase();
+                    if !matches!(kind.as_str(), "hidden" | "image" | "checkbox" | "radio") {
+                        let label = self
+                            .doc
+                            .attr(node, "value")
+                            .or_else(|| self.doc.attr(node, "placeholder"))
+                            .unwrap_or("");
+                        if !label.is_empty() {
+                            let mut text_box =
+                                LayoutBox::new(Some(node), BoxType::Text, style.clone());
+                            text_box.text = label.to_string();
+                            let text_index = self.tree.push(text_box);
+                            children.push(text_index);
+                        }
+                    }
+                }
+                // `::before`/`::after` generate inline text boxes in document
+                // order around the element's real children. Replaced elements
+                // (img/input) never generate pseudo-element boxes.
+                if !matches!(name, "img" | "input") && !is_svg {
+                    if let Some(before) = self.build_pseudo(node, "before") {
+                        if has_block_children {
+                            let anon = self.wrap_anonymous(vec![before], &style);
+                            children.insert(0, anon);
+                        } else {
+                            children.insert(0, before);
+                        }
+                    }
+                    if let Some(after) = self.build_pseudo(node, "after") {
+                        if has_block_children {
+                            let anon = self.wrap_anonymous(vec![after], &style);
+                            children.push(anon);
+                        } else {
+                            children.push(after);
+                        }
+                    }
                 }
                 self.tree.boxes[index].children = children;
                 Some(index)
@@ -423,6 +605,39 @@ impl<'a> TreeBuilder<'a> {
             browser_style::Property::Display,
             browser_style::ComputedValue::keyword("block"),
         );
+        // An anonymous box is only a wrapper for inline content. It must not
+        // inherit sizing constraints from its parent: a parent's
+        // `min-height`/`aspect-ratio`/definite size would otherwise be applied
+        // once per anonymous wrapper (a block with several inline runs next to
+        // block siblings gets one wrapper per run), multiplying the parent's
+        // height by the number of wrappers. Reset every size-derived property
+        // so the wrapper is sized solely by the inline content it holds.
+        for property in [
+            browser_style::Property::Width,
+            browser_style::Property::Height,
+            browser_style::Property::MinWidth,
+            browser_style::Property::MaxWidth,
+            browser_style::Property::MinHeight,
+            browser_style::Property::MaxHeight,
+            browser_style::Property::FlexBasis,
+        ] {
+            style.set(
+                property,
+                browser_style::ComputedValue::Dim(browser_style::Dim::Auto),
+            );
+        }
+        style.set(
+            browser_style::Property::AspectRatio,
+            browser_style::ComputedValue::AspectRatio(browser_style::AspectRatio::Auto),
+        );
+        style.set(
+            browser_style::Property::FlexGrow,
+            browser_style::ComputedValue::Number(0.0),
+        );
+        style.set(
+            browser_style::Property::FlexShrink,
+            browser_style::ComputedValue::Number(1.0),
+        );
         let mut b = LayoutBox::new(None, BoxType::AnonymousBlock, style);
         b.children = children;
         self.tree.push(b)
@@ -435,13 +650,145 @@ fn box_type_from_display(display: Display) -> BoxType {
         Display::Inline => BoxType::Inline,
         Display::InlineBlock => BoxType::InlineBlock,
         Display::ListItem => BoxType::ListItem,
-        Display::Flex => BoxType::Flex,
-        Display::Grid => BoxType::Grid,
+        Display::Flex | Display::InlineFlex => BoxType::Flex,
+        Display::Grid | Display::InlineGrid => BoxType::Grid,
         Display::Table => BoxType::Table,
         Display::TableRow => BoxType::TableRow,
         Display::TableCell => BoxType::TableCell,
         Display::Contents | Display::None => BoxType::Block,
     }
+}
+
+/// Resolves the width and height of an inline `<svg>` from its presentation
+/// attributes and viewBox. Returns `(width, height, view_box)` where `view_box`
+/// is `(width, height)` in user units when a valid viewBox is present.
+///
+/// The CSS replaced-element default is 300x150. A viewBox supplies the aspect
+/// ratio when only one edge is declared; when neither edge is declared the box
+/// keeps the 300x150 default (the viewBox letterboxes inside it).
+fn svg_box_dimensions(doc: &Document, node: NodeId) -> (f32, f32, Option<(f32, f32)>) {
+    const DEFAULT_WIDTH: f32 = 300.0;
+    const DEFAULT_HEIGHT: f32 = 150.0;
+
+    let parse_length = |key: &str| -> Option<f32> {
+        let raw = doc.attr(node, key)?.trim();
+        let number = raw.strip_suffix("px").unwrap_or(raw);
+        let value = number.parse::<f32>().ok()?;
+        (value.is_finite() && value > 0.0).then_some(value)
+    };
+
+    let view_box = doc.attr(node, "viewBox").and_then(|raw| {
+        let values: Vec<f32> = raw
+            .split(|c: char| c.is_ascii_whitespace() || c == ',')
+            .filter(|part| !part.is_empty())
+            .filter_map(|part| part.parse::<f32>().ok())
+            .collect();
+        match values.as_slice() {
+            [_, _, w, h] if *w > 0.0 && *h > 0.0 => Some((*w, *h)),
+            _ => None,
+        }
+    });
+    let aspect = view_box.map(|(w, h)| w / h);
+
+    let mut width = parse_length("width");
+    let mut height = parse_length("height");
+    match (width, height, aspect) {
+        (None, None, _) => {
+            width = Some(DEFAULT_WIDTH);
+            height = Some(DEFAULT_HEIGHT);
+        }
+        (Some(w), None, Some(ratio)) => height = Some(w / ratio),
+        (None, Some(h), Some(ratio)) => width = Some(h * ratio),
+        (Some(_), None, None) => height = Some(DEFAULT_HEIGHT),
+        (None, Some(_), None) => width = Some(DEFAULT_WIDTH),
+        (Some(_), Some(_), _) => {}
+    }
+    (
+        width.unwrap_or(DEFAULT_WIDTH),
+        height.unwrap_or(DEFAULT_HEIGHT),
+        view_box,
+    )
+}
+
+/// Restores SVG camelCase attribute names that the HTML parser lowercased.
+fn svg_attr_name(name: &str) -> &str {
+    match name {
+        "viewbox" => "viewBox",
+        "preserveaspectratio" => "preserveAspectRatio",
+        "gradientunits" => "gradientUnits",
+        "gradienttransform" => "gradientTransform",
+        "patternunits" => "patternUnits",
+        "patterncontentunits" => "patternContentUnits",
+        _ => name,
+    }
+}
+
+/// Serializes an inline `<svg>` subtree into a source string for the SVG
+/// rasterizer. The output is capped at [`MAX_SVG_SOURCE_BYTES`] and a bounded
+/// recursion depth; `None` means the subtree was too large to keep.
+fn serialize_svg_source(doc: &Document, root: NodeId, width: f32, height: f32) -> Option<String> {
+    let mut out = String::with_capacity(256);
+    write_svg_node(doc, root, width, height, 0, &mut out)?;
+    (out.len() <= MAX_SVG_SOURCE_BYTES).then_some(out)
+}
+
+fn write_svg_node(
+    doc: &Document,
+    node: NodeId,
+    width: f32,
+    height: f32,
+    depth: usize,
+    out: &mut String,
+) -> Option<()> {
+    if depth > MAX_SVG_DEPTH || out.len() >= MAX_SVG_SOURCE_BYTES {
+        return None;
+    }
+    match &doc.node(node).data {
+        browser_dom::NodeData::Element(element) => {
+            let is_root = depth == 0;
+            out.push('<');
+            out.push_str(&element.name);
+            for (key, value) in element.attributes.iter() {
+                let name = svg_attr_name(key);
+                // The resolved CSS size is injected below; skip the raw attrs.
+                if is_root && name.eq_ignore_ascii_case("width") {
+                    continue;
+                }
+                if is_root && name.eq_ignore_ascii_case("height") {
+                    continue;
+                }
+                out.push(' ');
+                out.push_str(name);
+                out.push_str("=\"");
+                out.push_str(&escape_attr(value));
+                out.push('"');
+                if out.len() >= MAX_SVG_SOURCE_BYTES {
+                    return None;
+                }
+            }
+            if is_root {
+                out.push_str(" xmlns=\"http://www.w3.org/2000/svg\"");
+                out.push_str(" width=\"");
+                out.push_str(&width.to_string());
+                out.push_str("\" height=\"");
+                out.push_str(&height.to_string());
+                out.push('"');
+            }
+            out.push('>');
+            for child in doc.children(node) {
+                write_svg_node(doc, *child, width, height, depth + 1, out)?;
+            }
+            out.push_str("</");
+            out.push_str(&element.name);
+            out.push('>');
+        }
+        browser_dom::NodeData::Text(text) => {
+            out.push_str(&escape_text(&text.data));
+        }
+        // Comments, doctypes and the document node carry no SVG geometry.
+        _ => {}
+    }
+    (out.len() <= MAX_SVG_SOURCE_BYTES).then_some(())
 }
 
 /// True for boxes that only contain collapsible whitespace.
@@ -514,6 +861,83 @@ mod tests {
     }
 
     #[test]
+    fn input_value_becomes_a_text_child() {
+        let mut doc = Document::new();
+        let html = doc.create_element("html");
+        let body = doc.create_element("body");
+        let input = doc.create_element("input");
+        doc.append_child(doc.root(), html);
+        doc.append_child(html, body);
+        doc.append_child(body, input);
+        doc.set_attr(input, "type", "submit");
+        doc.set_attr(input, "value", "Pesquisa Google");
+        let engine = StyleEngine::new(Viewport::default());
+        let styled = engine.compute(&doc);
+        let tree = TreeBuilder::new(&doc, &styled).build();
+        let input_box = tree.find_node(input).unwrap();
+        assert_eq!(input_box.children.len(), 1);
+        assert_eq!(tree.boxes[input_box.children[0]].text, "Pesquisa Google");
+    }
+
+    #[test]
+    fn input_size_attribute_is_a_presentational_width_hint() {
+        let mut doc = Document::new();
+        let html = doc.create_element("html");
+        let body = doc.create_element("body");
+        let input = doc.create_element("input");
+        doc.append_child(doc.root(), html);
+        doc.append_child(html, body);
+        doc.append_child(body, input);
+        doc.set_attr(input, "type", "text");
+        doc.set_attr(input, "size", "57");
+        doc.set_attr(input, "value", "hello");
+        let engine = StyleEngine::new(Viewport::default());
+        let styled = engine.compute(&doc);
+        let tree = TreeBuilder::new(&doc, &styled).build();
+        let input_box = tree.find_node(input).unwrap();
+        // 57 characters * 8px, and the synthetic value-text child survives.
+        assert_eq!(input_box.style.width(), Dim::Px(456.0));
+        assert_eq!(input_box.children.len(), 1);
+        assert_eq!(tree.boxes[input_box.children[0]].text, "hello");
+    }
+
+    #[test]
+    fn css_width_overrides_input_size_hint() {
+        let mut doc = Document::new();
+        let html = doc.create_element("html");
+        let body = doc.create_element("body");
+        let input = doc.create_element("input");
+        doc.append_child(doc.root(), html);
+        doc.append_child(html, body);
+        doc.append_child(body, input);
+        doc.set_attr(input, "class", "Ucigb");
+        doc.set_attr(input, "size", "57");
+        let mut engine = StyleEngine::new(Viewport::default());
+        engine.add_css(".Ucigb { width: 458px; }", Origin::Author);
+        let styled = engine.compute(&doc);
+        let tree = TreeBuilder::new(&doc, &styled).build();
+        let input_box = tree.find_node(input).unwrap();
+        assert_eq!(input_box.style.width(), Dim::Px(458.0));
+    }
+
+    #[test]
+    fn hidden_input_has_no_text_child() {
+        let mut doc = Document::new();
+        let html = doc.create_element("html");
+        let body = doc.create_element("body");
+        let input = doc.create_element("input");
+        doc.append_child(doc.root(), html);
+        doc.append_child(html, body);
+        doc.append_child(body, input);
+        doc.set_attr(input, "type", "hidden");
+        doc.set_attr(input, "value", "secret");
+        let engine = StyleEngine::new(Viewport::default());
+        let styled = engine.compute(&doc);
+        let tree = TreeBuilder::new(&doc, &styled).build();
+        assert!(tree.find_node(input).is_none());
+    }
+
+    #[test]
     fn display_none_produces_no_box() {
         let (doc, _body, p) = doc();
         let mut engine = StyleEngine::new(Viewport::default());
@@ -521,5 +945,314 @@ mod tests {
         let styled = engine.compute(&doc);
         let tree = TreeBuilder::new(&doc, &styled).build();
         assert!(tree.find_node(p).is_none());
+    }
+
+    fn div_doc() -> (Document, NodeId) {
+        let mut doc = Document::new();
+        let html = doc.create_element("html");
+        let body = doc.create_element("body");
+        doc.append_child(doc.root(), html);
+        doc.append_child(html, body);
+        let div = doc.create_element("div");
+        doc.append_child(body, div);
+        doc.append_text(div, "hello");
+        (doc, div)
+    }
+
+    #[test]
+    fn before_pseudo_produces_a_leading_text_box() {
+        let (doc, div) = div_doc();
+        let mut engine = StyleEngine::new(Viewport::default());
+        engine.add_css("div::before { content: \">>\"; }", Origin::Author);
+        let styled = engine.compute(&doc);
+        let tree = TreeBuilder::new(&doc, &styled).build();
+        let div_box = tree.find_node(div).unwrap();
+        assert_eq!(div_box.children.len(), 2);
+        assert_eq!(tree.boxes[div_box.children[0]].box_type, BoxType::Text);
+        assert_eq!(tree.boxes[div_box.children[0]].text, ">>");
+        assert_eq!(tree.boxes[div_box.children[1]].text, "hello");
+    }
+
+    #[test]
+    fn after_pseudo_appends_a_text_box() {
+        let (doc, div) = div_doc();
+        let mut engine = StyleEngine::new(Viewport::default());
+        engine.add_css("div::after { content: \"!\"; }", Origin::Author);
+        let styled = engine.compute(&doc);
+        let tree = TreeBuilder::new(&doc, &styled).build();
+        let div_box = tree.find_node(div).unwrap();
+        assert_eq!(div_box.children.len(), 2);
+        assert_eq!(tree.boxes[div_box.children[0]].text, "hello");
+        assert_eq!(tree.boxes[div_box.children[1]].text, "!");
+    }
+
+    #[test]
+    fn content_none_produces_no_pseudo_box() {
+        let (doc, div) = div_doc();
+        let mut engine = StyleEngine::new(Viewport::default());
+        engine.add_css(
+            "div::before { content: none; } div::after { content: \"!\"; }",
+            Origin::Author,
+        );
+        let styled = engine.compute(&doc);
+        let tree = TreeBuilder::new(&doc, &styled).build();
+        let div_box = tree.find_node(div).unwrap();
+        assert_eq!(div_box.children.len(), 2);
+        assert_eq!(tree.boxes[div_box.children[0]].text, "hello");
+        assert_eq!(tree.boxes[div_box.children[1]].text, "!");
+    }
+
+    #[test]
+    fn pseudo_text_box_uses_the_declared_color() {
+        let (doc, div) = div_doc();
+        let mut engine = StyleEngine::new(Viewport::default());
+        engine.add_css(
+            "div::before { content: \">>\"; color: #123456; }",
+            Origin::Author,
+        );
+        let styled = engine.compute(&doc);
+        let tree = TreeBuilder::new(&doc, &styled).build();
+        let div_box = tree.find_node(div).unwrap();
+        let before = &tree.boxes[div_box.children[0]];
+        assert_eq!(
+            before.style.color(),
+            browser_style::Color::rgb(0x12, 0x34, 0x56)
+        );
+    }
+
+    #[test]
+    fn pseudo_text_appears_as_a_leading_fragment_after_layout() {
+        let (doc, div) = div_doc();
+        let mut engine = StyleEngine::new(Viewport::default());
+        engine.add_css(
+            "div::before { content: \">>\"; } div::after { content: \"!\"; }",
+            Origin::Author,
+        );
+        let styled = engine.compute(&doc);
+        let tree = crate::layout(
+            &doc,
+            &styled,
+            crate::Size {
+                width: 800.0,
+                height: 600.0,
+            },
+        );
+        let div_box = tree.find_node(div).unwrap();
+        let line = &div_box.lines[0];
+        let texts: Vec<&str> = line.fragments.iter().map(|f| f.text.as_str()).collect();
+        assert_eq!(texts, [">>", "hello", "!"]);
+    }
+
+    #[test]
+    fn replaced_elements_have_no_pseudo_boxes() {
+        let mut doc = Document::new();
+        let html = doc.create_element("html");
+        let body = doc.create_element("body");
+        doc.append_child(doc.root(), html);
+        doc.append_child(html, body);
+        for tag in ["img", "input"] {
+            let element = doc.create_element(tag);
+            doc.append_child(body, element);
+        }
+        let mut engine = StyleEngine::new(Viewport::default());
+        engine.add_css(
+            "img::before, input::before { content: \">>\"; }",
+            Origin::Author,
+        );
+        let styled = engine.compute(&doc);
+        let tree = TreeBuilder::new(&doc, &styled).build();
+        for tag in ["img", "input"] {
+            let node = doc
+                .descendants(doc.root())
+                .find(|node| doc.is_tag(*node, tag))
+                .unwrap();
+            let b = tree.find_node(node).unwrap();
+            assert!(b.children.is_empty(), "{tag} generated a pseudo box");
+        }
+    }
+
+    fn svg_doc(width: &str, height: &str, view_box: Option<&str>) -> (Document, NodeId) {
+        let mut doc = Document::new();
+        let html = doc.create_element("html");
+        let body = doc.create_element("body");
+        doc.append_child(doc.root(), html);
+        doc.append_child(html, body);
+        let svg = doc.create_element("svg");
+        if !width.is_empty() {
+            doc.set_attr(svg, "width", width);
+        }
+        if !height.is_empty() {
+            doc.set_attr(svg, "height", height);
+        }
+        if let Some(view_box) = view_box {
+            doc.set_attr(svg, "viewBox", view_box);
+        }
+        doc.append_child(body, svg);
+        let rect = doc.create_element("rect");
+        doc.set_attr(rect, "width", "40");
+        doc.set_attr(rect, "height", "20");
+        doc.set_attr(rect, "fill", "red");
+        doc.append_child(svg, rect);
+        (doc, svg)
+    }
+
+    #[test]
+    fn inline_svg_is_an_atomic_image_box_with_serialized_source() {
+        let (doc, svg) = svg_doc("40", "20", None);
+        let engine = StyleEngine::new(Viewport::default());
+        let styled = engine.compute(&doc);
+        let tree = TreeBuilder::new(&doc, &styled).build();
+        let b = tree.find_node(svg).unwrap();
+        assert_eq!(b.box_type, BoxType::Image);
+        assert!(b.children.is_empty(), "SVG children must stay atomic");
+        assert_eq!(b.style.width(), Dim::Px(40.0));
+        assert_eq!(b.style.height(), Dim::Px(20.0));
+        let source = b.svg_source.as_deref().expect("serialized SVG source");
+        assert!(source.starts_with("<svg"), "{source}");
+        assert!(source.contains("<rect"), "{source}");
+        assert!(source.contains("width=\"40\""), "{source}");
+        assert!(source.contains("height=\"20\""), "{source}");
+        assert!(!source.contains("viewBox"), "{source}");
+    }
+
+    #[test]
+    fn inline_svg_defaults_to_300x150_and_restores_viewbox_case() {
+        let (doc, svg) = svg_doc("", "", Some("0 0 10 5"));
+        let engine = StyleEngine::new(Viewport::default());
+        let styled = engine.compute(&doc);
+        let tree = TreeBuilder::new(&doc, &styled).build();
+        let b = tree.find_node(svg).unwrap();
+        assert_eq!(b.style.width(), Dim::Px(300.0));
+        assert_eq!(b.style.height(), Dim::Px(150.0));
+        assert_eq!(
+            b.style.aspect_ratio(),
+            browser_style::AspectRatio::Ratio(10.0, 5.0)
+        );
+        let source = b.svg_source.as_deref().unwrap();
+        assert!(source.contains("viewBox=\"0 0 10 5\""), "{source}");
+    }
+
+    #[test]
+    fn inline_svg_single_dimension_uses_viewbox_aspect() {
+        let (doc, svg) = svg_doc("40", "", Some("0 0 10 5"));
+        let engine = StyleEngine::new(Viewport::default());
+        let styled = engine.compute(&doc);
+        let tree = TreeBuilder::new(&doc, &styled).build();
+        let b = tree.find_node(svg).unwrap();
+        assert_eq!(b.style.width(), Dim::Px(40.0));
+        assert_eq!(b.style.height(), Dim::Px(20.0));
+    }
+
+    #[test]
+    fn anonymous_wrappers_do_not_multiply_a_parent_min_height() {
+        // A block container with inline runs separated by block children gets
+        // one anonymous wrapper per run. Before the fix each wrapper inherited
+        // the parent's `min-height`, so a 240px panel with three runs measured
+        // over 700px tall. The wrappers must be sized by their text only.
+        let mut doc = Document::new();
+        let html = doc.create_element("html");
+        let body = doc.create_element("body");
+        doc.append_child(doc.root(), html);
+        doc.append_child(html, body);
+        let panel = doc.create_element("div");
+        doc.set_attr(panel, "id", "panel");
+        doc.append_child(body, panel);
+        doc.append_text(panel, "alpha");
+        let block = doc.create_element("div");
+        doc.append_child(panel, block);
+        doc.append_text(panel, "beta");
+        let block2 = doc.create_element("div");
+        doc.append_child(panel, block2);
+        doc.append_text(panel, "gamma");
+
+        let mut engine = StyleEngine::new(Viewport {
+            width: 800.0,
+            height: 600.0,
+        });
+        engine.add_css(
+            "body { margin:0; } #panel { min-height:240px; } #panel > div { height:10px; }",
+            Origin::Author,
+        );
+        let styled = engine.compute(&doc);
+        let tree = crate::layout(
+            &doc,
+            &styled,
+            crate::Size {
+                width: 800.0,
+                height: 600.0,
+            },
+        );
+        let panel_box = tree.find_node(panel).unwrap();
+        assert!(
+            panel_box.content.height <= 260.0,
+            "anonymous wrappers multiplied min-height: {}",
+            panel_box.content.height
+        );
+        for &child in &panel_box.children {
+            let wrapper = &tree.boxes[child];
+            if wrapper.box_type == BoxType::AnonymousBlock {
+                assert_eq!(
+                    wrapper.style.dim(browser_style::Property::MinHeight),
+                    browser_style::Dim::Auto,
+                    "anonymous wrapper inherited min-height"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn out_of_flow_boxes_do_not_extend_content_height() {
+        let mut doc = Document::new();
+        let html = doc.create_element("html");
+        let body = doc.create_element("body");
+        doc.append_child(doc.root(), html);
+        doc.append_child(html, body);
+        let normal = doc.create_element("div");
+        doc.append_child(body, normal);
+        let fixed = doc.create_element("div");
+        doc.set_attr(fixed, "id", "fixed");
+        doc.append_child(body, fixed);
+
+        let mut engine = StyleEngine::new(Viewport {
+            width: 800.0,
+            height: 600.0,
+        });
+        engine.add_css(
+            "body { margin:0; } #normal { height:100px; } \
+             #fixed { position:fixed; top:9000px; width:10px; height:10px; }",
+            Origin::Author,
+        );
+        let styled = engine.compute(&doc);
+        let tree = crate::layout(
+            &doc,
+            &styled,
+            crate::Size {
+                width: 800.0,
+                height: 600.0,
+            },
+        );
+        assert!(
+            tree.content_height() <= 200.0,
+            "fixed box inflated content height: {}",
+            tree.content_height()
+        );
+    }
+
+    #[test]
+    fn inline_svg_has_definite_geometry_after_layout() {
+        let (doc, svg) = svg_doc("40", "20", None);
+        let engine = StyleEngine::new(Viewport::default());
+        let styled = engine.compute(&doc);
+        let tree = crate::layout(
+            &doc,
+            &styled,
+            crate::Size {
+                width: 800.0,
+                height: 600.0,
+            },
+        );
+        let b = tree.find_node(svg).unwrap();
+        assert_eq!(b.rect.width, 40.0);
+        assert_eq!(b.rect.height, 20.0);
     }
 }

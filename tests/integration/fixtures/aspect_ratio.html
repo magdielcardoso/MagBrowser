@@ -1,0 +1,10 @@
+<!DOCTYPE html>
+<html>
+  <head><title>aspect ratio</title></head>
+  <body style="margin:0">
+    <!-- Intrinsic image is square (40x40). The author declares a 2:1 aspect
+         ratio and only a width, so the used height must be 100 / 2 = 50px,
+         overriding the image's intrinsic 1:1 ratio. -->
+    <img id="pic" src="photo.png" style="display:block;width:100px;aspect-ratio:2 / 1">
+  </body>
+</html>

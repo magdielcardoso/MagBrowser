@@ -3,9 +3,10 @@
 use std::fmt;
 
 use crate::ast::{
-    AssignOp, BinaryOp, CatchClause, DeclKind, Expr, ForInit, ForTarget, Function, LogicalOp,
-    ObjectPatternProperty, Pattern, Position, Program, Property, PropertyKey, Stmt, SwitchCase,
-    UnaryOp, UpdateOp, VarDecl, VarDeclarator,
+    AssignOp, BinaryOp, CatchClause, Class, ClassMember, DeclKind, ExportDecl, ExportKind,
+    ExportSpecifier, Expr, ForInit, ForTarget, Function, ImportDecl, ImportSpecifier, LogicalOp,
+    MethodKind, ObjectPatternProperty, OptionalChain, OptionalChainOp, Pattern, Position, Program,
+    Property, PropertyKey, Stmt, SwitchCase, UnaryOp, UpdateOp, VarDecl, VarDeclarator,
 };
 use crate::lexer::{Punct, Token, TokenKind, tokenize};
 use crate::regexp::Regex;
@@ -60,16 +61,40 @@ pub struct Parser {
     tokens: Vec<Token>,
     pos: usize,
     no_in: bool,
+    depth: usize,
 }
 
 impl Parser {
+    /// Maximum recursion depth while parsing statements and expressions.
+    ///
+    /// Deeply nested source (for example thousands of opening parentheses)
+    /// would otherwise exhaust the native stack. Exceeding the limit produces
+    /// a syntax error instead of overflowing.
+    pub const MAX_RECURSION_DEPTH: usize = 512;
+
     /// Create a parser over a token stream. The stream must end with an `Eof` token.
     pub fn new(tokens: Vec<Token>) -> Self {
         Self {
             tokens,
             pos: 0,
             no_in: false,
+            depth: 0,
         }
+    }
+
+    /// Enter a recursive parse function, rejecting nesting that is too deep.
+    fn enter_recursion(&mut self) -> Result<(), ParseError> {
+        if self.depth >= Self::MAX_RECURSION_DEPTH {
+            return self.error("expression is nested too deeply");
+        }
+        self.depth += 1;
+        Ok(())
+    }
+
+    /// Leave a recursive parse function. Always paired with `enter_recursion`
+    /// even when the inner parse returns an error.
+    fn leave_recursion(&mut self) {
+        self.depth -= 1;
     }
 
     fn current(&self) -> &Token {
@@ -186,6 +211,221 @@ impl Parser {
         }
     }
 
+    /// Whether the current token is the identifier-shaped word `word`.
+    fn is_identifier_word(&self, word: &str) -> bool {
+        matches!(self.kind(), TokenKind::Identifier(text) if text == word)
+    }
+
+    fn eat_identifier_word(&mut self, word: &str) -> bool {
+        if self.is_identifier_word(word) {
+            self.advance();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn expect_identifier_word(&mut self, word: &str) -> Result<(), ParseError> {
+        if self.eat_identifier_word(word) {
+            Ok(())
+        } else {
+            self.unexpected(&format!("`{word}`"))
+        }
+    }
+
+    /// Consume a quoted module specifier, returning its cooked text.
+    fn parse_module_specifier(&mut self) -> Result<String, ParseError> {
+        match self.kind().clone() {
+            TokenKind::String(source) => {
+                self.advance();
+                Ok(source)
+            }
+            _ => self.unexpected("a module specifier string"),
+        }
+    }
+
+    /// Parse the `{ ... }` part of an import declaration. The opening brace is
+    /// expected to be the current token.
+    fn parse_import_specifiers(&mut self) -> Result<Vec<ImportSpecifier>, ParseError> {
+        self.expect_punct(Punct::LBrace)?;
+        let mut specifiers = Vec::new();
+        while !self.is_punct(Punct::RBrace) {
+            // `import { default as d }` needs the keyword-tolerant name here.
+            let imported = self.identifier_name()?;
+            let local = if self.eat_identifier_word("as") {
+                self.binding_identifier()?
+            } else {
+                imported.clone()
+            };
+            specifiers.push(ImportSpecifier { imported, local });
+            if !self.eat_punct(Punct::Comma) {
+                break;
+            }
+        }
+        self.expect_punct(Punct::RBrace)?;
+        Ok(specifiers)
+    }
+
+    /// Parse the `{ ... }` part of an export declaration. The opening brace is
+    /// expected to be the current token.
+    fn parse_export_specifiers(&mut self) -> Result<Vec<ExportSpecifier>, ParseError> {
+        self.expect_punct(Punct::LBrace)?;
+        let mut specifiers = Vec::new();
+        while !self.is_punct(Punct::RBrace) {
+            let local = self.identifier_name()?;
+            let exported = if self.eat_identifier_word("as") {
+                self.identifier_name()?
+            } else {
+                local.clone()
+            };
+            specifiers.push(ExportSpecifier { local, exported });
+            if !self.eat_punct(Punct::Comma) {
+                break;
+            }
+        }
+        self.expect_punct(Punct::RBrace)?;
+        Ok(specifiers)
+    }
+
+    /// Parse a static `import` declaration.
+    fn parse_import_declaration(&mut self) -> Result<Stmt, ParseError> {
+        let pos = self.current().position;
+        self.advance(); // `import`
+
+        // Side-effect only: `import "module";`
+        if matches!(self.kind(), TokenKind::String(_)) {
+            let source = self.parse_module_specifier()?;
+            self.semicolon()?;
+            return Ok(Stmt::Import(ImportDecl {
+                default: None,
+                named: Vec::new(),
+                namespace: None,
+                source,
+                pos,
+            }));
+        }
+
+        let mut default = None;
+        let mut named = Vec::new();
+        let mut namespace = None;
+        match self.kind().clone() {
+            TokenKind::Identifier(name) => {
+                self.advance();
+                default = Some(name);
+                if self.eat_punct(Punct::Comma) {
+                    if self.eat_punct(Punct::Star) {
+                        self.expect_identifier_word("as")?;
+                        namespace = Some(self.binding_identifier()?);
+                    } else {
+                        named = self.parse_import_specifiers()?;
+                    }
+                }
+            }
+            TokenKind::Punct(Punct::Star) => {
+                self.advance();
+                self.expect_identifier_word("as")?;
+                namespace = Some(self.binding_identifier()?);
+            }
+            TokenKind::Punct(Punct::LBrace) => {
+                named = self.parse_import_specifiers()?;
+            }
+            _ => return self.unexpected("an import clause or a module specifier"),
+        }
+        self.expect_identifier_word("from")?;
+        let source = self.parse_module_specifier()?;
+        self.semicolon()?;
+        Ok(Stmt::Import(ImportDecl {
+            default,
+            named,
+            namespace,
+            source,
+            pos,
+        }))
+    }
+
+    /// Parse an `export` declaration.
+    fn parse_export_declaration(&mut self) -> Result<Stmt, ParseError> {
+        let pos = self.current().position;
+        self.advance(); // `export`
+
+        if self.eat_keyword(Keyword::Default) {
+            let kind = if self.is_keyword(Keyword::Function) {
+                // `export default function () {}` has no name; accepting an
+                // expression-style function covers both named and anonymous.
+                let mut function = self.parse_function(true, false)?;
+                if function.name.is_none() {
+                    function.name = Some("default".to_owned());
+                }
+                ExportKind::DefaultDecl(Box::new(Stmt::FunctionDecl(function)))
+            } else if self.is_keyword(Keyword::Class) {
+                let mut class = self.parse_class()?;
+                if class.name.is_none() {
+                    class.name = Some("default".to_owned());
+                }
+                ExportKind::DefaultDecl(Box::new(Stmt::ClassDecl(class)))
+            } else if self.is_identifier_word("async")
+                && matches!(self.peek_kind(1), TokenKind::Keyword(Keyword::Function))
+            {
+                self.advance();
+                let mut function = self.parse_function(true, true)?;
+                if function.name.is_none() {
+                    function.name = Some("default".to_owned());
+                }
+                ExportKind::DefaultDecl(Box::new(Stmt::FunctionDecl(function)))
+            } else {
+                let expression = self.parse_assignment()?;
+                self.semicolon()?;
+                ExportKind::DefaultExpr(expression)
+            };
+            return Ok(Stmt::Export(ExportDecl { kind, pos }));
+        }
+
+        if self.eat_punct(Punct::Star) {
+            self.expect_identifier_word("from")?;
+            let source = self.parse_module_specifier()?;
+            self.semicolon()?;
+            return Ok(Stmt::Export(ExportDecl {
+                kind: ExportKind::All { source },
+                pos,
+            }));
+        }
+
+        if self.is_punct(Punct::LBrace) {
+            let specifiers = self.parse_export_specifiers()?;
+            let source = if self.eat_identifier_word("from") {
+                Some(self.parse_module_specifier()?)
+            } else {
+                None
+            };
+            self.semicolon()?;
+            return Ok(Stmt::Export(ExportDecl {
+                kind: ExportKind::Named { specifiers, source },
+                pos,
+            }));
+        }
+
+        let declaration = match self.kind().clone() {
+            TokenKind::Keyword(Keyword::Var)
+            | TokenKind::Keyword(Keyword::Let)
+            | TokenKind::Keyword(Keyword::Const) => self.parse_variable_statement()?,
+            TokenKind::Keyword(Keyword::Function) => {
+                Stmt::FunctionDecl(self.parse_function(false, false)?)
+            }
+            TokenKind::Keyword(Keyword::Class) => Stmt::ClassDecl(self.parse_class()?),
+            _ if self.is_identifier_word("async")
+                && matches!(self.peek_kind(1), TokenKind::Keyword(Keyword::Function)) =>
+            {
+                self.advance();
+                Stmt::FunctionDecl(self.parse_function(false, true)?)
+            }
+            _ => return self.unexpected("a declaration, `default`, `{` or `*`"),
+        };
+        Ok(Stmt::Export(ExportDecl {
+            kind: ExportKind::Decl(Box::new(declaration)),
+            pos,
+        }))
+    }
+
     /// Parse a complete program.
     pub fn parse_program(&mut self) -> Result<Program, ParseError> {
         let mut body = Vec::new();
@@ -196,6 +436,13 @@ impl Parser {
     }
 
     fn parse_statement(&mut self) -> Result<Stmt, ParseError> {
+        self.enter_recursion()?;
+        let result = self.parse_statement_inner();
+        self.leave_recursion();
+        result
+    }
+
+    fn parse_statement_inner(&mut self) -> Result<Stmt, ParseError> {
         match self.kind().clone() {
             TokenKind::Punct(Punct::Semi) => {
                 self.advance();
@@ -207,7 +454,26 @@ impl Parser {
                 self.parse_variable_statement()
             }
             TokenKind::Keyword(Keyword::Function) => {
-                let function = self.parse_function(false)?;
+                let function = self.parse_function(false, false)?;
+                Ok(Stmt::FunctionDecl(function))
+            }
+            TokenKind::Keyword(Keyword::Class) => Ok(Stmt::ClassDecl(self.parse_class()?)),
+            TokenKind::Identifier(ref name)
+                if name == "import"
+                    && !matches!(
+                        self.peek_kind(1),
+                        TokenKind::Punct(Punct::LParen | Punct::Dot | Punct::QuestionDot)
+                    ) =>
+            {
+                self.parse_import_declaration()
+            }
+            TokenKind::Identifier(ref name) if name == "export" => self.parse_export_declaration(),
+            TokenKind::Identifier(ref name)
+                if name.as_str() == "async"
+                    && matches!(self.peek_kind(1), TokenKind::Keyword(Keyword::Function)) =>
+            {
+                self.advance();
+                let function = self.parse_function(false, true)?;
                 Ok(Stmt::FunctionDecl(function))
             }
             TokenKind::Keyword(Keyword::If) => self.parse_if(),
@@ -306,6 +572,13 @@ impl Parser {
     }
 
     fn parse_binding_pattern_base(&mut self) -> Result<Pattern, ParseError> {
+        self.enter_recursion()?;
+        let result = self.parse_binding_pattern_base_inner();
+        self.leave_recursion();
+        result
+    }
+
+    fn parse_binding_pattern_base_inner(&mut self) -> Result<Pattern, ParseError> {
         match self.kind().clone() {
             TokenKind::Identifier(name) => {
                 self.advance();
@@ -399,6 +672,12 @@ impl Parser {
             TokenKind::Number(value) => {
                 self.advance();
                 Ok(PropertyKey::Number(value))
+            }
+            TokenKind::Punct(Punct::LBracket) => {
+                self.advance();
+                let expr = self.parse_expression()?;
+                self.expect_punct(Punct::RBracket)?;
+                Ok(PropertyKey::Computed(Box::new(expr)))
             }
             _ => self.unexpected("a property key"),
         }
@@ -501,12 +780,16 @@ impl Parser {
         if declarator.init.is_some() {
             return self.error("for-in/of declaration may not have an initializer");
         }
-        let Some(name) = declarator.pattern.is_simple_identifier() else {
-            return self.error("for-in/of destructuring targets are not supported");
-        };
-        let left = ForTarget::Var {
-            kind: decl.kind,
-            name: name.to_owned(),
+        let left = if let Some(name) = declarator.pattern.is_simple_identifier() {
+            ForTarget::Var {
+                kind: decl.kind,
+                name: name.to_owned(),
+            }
+        } else {
+            ForTarget::Pattern {
+                kind: decl.kind,
+                pattern: declarator.pattern.clone(),
+            }
         };
         self.expect_punct(Punct::RParen)?;
         let body = Box::new(self.parse_statement()?);
@@ -676,6 +959,13 @@ impl Parser {
     }
 
     fn parse_expression(&mut self) -> Result<Expr, ParseError> {
+        self.enter_recursion()?;
+        let result = self.parse_expression_inner();
+        self.leave_recursion();
+        result
+    }
+
+    fn parse_expression_inner(&mut self) -> Result<Expr, ParseError> {
         let first = self.parse_assignment()?;
         if !self.is_punct(Punct::Comma) {
             return Ok(first);
@@ -688,6 +978,13 @@ impl Parser {
     }
 
     fn parse_assignment(&mut self) -> Result<Expr, ParseError> {
+        self.enter_recursion()?;
+        let result = self.parse_assignment_inner();
+        self.leave_recursion();
+        result
+    }
+
+    fn parse_assignment_inner(&mut self) -> Result<Expr, ParseError> {
         if self.is_punct(Punct::LBrace)
             && let Some(expr) = self.try_parse_object_assignment_pattern()?
         {
@@ -903,10 +1200,34 @@ impl Parser {
     }
 
     fn parse_binary(&mut self, min_precedence: u8) -> Result<Expr, ParseError> {
+        self.enter_recursion()?;
+        let result = self.parse_binary_inner(min_precedence);
+        self.leave_recursion();
+        result
+    }
+
+    fn parse_binary_inner(&mut self, min_precedence: u8) -> Result<Expr, ParseError> {
         let mut left = self.parse_unary()?;
+        let mut seen_nullish = false;
+        let mut seen_or_and = false;
         while let Some((precedence, right_assoc, kind)) = self.binary_operator() {
             if precedence < min_precedence {
                 break;
+            }
+            // JavaScript requires parentheses when `??` is mixed with `||`
+            // or `&&`; the three operators have equal precedence.
+            if let BinaryKind::Logical(op) = kind {
+                match op {
+                    LogicalOp::Nullish if seen_or_and => {
+                        return self
+                            .error("`??` cannot be mixed with `||` or `&&` without parentheses");
+                    }
+                    LogicalOp::And | LogicalOp::Or if seen_nullish => {
+                        return self
+                            .error("`??` cannot be mixed with `||` or `&&` without parentheses");
+                    }
+                    _ => {}
+                }
             }
             self.advance();
             let next_min = if right_assoc {
@@ -915,6 +1236,12 @@ impl Parser {
                 precedence + 1
             };
             let right = self.parse_binary(next_min)?;
+            if let BinaryKind::Logical(op) = kind {
+                match op {
+                    LogicalOp::Nullish => seen_nullish = true,
+                    LogicalOp::And | LogicalOp::Or => seen_or_and = true,
+                }
+            }
             left = match kind {
                 BinaryKind::Binary(op) => Expr::Binary {
                     op,
@@ -932,6 +1259,13 @@ impl Parser {
     }
 
     fn parse_unary(&mut self) -> Result<Expr, ParseError> {
+        self.enter_recursion()?;
+        let result = self.parse_unary_inner();
+        self.leave_recursion();
+        result
+    }
+
+    fn parse_unary_inner(&mut self) -> Result<Expr, ParseError> {
         let op = match self.kind() {
             TokenKind::Punct(Punct::Plus) => Some(UnaryOp::Plus),
             TokenKind::Punct(Punct::Minus) => Some(UnaryOp::Minus),
@@ -994,6 +1328,13 @@ impl Parser {
     }
 
     fn parse_new(&mut self) -> Result<Expr, ParseError> {
+        self.enter_recursion()?;
+        let result = self.parse_new_inner();
+        self.leave_recursion();
+        result
+    }
+
+    fn parse_new_inner(&mut self) -> Result<Expr, ParseError> {
         self.expect_keyword(Keyword::New)?;
         let callee = if self.is_keyword(Keyword::New) {
             self.parse_new()?
@@ -1036,31 +1377,88 @@ impl Parser {
     }
 
     fn parse_chain(&mut self, mut expr: Expr) -> Result<Expr, ParseError> {
+        let mut chain: Option<OptionalChain> = None;
         loop {
+            if self.eat_punct(Punct::QuestionDot) {
+                if chain.is_none() {
+                    chain = Some(OptionalChain {
+                        base: Box::new(expr.clone()),
+                        ops: Vec::new(),
+                    });
+                }
+                let current = chain.as_mut().expect("optional chain was just created");
+                if self.eat_punct(Punct::LParen) {
+                    current.ops.push(OptionalChainOp::Call {
+                        arguments: self.parse_arguments()?,
+                        optional: true,
+                    });
+                } else {
+                    let (property, computed) = if self.eat_punct(Punct::LBracket) {
+                        let property = self.parse_expression()?;
+                        self.expect_punct(Punct::RBracket)?;
+                        (property, true)
+                    } else {
+                        (Expr::Identifier(self.identifier_name()?), false)
+                    };
+                    current.ops.push(OptionalChainOp::Member {
+                        property: Box::new(property),
+                        computed,
+                        optional: true,
+                    });
+                }
+                continue;
+            }
             if self.eat_punct(Punct::Dot) {
-                let name = self.identifier_name()?;
-                expr = Expr::Member {
-                    object: Box::new(expr),
-                    property: Box::new(Expr::Identifier(name)),
-                    computed: false,
-                };
+                let property = Expr::Identifier(self.identifier_name()?);
+                if let Some(current) = &mut chain {
+                    current.ops.push(OptionalChainOp::Member {
+                        property: Box::new(property),
+                        computed: false,
+                        optional: false,
+                    });
+                } else {
+                    expr = Expr::Member {
+                        object: Box::new(expr),
+                        property: Box::new(property),
+                        computed: false,
+                    };
+                }
             } else if self.eat_punct(Punct::LBracket) {
                 let property = self.parse_expression()?;
                 self.expect_punct(Punct::RBracket)?;
-                expr = Expr::Member {
-                    object: Box::new(expr),
-                    property: Box::new(property),
-                    computed: true,
-                };
+                if let Some(current) = &mut chain {
+                    current.ops.push(OptionalChainOp::Member {
+                        property: Box::new(property),
+                        computed: true,
+                        optional: false,
+                    });
+                } else {
+                    expr = Expr::Member {
+                        object: Box::new(expr),
+                        property: Box::new(property),
+                        computed: true,
+                    };
+                }
             } else if self.eat_punct(Punct::LParen) {
                 let arguments = self.parse_arguments()?;
-                expr = Expr::Call {
-                    callee: Box::new(expr),
-                    arguments,
-                };
+                if let Some(current) = &mut chain {
+                    current.ops.push(OptionalChainOp::Call {
+                        arguments,
+                        optional: false,
+                    });
+                } else {
+                    expr = Expr::Call {
+                        callee: Box::new(expr),
+                        arguments,
+                    };
+                }
             } else {
-                return Ok(expr);
+                break;
             }
+        }
+        match chain {
+            Some(chain) => Ok(Expr::OptionalChain(chain)),
+            None => Ok(expr),
         }
     }
 
@@ -1070,7 +1468,12 @@ impl Parser {
             return Ok(arguments);
         }
         loop {
-            arguments.push(self.parse_assignment()?);
+            let argument = if self.eat_punct(Punct::Ellipsis) {
+                Expr::Spread(Box::new(self.parse_assignment()?))
+            } else {
+                self.parse_assignment()?
+            };
+            arguments.push(argument);
             if self.eat_punct(Punct::Comma) {
                 if self.is_punct(Punct::RParen) {
                     self.advance();
@@ -1127,11 +1530,20 @@ impl Parser {
             patterns,
             body,
             is_arrow: true,
+            is_generator: false,
+            is_async: false,
             pos: position,
         }))
     }
 
     fn parse_primary(&mut self) -> Result<Expr, ParseError> {
+        self.enter_recursion()?;
+        let result = self.parse_primary_inner();
+        self.leave_recursion();
+        result
+    }
+
+    fn parse_primary_inner(&mut self) -> Result<Expr, ParseError> {
         match self.kind().clone() {
             TokenKind::Number(value) => {
                 self.advance();
@@ -1161,8 +1573,13 @@ impl Parser {
                 self.advance();
                 Ok(Expr::This)
             }
+            TokenKind::Keyword(Keyword::Super) => {
+                self.advance();
+                Ok(Expr::Super)
+            }
+            TokenKind::Keyword(Keyword::Class) => Ok(Expr::Class(self.parse_class()?)),
             TokenKind::Keyword(Keyword::Function) => {
-                let function = self.parse_function(true)?;
+                let function = self.parse_function(true, false)?;
                 Ok(Expr::Function(function))
             }
             TokenKind::Regex { pattern, flags } => {
@@ -1177,6 +1594,34 @@ impl Parser {
                 Ok(Expr::Regex { pattern, flags })
             }
             TokenKind::Identifier(name) => {
+                match name.as_str() {
+                    "import" if matches!(self.peek_kind(1), TokenKind::Punct(Punct::LParen)) => {
+                        self.advance(); // `import`
+                        self.advance(); // `(`
+                        let argument = self.parse_assignment()?;
+                        self.expect_punct(Punct::RParen)?;
+                        return Ok(Expr::ImportCall(Box::new(argument)));
+                    }
+                    "import"
+                        if matches!(self.peek_kind(1), TokenKind::Punct(Punct::Dot))
+                            && matches!(self.peek_kind(2), TokenKind::Identifier(property) if property == "meta") =>
+                    {
+                        self.advance(); // `import`
+                        self.advance(); // `.`
+                        self.advance(); // `meta`
+                        return Ok(Expr::MetaProperty {
+                            meta: "import".to_owned(),
+                            property: "meta".to_owned(),
+                        });
+                    }
+                    "async" => return self.parse_async_primary(),
+                    "await" => {
+                        self.advance();
+                        return Ok(Expr::Await(Box::new(self.parse_unary()?)));
+                    }
+                    "yield" => return self.parse_yield(),
+                    _ => {}
+                }
                 if matches!(self.peek_kind(1), TokenKind::Punct(Punct::Arrow))
                     && !self.tokens[self.pos + 1].newline_before
                 {
@@ -1200,6 +1645,81 @@ impl Parser {
             TokenKind::Punct(Punct::LBracket) => self.parse_array_literal(),
             TokenKind::Punct(Punct::LBrace) => self.parse_object_literal(),
             _ => self.unexpected("an expression"),
+        }
+    }
+
+    /// Parse `async function ...`, `async (...) => ...` or `async x => ...`.
+    /// Falls back to the plain identifier `async` when none of those forms
+    /// match, so `async` remains usable as a variable name.
+    fn parse_async_primary(&mut self) -> Result<Expr, ParseError> {
+        let saved = self.pos;
+        let position = self.current().position;
+        self.advance();
+        let attempt = (|| -> Result<Expr, ParseError> {
+            if self.is_keyword(Keyword::Function) {
+                return Ok(Expr::Function(self.parse_function(true, true)?));
+            }
+            if self.is_punct(Punct::LParen) {
+                self.expect_punct(Punct::LParen)?;
+                let patterns = self.parse_parameter_patterns()?;
+                if self.current().newline_before || !self.is_punct(Punct::Arrow) {
+                    return self.unexpected("`=>`");
+                }
+                return self.parse_arrow(patterns, position);
+            }
+            if let TokenKind::Identifier(name) = self.kind().clone()
+                && matches!(self.peek_kind(1), TokenKind::Punct(Punct::Arrow))
+                && !self.tokens[self.pos + 1].newline_before
+            {
+                let patterns = vec![Pattern::Identifier(name)];
+                self.advance();
+                return self.parse_arrow(patterns, position);
+            }
+            self.unexpected("`function` or `=>` after `async`")
+        })();
+        match attempt {
+            Ok(mut expr) => {
+                if let Expr::Arrow(function) | Expr::Function(function) = &mut expr {
+                    function.is_async = true;
+                }
+                Ok(expr)
+            }
+            Err(_) => {
+                self.pos = saved;
+                self.advance();
+                Ok(Expr::Identifier("async".to_owned()))
+            }
+        }
+    }
+
+    /// Parse a `yield` expression, including `yield*` delegation.
+    fn parse_yield(&mut self) -> Result<Expr, ParseError> {
+        self.expect_keyword_or_name("yield")?;
+        let delegate = self.eat_punct(Punct::Star);
+        let has_argument = !self.current().newline_before
+            && !self.is_punct(Punct::Semi)
+            && !self.is_punct(Punct::RParen)
+            && !self.is_punct(Punct::RBracket)
+            && !self.is_punct(Punct::RBrace)
+            && !self.is_punct(Punct::Comma)
+            && !self.is_punct(Punct::Colon)
+            && !self.at_end();
+        let argument = if has_argument {
+            Some(Box::new(self.parse_assignment()?))
+        } else {
+            None
+        };
+        Ok(Expr::Yield { argument, delegate })
+    }
+
+    /// Consume an identifier-shaped keyword that the lexer reports as an
+    /// identifier (used for contextual keywords such as `yield`).
+    fn expect_keyword_or_name(&mut self, name: &str) -> Result<(), ParseError> {
+        if matches!(self.kind(), TokenKind::Identifier(text) if text == name) {
+            self.advance();
+            Ok(())
+        } else {
+            self.unexpected(&format!("`{name}`"))
         }
     }
 
@@ -1236,7 +1756,11 @@ impl Parser {
                 items.push(None);
                 continue;
             }
-            let value = self.parse_assignment()?;
+            let value = if self.eat_punct(Punct::Ellipsis) {
+                Expr::Spread(Box::new(self.parse_assignment()?))
+            } else {
+                self.parse_assignment()?
+            };
             items.push(Some(value));
             if self.eat_punct(Punct::Comma) {
                 continue;
@@ -1254,25 +1778,31 @@ impl Parser {
                 return Ok(Expr::Object(properties));
             }
             let position = self.current().position;
-            let key = match self.kind().clone() {
-                TokenKind::Identifier(name) => {
+            let mut is_generator = self.eat_punct(Punct::Star);
+            let mut is_async = false;
+            if !is_generator
+                && matches!(self.kind(), TokenKind::Identifier(name) if name.as_str() == "async")
+                && !self.current().newline_before
+            {
+                let next = self.peek_kind(1);
+                let after_name = self.peek_kind(2);
+                let modifier = if matches!(next, TokenKind::Punct(Punct::Star)) {
+                    true
+                } else if matches!(
+                    next,
+                    TokenKind::Identifier(_) | TokenKind::Keyword(_) | TokenKind::String(_)
+                ) {
+                    matches!(after_name, TokenKind::Punct(Punct::LParen | Punct::Star))
+                } else {
+                    false
+                };
+                if modifier {
                     self.advance();
-                    PropertyKey::Ident(name)
+                    is_async = true;
+                    is_generator = self.eat_punct(Punct::Star);
                 }
-                TokenKind::Keyword(keyword) => {
-                    self.advance();
-                    PropertyKey::Ident(keyword.as_str().to_owned())
-                }
-                TokenKind::String(value) => {
-                    self.advance();
-                    PropertyKey::String(value)
-                }
-                TokenKind::Number(value) => {
-                    self.advance();
-                    PropertyKey::Number(value)
-                }
-                _ => return self.unexpected("a property key"),
-            };
+            }
+            let key = self.parse_property_key()?;
 
             let (value, shorthand) = if self.eat_punct(Punct::Colon) {
                 (self.parse_assignment()?, false)
@@ -1283,6 +1813,7 @@ impl Parser {
                 let name = match &key {
                     PropertyKey::Ident(name) | PropertyKey::String(name) => Some(name.clone()),
                     PropertyKey::Number(n) => Some(crate::ast::number_to_key(*n)),
+                    PropertyKey::Computed(_) => None,
                 };
                 (
                     Expr::Function(Function {
@@ -1291,10 +1822,14 @@ impl Parser {
                         patterns,
                         body,
                         is_arrow: false,
+                        is_generator,
+                        is_async,
                         pos: position,
                     }),
                     false,
                 )
+            } else if is_generator || is_async {
+                return self.unexpected("`(`");
             } else {
                 match &key {
                     PropertyKey::Ident(name) => (Expr::Identifier(name.clone()), true),
@@ -1343,9 +1878,14 @@ impl Parser {
         }
     }
 
-    fn parse_function(&mut self, is_expression: bool) -> Result<Function, ParseError> {
+    fn parse_function(
+        &mut self,
+        is_expression: bool,
+        is_async: bool,
+    ) -> Result<Function, ParseError> {
         let position = self.current().position;
         self.expect_keyword(Keyword::Function)?;
+        let is_generator = self.eat_punct(Punct::Star);
         let name = match self.kind().clone() {
             TokenKind::Identifier(name) => {
                 self.advance();
@@ -1367,7 +1907,113 @@ impl Parser {
             patterns,
             body,
             is_arrow: false,
+            is_generator,
+            is_async,
             pos: position,
+        })
+    }
+
+    /// Parse a class declaration or expression. The `class` keyword has not
+    /// been consumed yet.
+    fn parse_class(&mut self) -> Result<Class, ParseError> {
+        let pos = self.current().position;
+        self.expect_keyword(Keyword::Class)?;
+        let name = match self.kind().clone() {
+            TokenKind::Identifier(name) => {
+                self.advance();
+                Some(name)
+            }
+            _ => None,
+        };
+        let super_class = if self.eat_keyword(Keyword::Extends) {
+            Some(Box::new(self.parse_lhs()?))
+        } else {
+            None
+        };
+        self.expect_punct(Punct::LBrace)?;
+        let mut body = Vec::new();
+        while !self.is_punct(Punct::RBrace) {
+            if self.at_end() {
+                return self.unexpected("`}`");
+            }
+            body.push(self.parse_class_member()?);
+        }
+        self.expect_punct(Punct::RBrace)?;
+        Ok(Class {
+            name,
+            super_class,
+            body,
+            pos,
+        })
+    }
+
+    /// Parse a single class body member.
+    fn parse_class_member(&mut self) -> Result<ClassMember, ParseError> {
+        while self.eat_punct(Punct::Semi) {}
+        let position = self.current().position;
+        let is_static = self.eat_keyword(Keyword::Static);
+        let mut is_generator = self.eat_punct(Punct::Star);
+        let mut is_async = false;
+        if !is_generator
+            && matches!(self.kind(), TokenKind::Identifier(name) if name == "async")
+            && !self.current().newline_before
+        {
+            // `async` is a modifier only when a method name follows it. A
+            // method literally named `async` is followed directly by `(`.
+            let next = self.peek_kind(1);
+            let after_name = self.peek_kind(2);
+            let modifier = if matches!(next, TokenKind::Punct(Punct::Star)) {
+                true
+            } else if matches!(
+                next,
+                TokenKind::Identifier(_)
+                    | TokenKind::Keyword(_)
+                    | TokenKind::String(_)
+                    | TokenKind::Number(_)
+            ) {
+                matches!(after_name, TokenKind::Punct(Punct::LParen | Punct::Star))
+            } else {
+                false
+            };
+            if modifier {
+                self.advance();
+                is_async = true;
+                is_generator = self.eat_punct(Punct::Star);
+            }
+        }
+        let mut kind = MethodKind::Method;
+        if matches!(self.kind(), TokenKind::Identifier(name) if name.as_str() == "get" || name.as_str() == "set")
+            && !matches!(
+                self.peek_kind(1),
+                TokenKind::Punct(Punct::LParen | Punct::Star | Punct::Semi)
+            )
+        {
+            kind = if matches!(self.kind(), TokenKind::Identifier(name) if name == "get") {
+                MethodKind::Getter
+            } else {
+                MethodKind::Setter
+            };
+            self.advance();
+        }
+        let key = self.parse_property_key()?;
+        let patterns = self.parse_parameter_list()?;
+        self.expect_punct(Punct::LBrace)?;
+        let body = self.parse_block_body()?;
+        let name = key.as_key_string();
+        Ok(ClassMember::Method {
+            key,
+            function: Function {
+                name: Some(name),
+                params: simple_parameter_names(&patterns),
+                patterns,
+                body,
+                is_arrow: false,
+                is_generator,
+                is_async,
+                pos: position,
+            },
+            is_static,
+            kind,
         })
     }
 }

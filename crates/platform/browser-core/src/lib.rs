@@ -18,6 +18,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod background;
 pub mod browser;
 pub mod page;
 pub mod profile;
@@ -25,7 +26,10 @@ pub mod script;
 pub mod settings;
 pub mod tab;
 
+pub use background::{BackgroundLoader, PagePayload};
 pub use browser::{Browser, BrowserError, Snapshot};
+pub use browser_navigation::Truncation;
+pub use browser_web_apis::{FormSubmission, form_for_input};
 pub use page::{Page, PageState};
 pub use profile::{Profile, ProfileError};
 pub use settings::Settings;
