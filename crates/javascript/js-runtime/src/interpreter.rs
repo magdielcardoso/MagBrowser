@@ -8,6 +8,7 @@ use browser_js_parser::{
     OptionalChainOp, Pattern, Program, PropertyKey, Stmt, SwitchCase, UnaryOp, UpdateOp, VarDecl,
 };
 
+use crate::bigint::{BigInt, BigIntError};
 use crate::errors::JsError;
 use crate::execution::{Completion, LoopAction, collect_var_names, loop_action};
 use crate::function::UserFunction;
@@ -922,7 +923,12 @@ impl crate::Runtime {
                 };
                 self.temp_roots.push(left_value.clone());
                 let outcome = match self.eval_expr(right) {
-                    Ok(right_value) => self.apply_binary(*op, &left_value, &right_value),
+                    Ok(right_value) => {
+                        // Root the RHS too: boxing/getters in `apply_binary`
+                        // can allocate and trigger a collection.
+                        self.temp_roots.push(right_value.clone());
+                        self.apply_binary(*op, &left_value, &right_value)
+                    }
                     Err(error) => Err(error),
                 };
                 self.temp_roots.truncate(mark);
@@ -1218,6 +1224,7 @@ impl crate::Runtime {
     fn eval_call(&mut self, callee: &Expr, arguments: &[Expr]) -> Result<Value, JsError> {
         let mark = self.temp_roots.len();
         let outcome = (|| -> Result<Value, JsError> {
+            let mut method_name: Option<String> = None;
             let (function, this) = if matches!(callee, Expr::Super) {
                 let constructor = self.read_binding(SUPER_CTOR)?;
                 let this = self.current_this();
@@ -1232,6 +1239,7 @@ impl crate::Runtime {
                     let this = self.current_this();
                     let home = self.read_binding(SUPER_HOME)?;
                     let key = self.property_key(property, *computed)?;
+                    method_name = Some(key.clone());
                     let function = match home {
                         Value::Object(id) => {
                             let start = self.object(id).and_then(|object| object.prototype);
@@ -1249,6 +1257,7 @@ impl crate::Runtime {
                     let base = self.eval_expr(object)?;
                     self.temp_roots.push(base.clone());
                     let key = self.property_key(property, *computed)?;
+                    method_name = Some(key.clone());
                     let function = self.get_property_checked(&base, &key)?;
                     (function, base)
                 }
@@ -1260,6 +1269,10 @@ impl crate::Runtime {
             let args = self.eval_arguments(arguments)?;
             for value in &args {
                 self.temp_roots.push(value.clone());
+            }
+            if !self.is_callable(&function) {
+                let name = method_name.unwrap_or_else(|| function.to_string_value());
+                return Err(JsError::type_error(format!("{name} is not a function")));
             }
             self.call_function(&function, this, args)
         })();
@@ -1362,16 +1375,31 @@ impl crate::Runtime {
             UnaryOp::Not => Ok(Value::Bool(!self.eval_expr(argument)?.is_truthy())),
             UnaryOp::Minus => {
                 let value = self.eval_expr(argument)?;
-                Ok(Value::Number(-self.to_number_rt(&value)?))
+                let primitive = self.to_primitive(&value)?;
+                match primitive {
+                    Value::BigInt(integer) => Ok(Value::BigInt(Box::new(integer.neg()))),
+                    other => Ok(Value::Number(-self.to_number_rt(&other)?)),
+                }
             }
             UnaryOp::Plus => {
                 let value = self.eval_expr(argument)?;
-                Ok(Value::Number(self.to_number_rt(&value)?))
+                let primitive = self.to_primitive(&value)?;
+                match primitive {
+                    Value::BigInt(_) => Err(JsError::type_error(
+                        "Cannot convert a BigInt value to a number",
+                    )),
+                    other => Ok(Value::Number(self.to_number_rt(&other)?)),
+                }
             }
             UnaryOp::BitNot => {
                 let value = self.eval_expr(argument)?;
-                let number = self.to_number_rt(&value)?;
-                Ok(Value::Number(f64::from(!to_int32(number))))
+                let primitive = self.to_primitive(&value)?;
+                match primitive {
+                    Value::BigInt(integer) => Ok(Value::BigInt(Box::new(integer.not()))),
+                    other => Ok(Value::Number(f64::from(!to_int32(
+                        self.to_number_rt(&other)?,
+                    )))),
+                }
             }
         }
     }
@@ -1383,7 +1411,21 @@ impl crate::Runtime {
         argument: &Expr,
     ) -> Result<Value, JsError> {
         let old_value = self.read_target(argument)?;
-        let old_number = self.to_number_rt(&old_value)?;
+        let primitive = self.to_primitive(&old_value)?;
+        if let Value::BigInt(integer) = primitive {
+            let new_value = match op {
+                UpdateOp::Increment => integer.add(&BigInt::one()),
+                UpdateOp::Decrement => integer.sub(&BigInt::one()),
+            }
+            .map_err(|error| JsError::range_error(error.to_string()))?;
+            self.assign_target(argument, Value::BigInt(Box::new(new_value.clone())))?;
+            return Ok(if prefix {
+                Value::BigInt(Box::new(new_value))
+            } else {
+                Value::BigInt(integer)
+            });
+        }
+        let old_number = self.to_number_rt(&primitive)?;
         let new_number = match op {
             UpdateOp::Increment => old_number + 1.0,
             UpdateOp::Decrement => old_number - 1.0,
@@ -1632,6 +1674,14 @@ impl crate::Runtime {
         }
         match (left, right) {
             (Value::Undefined | Value::Null, Value::Undefined | Value::Null) => Ok(true),
+            (Value::BigInt(_), Value::Number(_))
+            | (Value::Number(_), Value::BigInt(_))
+            | (Value::BigInt(_), Value::String(_))
+            | (Value::String(_), Value::BigInt(_))
+            | (Value::BigInt(_), Value::Bool(_))
+            | (Value::Bool(_), Value::BigInt(_)) => {
+                Ok(Self::bigint_compare(left, right) == Some(std::cmp::Ordering::Equal))
+            }
             (Value::Number(_), Value::String(_))
             | (Value::String(_), Value::Number(_))
             | (Value::Bool(_), _)
@@ -1650,6 +1700,42 @@ impl crate::Runtime {
         }
     }
 
+    fn bigint_error(error: BigIntError) -> JsError {
+        JsError::range_error(error.to_string())
+    }
+
+    fn both_bigint(left: &Value, right: &Value) -> Result<(BigInt, BigInt), JsError> {
+        match (left, right) {
+            (Value::BigInt(left), Value::BigInt(right)) => {
+                Ok(((**left).clone(), (**right).clone()))
+            }
+            _ => Err(JsError::type_error(
+                "Cannot mix BigInt and other types, use explicit conversions",
+            )),
+        }
+    }
+
+    /// Numeric comparison used by relational operators when a BigInt is present.
+    fn bigint_compare(left: &Value, right: &Value) -> Option<std::cmp::Ordering> {
+        use std::cmp::Ordering;
+        let parsed = |text: &str| BigInt::parse_string(text).ok();
+        match (left, right) {
+            (Value::BigInt(a), Value::BigInt(b)) => Some(a.cmp(b)),
+            (Value::BigInt(a), Value::Number(b)) => a.cmp_with_f64(*b),
+            (Value::Number(a), Value::BigInt(b)) => b.cmp_with_f64(*a).map(Ordering::reverse),
+            (Value::BigInt(a), Value::String(text)) => parsed(text).map(|b| a.as_ref().cmp(&b)),
+            (Value::String(text), Value::BigInt(b)) => parsed(text).map(|a| a.cmp(b.as_ref())),
+            (Value::BigInt(a), Value::Bool(value)) => {
+                Some(a.as_ref().cmp(&BigInt::from_i64(i64::from(*value))))
+            }
+            (Value::Bool(value), Value::BigInt(b)) => {
+                Some(BigInt::from_i64(i64::from(*value)).cmp(b.as_ref()))
+            }
+            (Value::BigInt(_), _) | (_, Value::BigInt(_)) => None,
+            _ => unreachable!("bigint_compare called without a BigInt operand"),
+        }
+    }
+
     pub(crate) fn apply_binary(
         &mut self,
         op: BinaryOp,
@@ -1660,6 +1746,8 @@ impl crate::Runtime {
             BinaryOp::Add => {
                 let left_primitive = self.to_primitive(left)?;
                 let right_primitive = self.to_primitive(right)?;
+                // String concatenation wins over BigInt addition, matching
+                // the ES `+` algorithm's ToPrimitive branch order.
                 if matches!(left_primitive, Value::String(_))
                     || matches!(right_primitive, Value::String(_))
                 {
@@ -1668,31 +1756,61 @@ impl crate::Runtime {
                         left_primitive.to_string_value(),
                         right_primitive.to_string_value()
                     )))
+                } else if matches!(left_primitive, Value::BigInt(_))
+                    || matches!(right_primitive, Value::BigInt(_))
+                {
+                    let (left, right) = Self::both_bigint(&left_primitive, &right_primitive)?;
+                    Ok(Value::BigInt(Box::new(
+                        left.add(&right).map_err(Self::bigint_error)?,
+                    )))
                 } else {
                     Ok(Value::Number(
                         left_primitive.to_number() + right_primitive.to_number(),
                     ))
                 }
             }
-            BinaryOp::Sub => Ok(Value::Number(
-                self.to_number_rt(left)? - self.to_number_rt(right)?,
-            )),
-            BinaryOp::Mul => Ok(Value::Number(
-                self.to_number_rt(left)? * self.to_number_rt(right)?,
-            )),
-            BinaryOp::Div => Ok(Value::Number(
-                self.to_number_rt(left)? / self.to_number_rt(right)?,
-            )),
-            BinaryOp::Mod => Ok(Value::Number(
-                self.to_number_rt(left)? % self.to_number_rt(right)?,
-            )),
-            BinaryOp::Exp => Ok(Value::Number(
-                self.to_number_rt(left)?.powf(self.to_number_rt(right)?),
-            )),
+            BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod | BinaryOp::Exp => {
+                let left_primitive = self.to_primitive(left)?;
+                let right_primitive = self.to_primitive(right)?;
+                if matches!(left_primitive, Value::BigInt(_))
+                    || matches!(right_primitive, Value::BigInt(_))
+                {
+                    let (left, right) = Self::both_bigint(&left_primitive, &right_primitive)?;
+                    let result = match op {
+                        BinaryOp::Sub => left.sub(&right),
+                        BinaryOp::Mul => left.mul(&right),
+                        BinaryOp::Div => left.div(&right),
+                        BinaryOp::Mod => left.rem(&right),
+                        _ => left.pow(&right),
+                    };
+                    return Ok(Value::BigInt(Box::new(result.map_err(Self::bigint_error)?)));
+                }
+                let left = self.to_number_rt(&left_primitive)?;
+                let right = self.to_number_rt(&right_primitive)?;
+                Ok(Value::Number(match op {
+                    BinaryOp::Sub => left - right,
+                    BinaryOp::Mul => left * right,
+                    BinaryOp::Div => left / right,
+                    BinaryOp::Mod => left % right,
+                    _ => left.powf(right),
+                }))
+            }
             BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge => {
                 let left_primitive = self.to_primitive(left)?;
                 let right_primitive = self.to_primitive(right)?;
-                let result = if let (Value::String(a), Value::String(b)) =
+                let result = if matches!(left_primitive, Value::BigInt(_))
+                    || matches!(right_primitive, Value::BigInt(_))
+                {
+                    match Self::bigint_compare(&left_primitive, &right_primitive) {
+                        Some(ordering) => match op {
+                            BinaryOp::Lt => ordering.is_lt(),
+                            BinaryOp::Le => ordering.is_le(),
+                            BinaryOp::Gt => ordering.is_gt(),
+                            _ => ordering.is_ge(),
+                        },
+                        None => false,
+                    }
+                } else if let (Value::String(a), Value::String(b)) =
                     (&left_primitive, &right_primitive)
                 {
                     match op {
@@ -1717,44 +1835,85 @@ impl crate::Runtime {
             BinaryOp::Ne => Ok(Value::Bool(!self.loose_equals_rt(left, right)?)),
             BinaryOp::StrictEq => Ok(Value::Bool(left.strict_equals(right))),
             BinaryOp::StrictNe => Ok(Value::Bool(!left.strict_equals(right))),
-            BinaryOp::BitAnd => {
-                let a = to_int32(self.to_number_rt(left)?);
-                let b = to_int32(self.to_number_rt(right)?);
-                Ok(Value::Number(f64::from(a & b)))
+            BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor => {
+                let left_primitive = self.to_primitive(left)?;
+                let right_primitive = self.to_primitive(right)?;
+                if matches!(left_primitive, Value::BigInt(_))
+                    || matches!(right_primitive, Value::BigInt(_))
+                {
+                    let (left, right) = Self::both_bigint(&left_primitive, &right_primitive)?;
+                    return Ok(Value::BigInt(Box::new(match op {
+                        BinaryOp::BitAnd => left.bitand(&right),
+                        BinaryOp::BitOr => left.bitor(&right),
+                        _ => left.bitxor(&right),
+                    })));
+                }
+                let a = to_int32(self.to_number_rt(&left_primitive)?);
+                let b = to_int32(self.to_number_rt(&right_primitive)?);
+                Ok(Value::Number(f64::from(match op {
+                    BinaryOp::BitAnd => a & b,
+                    BinaryOp::BitOr => a | b,
+                    _ => a ^ b,
+                })))
             }
-            BinaryOp::BitOr => {
-                let a = to_int32(self.to_number_rt(left)?);
-                let b = to_int32(self.to_number_rt(right)?);
-                Ok(Value::Number(f64::from(a | b)))
-            }
-            BinaryOp::BitXor => {
-                let a = to_int32(self.to_number_rt(left)?);
-                let b = to_int32(self.to_number_rt(right)?);
-                Ok(Value::Number(f64::from(a ^ b)))
-            }
-            BinaryOp::Shl => {
-                let a = to_int32(self.to_number_rt(left)?);
-                let shift = to_uint32(self.to_number_rt(right)?) & 31;
-                Ok(Value::Number(f64::from(a.wrapping_shl(shift))))
-            }
-            BinaryOp::Shr => {
-                let a = to_int32(self.to_number_rt(left)?);
-                let shift = to_uint32(self.to_number_rt(right)?) & 31;
-                Ok(Value::Number(f64::from(a.wrapping_shr(shift))))
+            BinaryOp::Shl | BinaryOp::Shr => {
+                let left_primitive = self.to_primitive(left)?;
+                let right_primitive = self.to_primitive(right)?;
+                if matches!(left_primitive, Value::BigInt(_))
+                    || matches!(right_primitive, Value::BigInt(_))
+                {
+                    let (left, right) = Self::both_bigint(&left_primitive, &right_primitive)?;
+                    let shift = right.to_u64().ok_or_else(|| {
+                        JsError::range_error("BigInt shift count must be a non-negative integer")
+                    })?;
+                    let result = if op == BinaryOp::Shl {
+                        left.shl(shift)
+                    } else {
+                        left.shr(shift)
+                    };
+                    return Ok(Value::BigInt(Box::new(result.map_err(Self::bigint_error)?)));
+                }
+                let a = to_int32(self.to_number_rt(&left_primitive)?);
+                let shift = to_uint32(self.to_number_rt(&right_primitive)?) & 31;
+                Ok(Value::Number(f64::from(if op == BinaryOp::Shl {
+                    a.wrapping_shl(shift)
+                } else {
+                    a.wrapping_shr(shift)
+                })))
             }
             BinaryOp::UShr => {
-                let a = to_uint32(self.to_number_rt(left)?);
-                let shift = to_uint32(self.to_number_rt(right)?) & 31;
+                let left_primitive = self.to_primitive(left)?;
+                let right_primitive = self.to_primitive(right)?;
+                if matches!(left_primitive, Value::BigInt(_))
+                    || matches!(right_primitive, Value::BigInt(_))
+                {
+                    return Err(JsError::type_error(
+                        "Cannot mix BigInt and other types, use explicit conversions",
+                    ));
+                }
+                let a = to_uint32(self.to_number_rt(&left_primitive)?);
+                let shift = to_uint32(self.to_number_rt(&right_primitive)?) & 31;
                 Ok(Value::Number(f64::from(a.wrapping_shr(shift))))
             }
             BinaryOp::In => {
-                if !matches!(right, Value::Object(_)) {
-                    return Err(JsError::type_error(
-                        "right-hand side of 'in' is not an object",
-                    ));
-                }
                 let key = self.to_string_rt(left)?;
-                Ok(Value::Bool(self.object_has(right, &key)))
+                // `to_object_value` accepts every non-nullish value, boxing
+                // primitives so `'x' in 5` keeps working, and returns `None`
+                // only for `undefined`/`null`. Those raise a descriptive
+                // TypeError instead of an internal engine abort.
+                let Some(target) = self.to_object_value(right) else {
+                    return Err(JsError::type_error(format!(
+                        "right-hand side of 'in' must be an object, got {}",
+                        right.to_string_value()
+                    )));
+                };
+                // Keep the wrapper alive across the property lookup, which may
+                // invoke getters on the prototype chain.
+                let mark = self.temp_roots.len();
+                self.temp_roots.push(target.clone());
+                let found = self.object_has(&target, &key);
+                self.temp_roots.truncate(mark);
+                Ok(Value::Bool(found))
             }
             BinaryOp::InstanceOf => self.instance_of(left, right),
         }

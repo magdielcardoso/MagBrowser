@@ -62,6 +62,10 @@ pub struct Parser {
     pos: usize,
     no_in: bool,
     depth: usize,
+    /// Number of template interpolations currently being parsed. A template
+    /// part directly following an expression is a tagged template in normal
+    /// code, but the continuation of the enclosing template inside `${...}`.
+    template_interpolation_depth: usize,
 }
 
 impl Parser {
@@ -79,6 +83,7 @@ impl Parser {
             pos: 0,
             no_in: false,
             depth: 0,
+            template_interpolation_depth: 0,
         }
     }
 
@@ -1004,6 +1009,29 @@ impl Parser {
             return Ok(expr);
         }
         let target = self.parse_conditional()?;
+        // Bitwise compound assignments (`&=`, `|=`, `^=`) are desugared into a
+        // plain assignment whose value is the corresponding binary expression.
+        // This keeps the `AssignOp` enum (and every downstream match on it)
+        // backward compatible.
+        let bitwise_op = match self.kind() {
+            TokenKind::Punct(Punct::AmpEq) => Some(BinaryOp::BitAnd),
+            TokenKind::Punct(Punct::PipeEq) => Some(BinaryOp::BitOr),
+            TokenKind::Punct(Punct::CaretEq) => Some(BinaryOp::BitXor),
+            _ => None,
+        };
+        if let Some(op) = bitwise_op {
+            self.advance();
+            let value = self.parse_assignment()?;
+            return Ok(Expr::Assign {
+                op: AssignOp::Assign,
+                target: Box::new(target.clone()),
+                value: Box::new(Expr::Binary {
+                    op,
+                    left: Box::new(target),
+                    right: Box::new(value),
+                }),
+            });
+        }
         let op = match self.kind() {
             TokenKind::Punct(Punct::Eq) => Some(AssignOp::Assign),
             TokenKind::Punct(Punct::PlusEq) => Some(AssignOp::Add),
@@ -1349,6 +1377,19 @@ impl Parser {
 
     fn parse_new_inner(&mut self) -> Result<Expr, ParseError> {
         self.expect_keyword(Keyword::New)?;
+        // `new.target` is a meta property, not a `new` expression whose callee
+        // happens to start with `.` (the original cause of "expected an
+        // expression, found `.`" on the YouTube main module script).
+        if self.is_punct(Punct::Dot)
+            && matches!(self.peek_kind(1), TokenKind::Identifier(property) if property == "target")
+        {
+            self.advance(); // `.`
+            self.advance(); // `target`
+            return Ok(Expr::MetaProperty {
+                meta: "new".to_owned(),
+                property: "target".to_owned(),
+            });
+        }
         let callee = if self.is_keyword(Keyword::New) {
             self.parse_new()?
         } else {
@@ -1454,6 +1495,39 @@ impl Parser {
                 }
             } else if self.eat_punct(Punct::LParen) {
                 let arguments = self.parse_arguments()?;
+                if let Some(current) = &mut chain {
+                    current.ops.push(OptionalChainOp::Call {
+                        arguments,
+                        optional: false,
+                    });
+                } else {
+                    expr = Expr::Call {
+                        callee: Box::new(expr),
+                        arguments,
+                    };
+                }
+            } else if self.template_interpolation_depth == 0
+                && matches!(self.kind(), TokenKind::TemplatePart { .. })
+            {
+                // Tagged template: `tag`part${expr}part``. Desugar it into a
+                // call whose first argument is an array of cooked strings,
+                // followed by the interpolated expressions. This keeps the
+                // AST backward compatible with consumers that match on `Expr`.
+                let TokenKind::TemplatePart { cooked, tail } = self.kind().clone() else {
+                    unreachable!("template part checked above");
+                };
+                self.advance();
+                let Expr::Template { parts, exprs } = self.parse_template(cooked, tail)? else {
+                    unreachable!("parse_template always returns a template");
+                };
+                let strings = Expr::Array(
+                    parts
+                        .into_iter()
+                        .map(|part| Some(Expr::String(part)))
+                        .collect(),
+                );
+                let mut arguments = vec![strings];
+                arguments.extend(exprs);
                 if let Some(current) = &mut chain {
                     current.ops.push(OptionalChainOp::Call {
                         arguments,
@@ -1743,7 +1817,10 @@ impl Parser {
             return Ok(Expr::Template { parts, exprs });
         }
         loop {
-            exprs.push(self.parse_expression()?);
+            self.template_interpolation_depth += 1;
+            let expr = self.parse_expression();
+            self.template_interpolation_depth -= 1;
+            exprs.push(expr?);
             let (cooked, tail) = match self.kind().clone() {
                 TokenKind::TemplatePart { cooked, tail } => {
                     self.advance();
@@ -1791,11 +1868,30 @@ impl Parser {
                 return Ok(Expr::Object(properties));
             }
             let position = self.current().position;
+            // Object spread: `{ ...source, key: value }`. Spread properties
+            // have no key of their own; an empty string key is used as a
+            // sentinel and the expression is wrapped in `Expr::Spread`.
+            if self.eat_punct(Punct::Ellipsis) {
+                let target = self.parse_assignment()?;
+                properties.push(Property {
+                    key: PropertyKey::String(String::new()),
+                    value: Expr::Spread(Box::new(target)),
+                    shorthand: false,
+                    pos: position,
+                });
+                if self.eat_punct(Punct::Comma) {
+                    continue;
+                }
+                self.expect_punct(Punct::RBrace)?;
+                return Ok(Expr::Object(properties));
+            }
             let mut is_generator = self.eat_punct(Punct::Star);
             let mut is_async = false;
+            // Inside an object literal `async <name>(...)` can only be an async
+            // method, so a line terminator before `async` (common in wrapped,
+            // minified scripts) does not turn it into a shorthand property.
             if !is_generator
                 && matches!(self.kind(), TokenKind::Identifier(name) if name.as_str() == "async")
-                && !self.current().newline_before
             {
                 let next = self.peek_kind(1);
                 let after_name = self.peek_kind(2);
@@ -1815,9 +1911,60 @@ impl Parser {
                     is_generator = self.eat_punct(Punct::Star);
                 }
             }
-            let key = self.parse_property_key()?;
+            // `get name() {}` and `set name(v) {}` are accessor methods. `get`
+            // and `set` are contextual keywords: they are only modifiers when
+            // a property key and a parameter list follow them.
+            let mut accessor = None;
+            if !is_generator
+                && !is_async
+                && matches!(self.kind(), TokenKind::Identifier(name) if name == "get" || name == "set")
+            {
+                let next = self.peek_kind(1);
+                if matches!(
+                    next,
+                    TokenKind::Identifier(_)
+                        | TokenKind::Keyword(_)
+                        | TokenKind::String(_)
+                        | TokenKind::Number(_)
+                        | TokenKind::Punct(Punct::LBracket)
+                ) {
+                    accessor = Some(if self.is_identifier_word("get") {
+                        MethodKind::Getter
+                    } else {
+                        MethodKind::Setter
+                    });
+                    self.advance();
+                }
+            }
 
-            let (value, shorthand) = if self.eat_punct(Punct::Colon) {
+            let key = self.parse_property_key()?;
+            let key_name = key.as_key_string();
+
+            let (value, shorthand) = if accessor.is_some() {
+                if !self.is_punct(Punct::LParen) {
+                    return self.unexpected("`(` after accessor name");
+                }
+                let patterns = self.parse_parameter_list()?;
+                self.expect_punct(Punct::LBrace)?;
+                let body = self.parse_block_body()?;
+                let prefix = match accessor {
+                    Some(MethodKind::Getter) => "get ",
+                    _ => "set ",
+                };
+                (
+                    Expr::Function(Function {
+                        name: Some(format!("{prefix}{key_name}")),
+                        params: simple_parameter_names(&patterns),
+                        patterns,
+                        body,
+                        is_arrow: false,
+                        is_generator: false,
+                        is_async: false,
+                        pos: position,
+                    }),
+                    false,
+                )
+            } else if self.eat_punct(Punct::Colon) {
                 (self.parse_assignment()?, false)
             } else if self.is_punct(Punct::LParen) {
                 let patterns = self.parse_parameter_list()?;
@@ -1967,10 +2114,9 @@ impl Parser {
         let is_static = self.eat_keyword(Keyword::Static);
         let mut is_generator = self.eat_punct(Punct::Star);
         let mut is_async = false;
-        if !is_generator
-            && matches!(self.kind(), TokenKind::Identifier(name) if name == "async")
-            && !self.current().newline_before
-        {
+        // As with object literals, `async <name>(...)` in a class body can only
+        // be an async method, even when a line terminator precedes `async`.
+        if !is_generator && matches!(self.kind(), TokenKind::Identifier(name) if name == "async") {
             // `async` is a modifier only when a method name follows it. A
             // method literally named `async` is followed directly by `(`.
             let next = self.peek_kind(1);
@@ -2095,4 +2241,238 @@ fn assignment_pattern_from_element(expr: &Expr) -> Option<Pattern> {
 enum BinaryKind {
     Binary(BinaryOp),
     Logical(LogicalOp),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn expr(source: &str) -> Expr {
+        match parse(source)
+            .unwrap_or_else(|error| panic!("parse failed for {source:?}: {error}"))
+            .body
+            .into_iter()
+            .next()
+        {
+            Some(Stmt::Expression(expr)) => expr,
+            other => panic!("expected an expression statement, got {other:?}"),
+        }
+    }
+
+    /// The exact object-literal getter shape from `webcomponents-sd.js`:
+    /// `C({get childNodes(){return this.__shady_childNodes}, ...})`.
+    #[test]
+    fn object_literal_getters_and_setters() {
+        let Expr::Object(properties) = expr(
+            r#"({
+                get childNodes() { return this.__shady_childNodes },
+                set childNodes(value) { this.__shady_childNodes = value },
+                get firstChild() { return this.__shady_firstChild }
+            })"#,
+        ) else {
+            panic!("expected an object literal");
+        };
+        assert_eq!(properties.len(), 3);
+        assert_eq!(properties[0].accessor_kind(), Some(MethodKind::Getter));
+        assert_eq!(properties[1].accessor_kind(), Some(MethodKind::Setter));
+        assert_eq!(properties[2].accessor_kind(), Some(MethodKind::Getter));
+        let Expr::Function(function) = &properties[0].value else {
+            panic!("expected a function");
+        };
+        assert_eq!(function.name.as_deref(), Some("get childNodes"));
+        assert!(function.params.is_empty());
+    }
+
+    /// Minified scripts put `get` at the start of a line, so a preceding line
+    /// terminator must not stop it from being recognised as a modifier.
+    #[test]
+    fn accessor_modifier_after_line_break() {
+        let Expr::Object(properties) = expr("({\nget childNodes(){ return 1 }\n})") else {
+            panic!("expected an object literal");
+        };
+        assert_eq!(properties[0].accessor_kind(), Some(MethodKind::Getter));
+    }
+
+    #[test]
+    fn accessor_modifiers_with_computed_and_keyword_keys() {
+        let Expr::Object(properties) = expr("({ get [key]() { return 1 }, set default(v) {} })")
+        else {
+            panic!("expected an object literal");
+        };
+        assert_eq!(properties[0].accessor_kind(), Some(MethodKind::Getter));
+        assert_eq!(properties[1].accessor_kind(), Some(MethodKind::Setter));
+    }
+
+    /// `get`/`set` used as ordinary property names must keep working.
+    #[test]
+    fn get_and_set_remain_ordinary_names() {
+        let Expr::Object(properties) = expr("({ get: 1, get() {}, set, set: 2 })") else {
+            panic!("expected an object literal");
+        };
+        assert!(properties.iter().all(|p| p.accessor_kind().is_none()));
+    }
+
+    /// The exact Unicode-escaped identifier from the main module script:
+    /// `O.id.\u0275prov.token`.
+    #[test]
+    fn unicode_escape_in_identifier() {
+        let program = parse(r"O.id.\u0275prov.token").expect("escaped identifier should parse");
+        assert_eq!(program.body.len(), 1);
+        let tokens: Vec<_> = tokenize(r"O.id.\u0275prov.token").unwrap();
+        let names: Vec<_> = tokens
+            .iter()
+            .filter_map(|token| match &token.kind {
+                TokenKind::Identifier(name) => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(names.contains(&"\u{0275}prov"), "names: {names:?}");
+    }
+
+    /// Angular-compiled code also escapes identifier starts:
+    /// `var \u0275prov = 1`.
+    #[test]
+    fn unicode_escape_at_identifier_start() {
+        let program = parse(r"var \u0275prov = 1;").expect("escaped binding should parse");
+        let Some(Stmt::VarDecl(decl)) = program.body.first() else {
+            panic!("expected a variable declaration");
+        };
+        assert_eq!(
+            decl.declarations[0].pattern,
+            Pattern::Identifier("\u{0275}prov".to_owned())
+        );
+    }
+
+    /// `G[u9]|=34` from the main module script. Bitwise compound assignments
+    /// are desugared so that the `AssignOp` enum stays backward compatible.
+    #[test]
+    fn bitwise_compound_assignment() {
+        for (source, op) in [
+            (r"G[u9]|=34", BinaryOp::BitOr),
+            (r"G[u9]&=34", BinaryOp::BitAnd),
+            (r"G[u9]^=34", BinaryOp::BitXor),
+        ] {
+            let Expr::Assign {
+                op: AssignOp::Assign,
+                value,
+                ..
+            } = expr(source)
+            else {
+                panic!("expected a plain assignment for {source:?}");
+            };
+            let Expr::Binary { op: binary_op, .. } = *value else {
+                panic!("expected a binary expression for {source:?}");
+            };
+            assert_eq!(binary_op, op);
+        }
+    }
+
+    /// `{...Y, error:m}` from the main module script.
+    #[test]
+    fn object_spread_properties() {
+        let Expr::Object(properties) = expr(r"({ ...Y, error: m })") else {
+            panic!("expected an object literal");
+        };
+        assert_eq!(properties.len(), 2);
+        assert!(properties[0].is_spread());
+        assert!(!properties[1].is_spread());
+        parse(r"A({...Y,error:m});return xN").expect("spread in a nested object should parse");
+    }
+
+    /// The tagged template `` `data-` `` from `Oi([nc`data-`], ...)`.
+    #[test]
+    fn tagged_template_literals() {
+        let Expr::Call { callee, arguments } = expr("nc`data-`") else {
+            panic!("expected a call");
+        };
+        assert!(matches!(&*callee, Expr::Identifier(name) if name == "nc"));
+        let Expr::Array(strings) = &arguments[0] else {
+            panic!("expected a strings array");
+        };
+        assert_eq!(strings.len(), 1);
+        assert_eq!(strings[0], Some(Expr::String("data-".to_owned())));
+
+        // The exact surrounding snippet, plus a tagged template with an
+        // interpolation.
+        expr(r#"Oi([nc`data-`],G,"data-loaded","true".toString())"#);
+        let Expr::Call { arguments, .. } = expr("tag`a${x}b`") else {
+            panic!("expected a call");
+        };
+        assert_eq!(arguments.len(), 2);
+    }
+
+    /// A template continuation after an interpolation must not be mistaken for
+    /// a tagged template (regression for the tagged-template change).
+    #[test]
+    fn template_continuation_is_not_a_tagged_template() {
+        let Expr::Template { parts, exprs } = expr("`hello ${name}!`") else {
+            panic!("expected a template literal");
+        };
+        assert_eq!(parts, ["hello ", "!"]);
+        assert_eq!(exprs.len(), 1);
+    }
+
+    /// The exact statement from YouTube's main module script (line 5642,
+    /// column 45): `Object.setPrototypeOf(this,new.target.prototype)`.
+    /// `new.target` is a meta property, not a `new` expression.
+    #[test]
+    fn new_target_meta_property() {
+        let Expr::MetaProperty { meta, property } = expr("new.target") else {
+            panic!("expected a meta property for `new.target`");
+        };
+        assert_eq!(meta, "new");
+        assert_eq!(property, "target");
+
+        // The exact failing snippet, including the chained `.prototype`.
+        let Expr::Call { arguments, .. } = expr("Object.setPrototypeOf(this,new.target.prototype)")
+        else {
+            panic!("expected a call expression");
+        };
+        let Expr::Member {
+            object, computed, ..
+        } = &arguments[1]
+        else {
+            panic!("expected a member expression for the second argument");
+        };
+        assert!(!computed);
+        assert!(matches!(
+            &**object,
+            Expr::MetaProperty { meta, property } if meta == "new" && property == "target"
+        ));
+
+        // `new.target` remains usable as a callee and must not swallow a real
+        // `new` expression that follows it.
+        parse("new.target(); new Foo()").expect("new.target with a call and a real new");
+    }
+
+    /// The exact async object-literal method from YouTube's main module script
+    /// (line 29279): `async isSheetOpen(){...}`. Minified scripts are wrapped at
+    /// fixed widths, so `async` starts a new physical line. In an object literal
+    /// or class body `async <name>(...)` is unambiguously an async method.
+    #[test]
+    fn async_method_after_line_break() {
+        let source = "var o={closeSheet:function(){},\nasync isSheetOpen(){return this.x},\ngetSheetContainerElement:function(){return this.hostElement}};";
+        let program = parse(source).expect("async method after a line break");
+        let Some(Stmt::VarDecl(decl)) = program.body.first() else {
+            panic!("expected a variable declaration");
+        };
+        let Expr::Object(properties) = decl.declarations[0].init.as_ref().expect("init") else {
+            panic!("expected an object literal");
+        };
+        assert_eq!(properties.len(), 3);
+        let Expr::Function(function) = &properties[1].value else {
+            panic!("expected a function for the async method");
+        };
+        assert!(function.is_async);
+        assert_eq!(function.name.as_deref(), Some("isSheetOpen"));
+
+        // The same holds for class methods.
+        let program = parse("class C {\nm(){}\nasync isOpen(){return 1}\n}")
+            .expect("async class method after a line break");
+        let Some(Stmt::ClassDecl(class)) = program.body.first() else {
+            panic!("expected a class declaration");
+        };
+        let ClassMember::Method { function, .. } = &class.body[1];
+        assert!(function.is_async);
+    }
 }

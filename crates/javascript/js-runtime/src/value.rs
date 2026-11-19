@@ -2,6 +2,8 @@
 
 use std::fmt;
 
+use crate::bigint::BigInt;
+
 /// Identifier of a heap allocated object.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ObjectId(pub usize);
@@ -17,6 +19,9 @@ pub enum Value {
     Bool(bool),
     /// A double precision floating point number.
     Number(f64),
+    /// An arbitrary precision integer. Boxed to keep `Value` small; the
+    /// interpreter's recursive frames depend on it.
+    BigInt(Box<BigInt>),
     /// A string.
     String(String),
     /// A heap allocated object.
@@ -30,6 +35,7 @@ impl Value {
             Self::Undefined | Self::Null => false,
             Self::Bool(value) => *value,
             Self::Number(value) => *value != 0.0 && !value.is_nan(),
+            Self::BigInt(value) => !value.is_zero(),
             Self::String(value) => !value.is_empty(),
             Self::Object(_) => true,
         }
@@ -48,6 +54,7 @@ impl Value {
                 }
             }
             Self::Number(value) => *value,
+            Self::BigInt(value) => value.to_f64(),
             Self::String(value) => string_to_number(value),
             Self::Object(_) => f64::NAN,
         }
@@ -60,6 +67,7 @@ impl Value {
             Self::Null => "null".to_owned(),
             Self::Bool(value) => value.to_string(),
             Self::Number(value) => number_to_string(*value),
+            Self::BigInt(value) => value.to_string(),
             Self::String(value) => value.clone(),
             Self::Object(_) => "[object Object]".to_owned(),
         }
@@ -73,6 +81,7 @@ impl Value {
             Self::Null => "object",
             Self::Bool(_) => "boolean",
             Self::Number(_) => "number",
+            Self::BigInt(_) => "bigint",
             Self::String(_) => "string",
             Self::Object(_) => "object",
         }
@@ -84,6 +93,7 @@ impl Value {
             (Self::Undefined, Self::Undefined) | (Self::Null, Self::Null) => true,
             (Self::Bool(a), Self::Bool(b)) => a == b,
             (Self::Number(a), Self::Number(b)) => a == b,
+            (Self::BigInt(a), Self::BigInt(b)) => a == b,
             (Self::String(a), Self::String(b)) => a == b,
             (Self::Object(a), Self::Object(b)) => a == b,
             _ => false,
@@ -95,6 +105,7 @@ impl Value {
         match (self, other) {
             (Self::Undefined | Self::Null, Self::Undefined | Self::Null) => true,
             (Self::Number(a), Self::Number(b)) => a == b,
+            (Self::BigInt(a), Self::BigInt(b)) => a == b,
             (Self::String(a), Self::String(b)) => a == b,
             (Self::Bool(_), _) | (_, Self::Bool(_)) => self.to_number() == other.to_number(),
             (Self::Number(a), Self::String(b)) => *a == string_to_number(b),
@@ -132,6 +143,12 @@ impl From<f64> for Value {
 impl From<bool> for Value {
     fn from(value: bool) -> Self {
         Self::Bool(value)
+    }
+}
+
+impl From<BigInt> for Value {
+    fn from(value: BigInt) -> Self {
+        Self::BigInt(Box::new(value))
     }
 }
 
@@ -226,6 +243,19 @@ mod tests {
         assert_eq!(number_to_string(1.5), "1.5");
         assert_eq!(number_to_string(f64::NAN), "NaN");
         assert_eq!(number_to_string(f64::INFINITY), "Infinity");
+    }
+
+    #[test]
+    fn bigint_value_semantics() {
+        let zero = Value::BigInt(Box::new(BigInt::ZERO));
+        let one = Value::BigInt(Box::new(BigInt::one()));
+        assert!(!zero.is_truthy());
+        assert!(one.is_truthy());
+        assert_eq!(one.type_of(), "bigint");
+        assert_eq!(one.to_string_value(), "1");
+        assert!(one.strict_equals(&Value::BigInt(Box::new(BigInt::one()))));
+        assert!(!one.strict_equals(&Value::Number(1.0)));
+        assert!(!one.loose_equals(&Value::Number(1.0)));
     }
 
     #[test]

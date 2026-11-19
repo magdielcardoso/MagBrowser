@@ -13,6 +13,11 @@ use crate::element::{require_node, wrap};
 pub fn install(runtime: &mut Runtime, state: &Rc<RefCell<HostState>>) {
     let document = runtime.new_object();
     runtime.set_global("document", document.clone());
+    runtime.set_property(
+        document.clone(),
+        "readyState",
+        Value::String("loading".into()),
+    );
 
     runtime.define_host_method(document.clone(), "getElementById", {
         let state = state.clone();
@@ -80,6 +85,28 @@ pub fn install(runtime: &mut Runtime, state: &Rc<RefCell<HostState>>) {
                 .ok_or_else(|| JsError::type_error("createElement needs a tag name"))?;
             let document = state.borrow().document.clone();
             let node = document.borrow_mut().create_element(&tag);
+            Ok(wrap(runtime, &state, node))
+        })
+    });
+
+    runtime.define_host_method(document.clone(), "createElementNS", {
+        let state = state.clone();
+        Box::new(move |runtime, _this, args| {
+            let namespace = match args.first() {
+                None | Some(Value::Undefined) | Some(Value::Null) => String::new(),
+                Some(value) => value.to_string_value(),
+            };
+            let qualified_name = args
+                .get(1)
+                .map(Value::to_string_value)
+                .ok_or_else(|| JsError::type_error("createElementNS needs a qualified name"))?;
+            // The arena models namespaces on elements, but the JS binding keeps
+            // this simple: create the element the same way as `createElement`
+            // and remember the requested namespace as an attribute so scripts
+            // can read it back with `getAttribute('xmlns')`.
+            let document = state.borrow().document.clone();
+            let node = document.borrow_mut().create_element(&qualified_name);
+            document.borrow_mut().set_attr(node, "xmlns", &namespace);
             Ok(wrap(runtime, &state, node))
         })
     });
@@ -251,6 +278,14 @@ fn install_accessors(runtime: &mut Runtime, state: &Rc<RefCell<HostState>>, obje
             })
         },
     );
+}
+
+/// Updates `document.readyState` as the page lifecycle advances.
+pub fn set_ready_state(runtime: &mut Runtime, state: &Rc<RefCell<HostState>>, value: &str) {
+    let global = runtime.global();
+    let document = runtime.get_property(&global, "document");
+    runtime.set_property(document, "readyState", Value::String(value.into()));
+    let _ = state;
 }
 
 /// Returns the body element id, when present.

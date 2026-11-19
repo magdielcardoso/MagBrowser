@@ -1,5 +1,9 @@
 //! Builtin objects and functions installed into the global environment.
 
+pub(crate) mod bigint_builtins;
+mod collections;
+mod date;
+
 use std::rc::Rc;
 
 use browser_js_parser::{Regex, RegexMatch};
@@ -7,7 +11,7 @@ use browser_js_parser::{Regex, RegexMatch};
 use crate::Runtime;
 use crate::errors::JsError;
 use crate::object::{ObjectKind, SYMBOL_ASYNC_ITERATOR_KEY, SYMBOL_ITERATOR_KEY};
-use crate::value::{Value, number_to_string};
+use crate::value::{ObjectId, Value, number_to_string};
 
 impl Runtime {
     /// Install the standard library.
@@ -18,10 +22,15 @@ impl Runtime {
         self.prototypes.function = self.bootstrap_object(Some(object_prototype));
         self.prototypes.string = self.bootstrap_object(Some(object_prototype));
         self.prototypes.number = self.bootstrap_object(Some(object_prototype));
+        self.prototypes.bigint = self.bootstrap_object(Some(object_prototype));
         self.prototypes.boolean = self.bootstrap_object(Some(object_prototype));
         self.prototypes.error = self.bootstrap_object(Some(object_prototype));
         self.prototypes.promise = self.bootstrap_object(Some(object_prototype));
         self.prototypes.regexp = self.bootstrap_object(Some(object_prototype));
+        self.prototypes.map = self.bootstrap_object(Some(object_prototype));
+        self.prototypes.set = self.bootstrap_object(Some(object_prototype));
+        self.prototypes.weakmap = self.bootstrap_object(Some(object_prototype));
+        self.prototypes.weakset = self.bootstrap_object(Some(object_prototype));
         self.generator_prototype = self.bootstrap_object(Some(object_prototype));
 
         let global = self.bootstrap_object(Some(object_prototype));
@@ -36,6 +45,7 @@ impl Runtime {
         self.install_function_prototype();
         self.install_string_prototype();
         self.install_number_prototype();
+        self.install_bigint();
         self.install_boolean_prototype();
         self.install_error();
         self.install_regexp();
@@ -43,11 +53,13 @@ impl Runtime {
         self.install_math();
         self.install_json();
         self.install_console();
+        self.install_date();
         self.install_promise();
         self.install_symbol_and_iterators();
         self.install_generator_prototype();
         self.install_reflect();
         self.install_weak_refs();
+        self.install_collections();
         self.install_intl();
 
         self.declare_binding(
@@ -86,6 +98,10 @@ impl Runtime {
         }
         if let Value::Object(id) = &number {
             self.define_data_property(*id, "prototype", Value::Object(self.prototypes.number));
+            let is_finite = self.new_builtin_value("isFinite", 1, number_is_finite);
+            let is_integer = self.new_builtin_value("isInteger", 1, number_is_integer);
+            self.define_data_property(*id, "isFinite", is_finite);
+            self.define_data_property(*id, "isInteger", is_integer);
         }
         if let Value::Object(id) = &boolean {
             self.define_data_property(*id, "prototype", Value::Object(self.prototypes.boolean));
@@ -95,9 +111,49 @@ impl Runtime {
         if let Value::Object(id) = &object {
             self.define_data_property(*id, "prototype", Value::Object(self.prototypes.object));
             let keys = self.new_builtin_value("keys", 1, object_keys);
-            let create = self.new_builtin_value("create", 1, object_create);
+            let create = self.new_builtin_value("create", 2, object_create);
+            let assign = self.new_builtin_value("assign", 2, object_assign);
+            let entries = self.new_builtin_value("entries", 1, object_entries);
+            let values = self.new_builtin_value("values", 1, object_values);
+            let from_entries = self.new_builtin_value("fromEntries", 1, object_from_entries);
+            let get_own_property_descriptor = self.new_builtin_value(
+                "getOwnPropertyDescriptor",
+                2,
+                object_get_own_property_descriptor,
+            );
+            let get_own_property_names =
+                self.new_builtin_value("getOwnPropertyNames", 1, object_get_own_property_names);
+            let get_own_property_symbols =
+                self.new_builtin_value("getOwnPropertySymbols", 1, object_get_own_property_symbols);
+            let get_prototype_of =
+                self.new_builtin_value("getPrototypeOf", 1, object_get_prototype_of);
+            let set_prototype_of =
+                self.new_builtin_value("setPrototypeOf", 2, object_set_prototype_of);
+            let define_property =
+                self.new_builtin_value("defineProperty", 3, object_define_property);
+            let define_properties =
+                self.new_builtin_value("defineProperties", 2, object_define_properties);
+            let freeze = self.new_builtin_value("freeze", 1, object_freeze);
+            let is_frozen = self.new_builtin_value("isFrozen", 1, object_is_frozen);
+            let seal = self.new_builtin_value("seal", 1, object_seal);
+            let is_sealed = self.new_builtin_value("isSealed", 1, object_is_sealed);
             self.define_data_property(*id, "keys", keys);
             self.define_data_property(*id, "create", create);
+            self.define_data_property(*id, "assign", assign);
+            self.define_data_property(*id, "entries", entries);
+            self.define_data_property(*id, "values", values);
+            self.define_data_property(*id, "fromEntries", from_entries);
+            self.define_data_property(*id, "getOwnPropertyDescriptor", get_own_property_descriptor);
+            self.define_data_property(*id, "getOwnPropertyNames", get_own_property_names);
+            self.define_data_property(*id, "getOwnPropertySymbols", get_own_property_symbols);
+            self.define_data_property(*id, "getPrototypeOf", get_prototype_of);
+            self.define_data_property(*id, "setPrototypeOf", set_prototype_of);
+            self.define_data_property(*id, "defineProperty", define_property);
+            self.define_data_property(*id, "defineProperties", define_properties);
+            self.define_data_property(*id, "freeze", freeze);
+            self.define_data_property(*id, "isFrozen", is_frozen);
+            self.define_data_property(*id, "seal", seal);
+            self.define_data_property(*id, "isSealed", is_sealed);
         }
         self.declare_global("Object", object);
 
@@ -105,7 +161,9 @@ impl Runtime {
         if let Value::Object(id) = &array {
             self.define_data_property(*id, "prototype", Value::Object(self.prototypes.array));
             let is_array = self.new_builtin_value("isArray", 1, array_is_array);
+            let from = self.new_builtin_value("from", 1, array_from);
             self.define_data_property(*id, "isArray", is_array);
+            self.define_data_property(*id, "from", from);
         }
         self.declare_global("Array", array);
     }
@@ -200,6 +258,10 @@ impl Runtime {
         self.define_builtin_method(prototype, "unshift", 1, array_unshift);
         self.define_builtin_method(prototype, "join", 1, array_join);
         self.define_builtin_method(prototype, "indexOf", 1, array_index_of);
+        self.define_builtin_method(prototype, "includes", 1, array_includes);
+        self.define_builtin_method(prototype, "at", 1, array_at);
+        self.define_builtin_method(prototype, "flat", 0, array_flat);
+        self.define_builtin_method(prototype, "flatMap", 1, array_flat_map);
         self.define_builtin_method(prototype, "slice", 2, array_slice);
         self.define_builtin_method(prototype, "map", 1, array_map);
         self.define_builtin_method(prototype, "forEach", 1, array_for_each);
@@ -230,6 +292,7 @@ impl Runtime {
         self.define_builtin_method(prototype, "split", 2, string_split);
         self.define_builtin_method(prototype, "trim", 0, string_trim);
         self.define_builtin_method(prototype, "replace", 2, string_replace);
+        self.define_builtin_method(prototype, "replaceAll", 2, string_replace_all);
         self.define_builtin_method(prototype, "match", 1, string_match);
         self.define_builtin_method(prototype, "matchAll", 1, string_match_all);
         self.define_builtin_method(prototype, "includes", 1, string_includes);
@@ -396,6 +459,26 @@ fn global_number(runtime: &mut Runtime, _this: Value, args: Vec<Value>) -> Resul
         Some(value) => Ok(Value::Number(runtime.to_number_rt(value)?)),
         None => Ok(Value::Number(0.0)),
     }
+}
+
+fn number_is_finite(
+    _runtime: &mut Runtime,
+    _this: Value,
+    args: Vec<Value>,
+) -> Result<Value, JsError> {
+    Ok(Value::Bool(
+        matches!(args.first(), Some(Value::Number(value)) if value.is_finite()),
+    ))
+}
+
+fn number_is_integer(
+    _runtime: &mut Runtime,
+    _this: Value,
+    args: Vec<Value>,
+) -> Result<Value, JsError> {
+    Ok(Value::Bool(
+        matches!(args.first(), Some(Value::Number(value)) if value.is_finite() && value.fract() == 0.0),
+    ))
 }
 
 fn global_boolean(
@@ -586,11 +669,16 @@ fn object_to_string(
     let name = match &this {
         Value::Undefined => "Undefined",
         Value::Null => "Null",
+        Value::BigInt(_) => "BigInt",
         Value::Object(id) => match runtime.object(*id).map(|object| &object.kind) {
             Some(ObjectKind::Array(_)) => "Array",
             Some(ObjectKind::Function(_)) => "Function",
             Some(ObjectKind::Promise(_)) => "Promise",
             Some(ObjectKind::RegExp(_)) => "RegExp",
+            Some(ObjectKind::Map(_)) => "Map",
+            Some(ObjectKind::Set(_)) => "Set",
+            Some(ObjectKind::WeakMap(_)) => "WeakMap",
+            Some(ObjectKind::WeakSet(_)) => "WeakSet",
             _ => "Object",
         },
         _ => "Object",
@@ -622,9 +710,377 @@ fn object_create(runtime: &mut Runtime, _this: Value, args: Vec<Value>) -> Resul
             ));
         }
     };
-    Ok(Value::Object(
-        runtime.alloc_object(ObjectKind::Ordinary, prototype),
-    ))
+    let id = runtime.alloc_object(ObjectKind::Ordinary, prototype);
+    let object = Value::Object(id);
+    if let Some(descriptors) = args.get(1) {
+        requires_object(descriptors, "Object.create")?;
+        let keys = enumerable_keys(runtime, descriptors);
+        let mark = runtime.temp_roots.len();
+        runtime.temp_roots.push(object.clone());
+        for key in keys {
+            let descriptor = runtime.get_property_checked(descriptors, &key)?;
+            define_property_from(runtime, id, &key, &descriptor);
+        }
+        runtime.temp_roots.truncate(mark);
+    }
+    Ok(object)
+}
+
+/// Own enumerable keys, including string indices for primitive strings.
+fn enumerable_keys(runtime: &mut Runtime, value: &Value) -> Vec<String> {
+    match value {
+        Value::String(text) => (0..text.chars().count())
+            .map(|index| index.to_string())
+            .collect(),
+        _ => runtime.object_keys(value),
+    }
+}
+
+fn requires_object(value: &Value, method: &str) -> Result<(), JsError> {
+    if matches!(value, Value::Undefined | Value::Null) {
+        return Err(JsError::type_error(format!(
+            "{method} called on {}",
+            value.to_string_value()
+        )));
+    }
+    Ok(())
+}
+
+/// Box a target for an `Object` static, mirroring the spec's `ToObject`.
+/// Primitives get a wrapper with the matching prototype, so methods such as
+/// `Object.getOwnPropertyDescriptor('ab', '0')` keep working. Only `undefined`
+/// and `null` fail, with a clear `TypeError` rather than an engine abort.
+fn object_target(runtime: &mut Runtime, value: &Value, method: &str) -> Result<Value, JsError> {
+    runtime.to_object_value(value).ok_or_else(|| {
+        JsError::type_error(format!("{method} called on {}", value.to_string_value()))
+    })
+}
+
+/// Apply a property descriptor object to `id`. Both data and accessor
+/// descriptors are supported; attributes we do not model are ignored.
+fn define_property_from(runtime: &mut Runtime, id: ObjectId, key: &str, descriptor: &Value) {
+    let getter = runtime.get_property(descriptor, "get");
+    let setter = runtime.get_property(descriptor, "set");
+    let has_accessor =
+        runtime.object_has(descriptor, "get") || runtime.object_has(descriptor, "set");
+    if has_accessor {
+        runtime.define_accessor_property(
+            id,
+            key,
+            runtime.is_callable(&getter).then_some(getter),
+            runtime.is_callable(&setter).then_some(setter),
+        );
+    } else {
+        let value = runtime.get_property(descriptor, "value");
+        runtime.define_data_property(id, key, value);
+    }
+}
+
+/// `Object.getOwnPropertyDescriptor(target, key)`.
+///
+/// Returns a fresh descriptor object (`value`/`writable`/`enumerable`/
+/// `configurable`, or `get`/`set` for accessors) or `undefined` when the own
+/// property does not exist.
+fn object_get_own_property_descriptor(
+    runtime: &mut Runtime,
+    _this: Value,
+    args: Vec<Value>,
+) -> Result<Value, JsError> {
+    let target = object_target(
+        runtime,
+        &args.first().cloned().unwrap_or(Value::Undefined),
+        "Object.getOwnPropertyDescriptor",
+    )?;
+    let key = crate::reflect::key_from(runtime, args.get(1).unwrap_or(&Value::Undefined))?;
+    let Value::Object(id) = target else {
+        return Ok(Value::Undefined);
+    };
+    if let Some((object_target, handler)) = runtime.as_proxy(&target)
+        && let Some(trap) = runtime.proxy_trap(&handler, "getOwnPropertyDescriptor")
+    {
+        return runtime.call_function(&trap, handler, vec![object_target, Value::String(key)]);
+    }
+    let descriptor = runtime.own_property_descriptor(id, &key);
+    Ok(descriptor
+        .map(|data| crate::reflect::descriptor_value(runtime, &data))
+        .unwrap_or(Value::Undefined))
+}
+
+/// `Object.getOwnPropertyNames(target)`.
+fn object_get_own_property_names(
+    runtime: &mut Runtime,
+    _this: Value,
+    args: Vec<Value>,
+) -> Result<Value, JsError> {
+    let target = object_target(
+        runtime,
+        &args.first().cloned().unwrap_or(Value::Undefined),
+        "Object.getOwnPropertyNames",
+    )?;
+    let mut keys = runtime.object_keys(&target);
+    // `object_keys` exposes enumerable properties; derived array/function
+    // properties are non-enumerable but still own properties.
+    if let Value::Object(id) = &target {
+        for derived in ["length", "name"] {
+            if !keys.iter().any(|key| key == derived) && runtime.has_own_property(*id, derived) {
+                keys.push(derived.to_owned());
+            }
+        }
+    }
+    Ok(runtime.new_array(keys.into_iter().map(Value::String).collect()))
+}
+
+/// `Object.getOwnPropertySymbols(target)`. Symbols are represented internally
+/// as unique objects, so no own properties use symbol keys in this engine; an
+/// empty array is a faithful result.
+fn object_get_own_property_symbols(
+    runtime: &mut Runtime,
+    _this: Value,
+    _args: Vec<Value>,
+) -> Result<Value, JsError> {
+    Ok(runtime.new_array(Vec::new()))
+}
+
+/// `Object.getPrototypeOf(target)`.
+fn object_get_prototype_of(
+    runtime: &mut Runtime,
+    _this: Value,
+    args: Vec<Value>,
+) -> Result<Value, JsError> {
+    let target = object_target(
+        runtime,
+        &args.first().cloned().unwrap_or(Value::Undefined),
+        "Object.getPrototypeOf",
+    )?;
+    Ok(runtime
+        .prototype_of(&target)
+        .map(Value::Object)
+        .unwrap_or(Value::Null))
+}
+
+/// `Object.setPrototypeOf(target, prototype)`.
+fn object_set_prototype_of(
+    runtime: &mut Runtime,
+    _this: Value,
+    args: Vec<Value>,
+) -> Result<Value, JsError> {
+    let target = args.first().cloned().unwrap_or(Value::Undefined);
+    let Value::Object(id) = target else {
+        return Err(JsError::type_error(
+            "Object.setPrototypeOf called on a non-object",
+        ));
+    };
+    let prototype = args.get(1).cloned().unwrap_or(Value::Null);
+    let prototype_id = match prototype {
+        Value::Object(prototype) => Some(prototype),
+        Value::Null => None,
+        _ => {
+            return Err(JsError::type_error(
+                "Object prototype may only be an object or null",
+            ));
+        }
+    };
+    if let Some(object) = runtime.object_mut(id) {
+        object.prototype = prototype_id;
+    }
+    Ok(Value::Object(id))
+}
+
+/// `Object.defineProperty(target, key, descriptor)`.
+fn object_define_property(
+    runtime: &mut Runtime,
+    _this: Value,
+    args: Vec<Value>,
+) -> Result<Value, JsError> {
+    let target = args.first().cloned().unwrap_or(Value::Undefined);
+    let Value::Object(id) = target else {
+        return Err(JsError::type_error(
+            "Object.defineProperty called on a non-object",
+        ));
+    };
+    let key = crate::reflect::key_from(runtime, args.get(1).unwrap_or(&Value::Undefined))?;
+    let descriptor = args.get(2).cloned().unwrap_or(Value::Undefined);
+    define_property_from(runtime, id, &key, &descriptor);
+    Ok(Value::Object(id))
+}
+
+/// `Object.defineProperties(target, descriptors)`.
+fn object_define_properties(
+    runtime: &mut Runtime,
+    _this: Value,
+    args: Vec<Value>,
+) -> Result<Value, JsError> {
+    let target = args.first().cloned().unwrap_or(Value::Undefined);
+    let Value::Object(id) = target else {
+        return Err(JsError::type_error(
+            "Object.defineProperties called on a non-object",
+        ));
+    };
+    let descriptors = args.get(1).cloned().unwrap_or(Value::Undefined);
+    requires_object(&descriptors, "Object.defineProperties")?;
+    let keys = enumerable_keys(runtime, &descriptors);
+    let mark = runtime.temp_roots.len();
+    runtime.temp_roots.push(Value::Object(id));
+    for key in keys {
+        let descriptor = runtime.get_property_checked(&descriptors, &key)?;
+        define_property_from(runtime, id, &key, &descriptor);
+    }
+    runtime.temp_roots.truncate(mark);
+    Ok(Value::Object(id))
+}
+
+/// `Object.freeze(target)`. Attributes are not tracked per property, so this
+/// marks the object non-extensible and records that it was frozen.
+fn object_freeze(runtime: &mut Runtime, _this: Value, args: Vec<Value>) -> Result<Value, JsError> {
+    let target = args.first().cloned().unwrap_or(Value::Undefined);
+    if let Value::Object(id) = &target
+        && let Some(object) = runtime.object_mut(*id)
+    {
+        object.extensible = false;
+        object.frozen = true;
+    }
+    Ok(target)
+}
+
+/// `Object.isFrozen(target)`. Primitives are considered frozen.
+fn object_is_frozen(
+    runtime: &mut Runtime,
+    _this: Value,
+    args: Vec<Value>,
+) -> Result<Value, JsError> {
+    let target = args.first().cloned().unwrap_or(Value::Undefined);
+    let frozen = match &target {
+        Value::Object(id) => runtime.object(*id).is_some_and(|object| object.frozen),
+        _ => true,
+    };
+    Ok(Value::Bool(frozen))
+}
+
+/// `Object.seal(target)`.
+fn object_seal(runtime: &mut Runtime, _this: Value, args: Vec<Value>) -> Result<Value, JsError> {
+    let target = args.first().cloned().unwrap_or(Value::Undefined);
+    if let Value::Object(id) = &target
+        && let Some(object) = runtime.object_mut(*id)
+    {
+        object.extensible = false;
+    }
+    Ok(target)
+}
+
+/// `Object.isSealed(target)`. Primitives are considered sealed.
+fn object_is_sealed(
+    runtime: &mut Runtime,
+    _this: Value,
+    args: Vec<Value>,
+) -> Result<Value, JsError> {
+    let target = args.first().cloned().unwrap_or(Value::Undefined);
+    let sealed = match &target {
+        Value::Object(id) => runtime.object(*id).is_some_and(|object| !object.extensible),
+        _ => true,
+    };
+    Ok(Value::Bool(sealed))
+}
+
+fn object_assign(runtime: &mut Runtime, _this: Value, args: Vec<Value>) -> Result<Value, JsError> {
+    let target = args.first().cloned().unwrap_or(Value::Undefined);
+    requires_object(&target, "Object.assign")?;
+    let target = match target {
+        Value::Object(_) => target,
+        // The spec boxes primitive targets; a plain wrapper is close enough for
+        // the scripts that rely on `Object.assign({}, ...)` and friends.
+        _ => runtime.new_object(),
+    };
+    runtime.temp_roots.push(target.clone());
+    let mark = runtime.temp_roots.len();
+    for source in args.into_iter().skip(1) {
+        if matches!(source, Value::Undefined | Value::Null) {
+            continue;
+        }
+        for key in enumerable_keys(runtime, &source) {
+            let value = runtime.get_property_checked(&source, &key)?;
+            runtime.set_property_checked(&target, &key, value)?;
+        }
+    }
+    runtime.temp_roots.truncate(mark);
+    Ok(target)
+}
+
+fn object_entries(runtime: &mut Runtime, _this: Value, args: Vec<Value>) -> Result<Value, JsError> {
+    let source = args.first().cloned().unwrap_or(Value::Undefined);
+    requires_object(&source, "Object.entries")?;
+    let keys = enumerable_keys(runtime, &source);
+    let mut entries = Vec::with_capacity(keys.len());
+    for key in keys {
+        let value = runtime.get_property_checked(&source, &key)?;
+        entries.push(runtime.new_array(vec![Value::String(key), value]));
+    }
+    Ok(runtime.new_array(entries))
+}
+
+fn object_values(runtime: &mut Runtime, _this: Value, args: Vec<Value>) -> Result<Value, JsError> {
+    let source = args.first().cloned().unwrap_or(Value::Undefined);
+    requires_object(&source, "Object.values")?;
+    let keys = enumerable_keys(runtime, &source);
+    let mut values = Vec::with_capacity(keys.len());
+    for key in keys {
+        values.push(runtime.get_property_checked(&source, &key)?);
+    }
+    Ok(runtime.new_array(values))
+}
+
+fn object_from_entries(
+    runtime: &mut Runtime,
+    _this: Value,
+    args: Vec<Value>,
+) -> Result<Value, JsError> {
+    let source = args.first().cloned().unwrap_or(Value::Undefined);
+    let entries = runtime.to_array_like(&source).unwrap_or_default();
+    let object = runtime.new_object();
+    runtime.temp_roots.push(object.clone());
+    let mark = runtime.temp_roots.len();
+    for entry in entries {
+        let pair = runtime.to_array_like(&entry).unwrap_or_default();
+        let key = runtime.to_string_rt(pair.first().unwrap_or(&Value::Undefined))?;
+        let value = pair.get(1).cloned().unwrap_or(Value::Undefined);
+        runtime.set_property_checked(&object, &key, value)?;
+    }
+    runtime.temp_roots.truncate(mark);
+    Ok(object)
+}
+
+fn array_from(runtime: &mut Runtime, _this: Value, args: Vec<Value>) -> Result<Value, JsError> {
+    let source = args.first().cloned().unwrap_or(Value::Undefined);
+    let items = runtime.to_array_like(&source).ok_or_else(|| {
+        JsError::type_error("Array.from requires an array-like or iterable value")
+    })?;
+    let map = args.get(1).cloned().unwrap_or(Value::Undefined);
+    let map = runtime.is_callable(&map).then_some(map);
+    let this_arg = args.get(2).cloned().unwrap_or(Value::Undefined);
+    let mark = runtime.temp_roots.len();
+    let mut out = Vec::with_capacity(items.len());
+    for (index, item) in items.into_iter().enumerate() {
+        let mapped = match &map {
+            Some(function) => runtime.call_function(
+                function,
+                this_arg.clone(),
+                vec![item, Value::Number(index as f64)],
+            ),
+            None => Ok(item),
+        };
+        match mapped {
+            Ok(value) => {
+                runtime.temp_roots.push(value.clone());
+                out.push(value);
+            }
+            Err(error) => {
+                runtime.temp_roots.truncate(mark);
+                return Err(error);
+            }
+        }
+    }
+    let array = runtime.new_array(out);
+    runtime.temp_roots.truncate(mark);
+    Ok(array)
 }
 
 fn array_is_array(runtime: &mut Runtime, _this: Value, args: Vec<Value>) -> Result<Value, JsError> {
@@ -633,23 +1089,26 @@ fn array_is_array(runtime: &mut Runtime, _this: Value, args: Vec<Value>) -> Resu
 }
 
 fn require_array(runtime: &mut Runtime, this: &Value) -> Result<Vec<Value>, JsError> {
-    runtime
-        .object_array_items(this)
-        .ok_or_else(|| JsError::type_error("array method called on a non-array"))
+    runtime.to_array_like(this).ok_or_else(|| {
+        JsError::type_error(match this {
+            Value::Undefined | Value::Null => "array method called on null or undefined".to_owned(),
+            _ => "array method called on a value that is not array-like".to_owned(),
+        })
+    })
 }
 
 fn array_push(runtime: &mut Runtime, this: Value, args: Vec<Value>) -> Result<Value, JsError> {
     let mut items = require_array(runtime, &this)?;
     items.extend(args);
     let length = items.len();
-    runtime.set_array_items(&this, items);
+    runtime.set_array_like_items(&this, items);
     Ok(Value::Number(length as f64))
 }
 
 fn array_pop(runtime: &mut Runtime, this: Value, _args: Vec<Value>) -> Result<Value, JsError> {
     let mut items = require_array(runtime, &this)?;
     let value = items.pop().unwrap_or(Value::Undefined);
-    runtime.set_array_items(&this, items);
+    runtime.set_array_like_items(&this, items);
     Ok(value)
 }
 
@@ -660,7 +1119,7 @@ fn array_shift(runtime: &mut Runtime, this: Value, _args: Vec<Value>) -> Result<
     } else {
         items.remove(0)
     };
-    runtime.set_array_items(&this, items);
+    runtime.set_array_like_items(&this, items);
     Ok(value)
 }
 
@@ -669,7 +1128,7 @@ fn array_unshift(runtime: &mut Runtime, this: Value, args: Vec<Value>) -> Result
     let existing = require_array(runtime, &this)?;
     items.extend(existing);
     let length = items.len();
-    runtime.set_array_items(&this, items);
+    runtime.set_array_like_items(&this, items);
     Ok(Value::Number(length as f64))
 }
 
@@ -708,6 +1167,119 @@ fn array_index_of(runtime: &mut Runtime, this: Value, args: Vec<Value>) -> Resul
         }
     }
     Ok(Value::Number(-1.0))
+}
+
+fn same_value_zero(left: &Value, right: &Value) -> bool {
+    left.strict_equals(right)
+        || matches!(
+            (left, right),
+            (Value::Number(a), Value::Number(b)) if a.is_nan() && b.is_nan()
+        )
+}
+
+fn relative_index(length: usize, value: Option<&Value>) -> usize {
+    match value.map(Value::to_number) {
+        Some(number) if number.is_finite() => {
+            if number < 0.0 {
+                (length as f64 + number).max(0.0) as usize
+            } else {
+                (number as usize).min(length)
+            }
+        }
+        _ => 0,
+    }
+}
+
+fn array_includes(runtime: &mut Runtime, this: Value, args: Vec<Value>) -> Result<Value, JsError> {
+    let items = require_array(runtime, &this)?;
+    let needle = args.first().cloned().unwrap_or(Value::Undefined);
+    let start = relative_index(items.len(), args.get(1));
+    Ok(Value::Bool(
+        items
+            .iter()
+            .skip(start)
+            .any(|item| same_value_zero(item, &needle)),
+    ))
+}
+
+fn array_at(runtime: &mut Runtime, this: Value, args: Vec<Value>) -> Result<Value, JsError> {
+    let items = require_array(runtime, &this)?;
+    let number = args.first().map(Value::to_number).unwrap_or(f64::NAN);
+    let index = if number.is_nan() { 0.0 } else { number.trunc() };
+    let index = if index < 0.0 {
+        items.len() as f64 + index
+    } else {
+        index
+    };
+    if index < 0.0 || index >= items.len() as f64 {
+        return Ok(Value::Undefined);
+    }
+    Ok(items[index as usize].clone())
+}
+
+fn flatten_into(runtime: &mut Runtime, items: Vec<Value>, depth: usize, out: &mut Vec<Value>) {
+    for item in items {
+        if depth > 0
+            && let Some(nested) = runtime.object_array_items(&item)
+        {
+            flatten_into(runtime, nested, depth - 1, out);
+            continue;
+        }
+        out.push(item);
+    }
+}
+
+fn array_flat(runtime: &mut Runtime, this: Value, args: Vec<Value>) -> Result<Value, JsError> {
+    let items = require_array(runtime, &this)?;
+    let depth = match args.first() {
+        None | Some(Value::Undefined) => 1,
+        Some(value) => {
+            let number = value.to_number();
+            if number.is_nan() || number <= 0.0 {
+                0
+            } else if number.is_infinite() {
+                usize::MAX
+            } else {
+                number.floor() as usize
+            }
+        }
+    };
+    let mut out = Vec::new();
+    // Cap the effective depth so a hostile `Infinity` cannot recurse forever.
+    flatten_into(runtime, items, depth.min(64), &mut out);
+    Ok(runtime.new_array(out))
+}
+
+fn array_flat_map(runtime: &mut Runtime, this: Value, args: Vec<Value>) -> Result<Value, JsError> {
+    let items = require_array(runtime, &this)?;
+    let callback = args.first().cloned().unwrap_or(Value::Undefined);
+    if !runtime.is_callable(&callback) {
+        return Err(JsError::type_error("flatMap callback is not a function"));
+    }
+    let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
+    let mark = runtime.temp_roots.len();
+    let mut mapped = Vec::with_capacity(items.len());
+    for (index, item) in items.iter().enumerate() {
+        match runtime.call_function(
+            &callback,
+            this_arg.clone(),
+            vec![item.clone(), Value::Number(index as f64), this.clone()],
+        ) {
+            Ok(value) => {
+                runtime.temp_roots.push(value.clone());
+                mapped.push(value);
+            }
+            Err(error) => {
+                runtime.temp_roots.truncate(mark);
+                return Err(error);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    flatten_into(runtime, mapped, 1, &mut out);
+    let array = runtime.new_array(out);
+    runtime.temp_roots.truncate(mark);
+    Ok(array)
 }
 
 fn slice_bounds(length: usize, start: Option<&Value>, end: Option<&Value>) -> (usize, usize) {
@@ -882,7 +1454,7 @@ fn array_reverse(runtime: &mut Runtime, this: Value, _args: Vec<Value>) -> Resul
     let mut items = require_array(runtime, &this)?;
     items.reverse();
     let length = items.len();
-    runtime.set_array_items(&this, items);
+    runtime.set_array_like_items(&this, items);
     Ok(Value::Number(length as f64))
 }
 
@@ -1243,6 +1815,45 @@ fn expand_replacement(out: &mut String, replacement: &str, found: &RegexMatch) {
             }
         }
     }
+}
+
+fn string_replace_all(
+    runtime: &mut Runtime,
+    this: Value,
+    args: Vec<Value>,
+) -> Result<Value, JsError> {
+    let text = this_string(runtime, &this)?;
+    let pattern = args.first().cloned().unwrap_or(Value::Undefined);
+    let replacement = match args.get(1) {
+        Some(value) if runtime.is_callable(value) => {
+            return Err(JsError::type_error(
+                "function replacements are not supported",
+            ));
+        }
+        Some(value) => runtime.to_string_rt(value)?,
+        None => "undefined".to_owned(),
+    };
+    if let Some(regex) = runtime.regex_of(&pattern) {
+        if !regex.flags().global {
+            return Err(JsError::type_error(
+                "replaceAll requires a global regular expression",
+            ));
+        }
+        let replaced = replace_with_regex(&regex, &text, &replacement);
+        runtime.set_property(pattern, "lastIndex", Value::Number(0.0));
+        return Ok(Value::String(replaced));
+    }
+    let needle = runtime.to_string_rt(&pattern)?;
+    if needle.is_empty() {
+        let mut result = String::new();
+        for ch in text.chars() {
+            result.push_str(&replacement);
+            result.push(ch);
+        }
+        result.push_str(&replacement);
+        return Ok(Value::String(result));
+    }
+    Ok(Value::String(text.replace(&needle, &replacement)))
 }
 
 fn string_match(runtime: &mut Runtime, this: Value, args: Vec<Value>) -> Result<Value, JsError> {
@@ -1716,7 +2327,7 @@ fn math_random(runtime: &mut Runtime, _this: Value, _args: Vec<Value>) -> Result
 
 fn json_stringify(runtime: &mut Runtime, _this: Value, args: Vec<Value>) -> Result<Value, JsError> {
     let value = args.first().cloned().unwrap_or(Value::Undefined);
-    match stringify(runtime, &value, 0)? {
+    match stringify(runtime, &value, 0, "")? {
         Some(text) => Ok(Value::String(text)),
         None => Ok(Value::Undefined),
     }
@@ -1726,6 +2337,7 @@ fn stringify(
     runtime: &mut Runtime,
     value: &Value,
     depth: usize,
+    key: &str,
 ) -> Result<Option<String>, JsError> {
     if depth > 64 {
         return Err(JsError::range_error("JSON.stringify nesting is too deep"));
@@ -1742,17 +2354,33 @@ fn stringify(
             }
         }
         Value::String(text) => Some(json_escape(text)),
+        Value::BigInt(_) => {
+            return Err(JsError::type_error("Do not know how to serialize a BigInt"));
+        }
         Value::Object(id) => {
             if runtime.is_callable(value) {
                 return Ok(None);
+            }
+            // `toJSON` is consulted before serialising any object. `Date` uses
+            // it to emit an ISO string instead of its internal fields.
+            let to_json = runtime.get_property_checked(value, "toJSON")?;
+            if runtime.is_callable(&to_json) {
+                let replacement = runtime.call_function(
+                    &to_json,
+                    value.clone(),
+                    vec![Value::String(key.to_owned())],
+                )?;
+                if !replacement.strict_equals(value) {
+                    return stringify(runtime, &replacement, depth + 1, key);
+                }
             }
             match runtime.object(*id).map(|object| &object.kind) {
                 Some(ObjectKind::Array(_)) => {
                     let items = runtime.object_array_items(value).unwrap_or_default();
                     let mut parts = Vec::with_capacity(items.len());
-                    for item in &items {
+                    for (index, item) in items.iter().enumerate() {
                         parts.push(
-                            stringify(runtime, item, depth + 1)?
+                            stringify(runtime, item, depth + 1, &index.to_string())?
                                 .unwrap_or_else(|| "null".to_owned()),
                         );
                     }
@@ -1763,7 +2391,7 @@ fn stringify(
                     let mut parts = Vec::new();
                     for key in keys {
                         let item = runtime.get_property(value, &key);
-                        if let Some(text) = stringify(runtime, &item, depth + 1)? {
+                        if let Some(text) = stringify(runtime, &item, depth + 1, &key)? {
                             parts.push(format!("{}:{}", json_escape(&key), text));
                         }
                     }

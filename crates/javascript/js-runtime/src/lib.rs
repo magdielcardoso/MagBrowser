@@ -5,6 +5,7 @@
 
 #![forbid(unsafe_code)]
 
+mod bigint;
 mod builtins;
 mod errors;
 mod execution;
@@ -23,6 +24,7 @@ mod weak;
 
 use std::collections::{HashMap, VecDeque};
 
+pub use bigint::BigInt;
 pub use errors::JsError;
 pub use module::ModuleLoader;
 pub use object::HostFunction;
@@ -119,10 +121,15 @@ impl Runtime {
                 function: ObjectId(0),
                 string: ObjectId(0),
                 number: ObjectId(0),
+                bigint: ObjectId(0),
                 boolean: ObjectId(0),
                 error: ObjectId(0),
                 promise: ObjectId(0),
                 regexp: ObjectId(0),
+                map: ObjectId(0),
+                set: ObjectId(0),
+                weakmap: ObjectId(0),
+                weakset: ObjectId(0),
             },
             symbol_iterator: ObjectId(0),
             symbol_async_iterator: ObjectId(0),
@@ -161,6 +168,9 @@ impl Runtime {
         let program = browser_js_parser::parse(source)
             .map_err(|error| JsError::syntax_error(error.to_string()))?;
         self.steps = 0;
+        // A previous script may have failed mid-evaluation; don't let its
+        // completion value leak into this one.
+        self.completion_value = Value::Undefined;
         self.exec_program(&program)
     }
 
@@ -170,6 +180,23 @@ impl Runtime {
         let result = self.eval(source);
         self.call_stack.pop();
         result
+    }
+
+    /// Evaluate a script, reporting a failure through the console sink instead
+    /// of returning it to the caller.
+    ///
+    /// Hosts that run a batch of independent scripts can use this so a single
+    /// bad script (for example one calling a missing builtin) is logged and the
+    /// remaining scripts still execute.
+    pub fn eval_named_report(&mut self, source: &str, name: &str) -> Result<Value, JsError> {
+        match self.eval_named(source, name) {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                let line = format!("[JS] {name}: {error}");
+                (self.console)(&line);
+                Ok(Value::Undefined)
+            }
+        }
     }
 
     /// The global object.
@@ -188,8 +215,26 @@ impl Runtime {
     }
 
     /// Install a host function as a global.
+    ///
+    /// A host constructor is a regular function object, so it carries a
+    /// `prototype` with a `constructor` back-reference just like a function
+    /// written in JavaScript. Feature detection such as
+    /// `'x' in HostCtor.prototype` then resolves to an object (returning
+    /// `false` when absent) instead of throwing a `TypeError` because the
+    /// right-hand side was `undefined`.
     pub fn define_global_function(&mut self, name: &str, f: HostFunction) {
         let function = self.new_native_value(name, 0, f);
+        let Value::Object(id) = &function else {
+            self.declare_global(name, function);
+            return;
+        };
+        let id = *id;
+        let mark = self.temp_roots.len();
+        self.temp_roots.push(function.clone());
+        let prototype = self.new_object();
+        self.set_property(prototype.clone(), "constructor", function.clone());
+        self.define_data_property(id, "prototype", prototype);
+        self.temp_roots.truncate(mark);
         self.declare_global(name, function);
     }
 
@@ -1301,5 +1346,511 @@ mod tests {
             eval_ok(&mut runtime, "log.join(',')"),
             Value::String("caught:nope,ok".into())
         );
+    }
+
+    #[test]
+    fn array_methods_accept_array_like_objects() {
+        let mut runtime = Runtime::new();
+        eval_ok(
+            &mut runtime,
+            "var list = { length: 3, 0: 'a', 1: 'b', 2: 'c' };",
+        );
+        assert_eq!(
+            eval_ok(
+                &mut runtime,
+                "Array.prototype.map.call(list, function (x) { return x.toUpperCase(); }).join('')"
+            ),
+            Value::String("ABC".into())
+        );
+        assert_eq!(
+            eval_ok(
+                &mut runtime,
+                "Array.prototype.filter.call(list, function (_, i) { return i > 0; }).join('')"
+            ),
+            Value::String("bc".into())
+        );
+        assert_eq!(
+            number(&mut runtime, "Array.prototype.indexOf.call(list, 'b')"),
+            1.0
+        );
+        assert_eq!(
+            eval_ok(&mut runtime, "Array.prototype.includes.call(list, 'c')"),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            eval_ok(&mut runtime, "Array.prototype.slice.call(list, 1).join('')"),
+            Value::String("bc".into())
+        );
+        eval_ok(
+            &mut runtime,
+            "var seen = ''; Array.prototype.forEach.call(list, function (x) { seen += x; });",
+        );
+        assert_eq!(eval_ok(&mut runtime, "seen"), Value::String("abc".into()));
+
+        // Mutating methods write indexed slots and length back to the object.
+        eval_ok(&mut runtime, "Array.prototype.push.call(list, 'd');");
+        assert_eq!(number(&mut runtime, "list.length"), 4.0);
+        assert_eq!(eval_ok(&mut runtime, "list[3]"), Value::String("d".into()));
+
+        // Strings are array-likes too.
+        assert_eq!(
+            eval_ok(
+                &mut runtime,
+                "Array.prototype.map.call('ab', function (ch) { return ch + ch; }).join('')"
+            ),
+            Value::String("aabb".into())
+        );
+
+        assert_eq!(
+            eval_ok(
+                &mut runtime,
+                "Array.from(list, function (x) { return x + '!'; }).join('')"
+            ),
+            Value::String("a!b!c!d!".into())
+        );
+
+        // Non-array-likes now get a descriptive TypeError.
+        let error = runtime
+            .eval("Array.prototype.map.call({}, function (x) { return x; })")
+            .expect_err("should fail");
+        assert!(error.message.contains("not array-like"), "{error}");
+    }
+
+    #[test]
+    fn in_operator_accepts_global_and_wrapped_objects() {
+        let mut runtime = Runtime::new();
+        assert_eq!(
+            eval_ok(&mut runtime, "'Array' in globalThis"),
+            Value::Bool(true)
+        );
+        let host = runtime.new_object();
+        runtime.set_global("hostObject", host);
+        assert_eq!(
+            eval_ok(&mut runtime, "'hostObject' in globalThis"),
+            Value::Bool(true)
+        );
+        assert_eq!(eval_ok(&mut runtime, "'x' in { x: 1 }"), Value::Bool(true));
+        assert_eq!(
+            eval_ok(&mut runtime, "'length' in 'abc'"),
+            Value::Bool(true)
+        );
+        assert_eq!(eval_ok(&mut runtime, "'0' in 'abc'"), Value::Bool(true));
+        assert_eq!(eval_ok(&mut runtime, "'toString' in 5"), Value::Bool(true));
+        let error = runtime.eval("'x' in undefined").expect_err("should fail");
+        assert!(error.message.contains("must be an object"), "{error}");
+    }
+
+    #[test]
+    fn newly_installed_builtins_are_available() {
+        let mut runtime = Runtime::new();
+        assert_eq!(
+            eval_ok(&mut runtime, "'a-b-a'.replaceAll('-', '+')"),
+            Value::String("a+b+a".into())
+        );
+        assert_eq!(
+            eval_ok(&mut runtime, "String.prototype.replaceAll !== undefined"),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            eval_ok(&mut runtime, "[1, [2, [3]]].flat(2).join(',')"),
+            Value::String("1,2,3".into())
+        );
+        assert_eq!(
+            eval_ok(
+                &mut runtime,
+                "[[1], [2]].flatMap(function (x) { return x.concat(9); }).join(',')"
+            ),
+            Value::String("1,9,2,9".into())
+        );
+        assert_eq!(number(&mut runtime, "[1, 2, 3].at(-1)"), 3.0);
+        assert_eq!(eval_ok(&mut runtime, "[1, 2, 3].at(-4)"), Value::Undefined);
+        assert_eq!(
+            eval_ok(&mut runtime, "[1, NaN].includes(NaN)"),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            eval_ok(
+                &mut runtime,
+                "Object.keys(Object.assign({}, { a: 1 }, { b: 2 })).join(',')"
+            ),
+            Value::String("a,b".into())
+        );
+        assert_eq!(
+            eval_ok(
+                &mut runtime,
+                "Object.entries({ a: 1, b: 2 }).map(function (pair) { return pair[0] + pair[1]; }).join(',')"
+            ),
+            Value::String("a1,b2".into())
+        );
+        assert_eq!(
+            eval_ok(&mut runtime, "Object.values({ a: 1, b: 2 }).join(',')"),
+            Value::String("1,2".into())
+        );
+        assert_eq!(
+            eval_ok(
+                &mut runtime,
+                "Object.keys(Object.fromEntries([['x', 1], ['y', 2]])).join(',')"
+            ),
+            Value::String("x,y".into())
+        );
+        assert_eq!(
+            eval_ok(
+                &mut runtime,
+                "Number.isFinite(1) && !Number.isFinite('1') && Number.isInteger(2) && !Number.isInteger(2.5)"
+            ),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            eval_ok(&mut runtime, "globalThis === globalThis"),
+            Value::Bool(true)
+        );
+    }
+
+    #[test]
+    fn missing_method_errors_name_the_method() {
+        let mut runtime = Runtime::new();
+        let error = runtime
+            .eval("var obj = {}; obj.notThere()")
+            .expect_err("should fail");
+        assert_eq!(error.message, "TypeError: notThere is not a function");
+    }
+
+    #[test]
+    fn object_statics_are_installed() {
+        let mut runtime = Runtime::new();
+        for name in [
+            "getOwnPropertyDescriptor",
+            "getOwnPropertyNames",
+            "getOwnPropertySymbols",
+            "getPrototypeOf",
+            "setPrototypeOf",
+            "defineProperty",
+            "defineProperties",
+            "freeze",
+            "isFrozen",
+            "seal",
+            "isSealed",
+            "create",
+            "keys",
+            "assign",
+            "entries",
+            "values",
+            "fromEntries",
+        ] {
+            assert_eq!(
+                eval_ok(&mut runtime, &format!("typeof Object.{name}")),
+                Value::String("function".into()),
+                "Object.{name} should be callable"
+            );
+        }
+    }
+
+    #[test]
+    fn get_own_property_descriptor_is_callable_and_reports_descriptors() {
+        let mut runtime = Runtime::new();
+        // Reproduces the YouTube error verbatim: this used to be `undefined`.
+        eval_ok(
+            &mut runtime,
+            "var d = Object.getOwnPropertyDescriptor({ x: 1 }, 'x');",
+        );
+        assert_eq!(number(&mut runtime, "d.value"), 1.0);
+        assert_eq!(eval_ok(&mut runtime, "d.writable"), Value::Bool(true));
+        assert_eq!(eval_ok(&mut runtime, "d.enumerable"), Value::Bool(true));
+        assert_eq!(eval_ok(&mut runtime, "d.configurable"), Value::Bool(true));
+        assert_eq!(
+            eval_ok(
+                &mut runtime,
+                "Object.getOwnPropertyDescriptor({ x: 1 }, 'y')"
+            ),
+            Value::Undefined
+        );
+        // Primitives are boxed to objects before the lookup.
+        assert_eq!(
+            eval_ok(
+                &mut runtime,
+                "Object.getOwnPropertyDescriptor('ab', '0').value"
+            ),
+            Value::String("a".into())
+        );
+        assert_eq!(
+            number(
+                &mut runtime,
+                "Object.getOwnPropertyDescriptor('ab', 'length').value"
+            ),
+            2.0
+        );
+        // Arrays and accessors are handled by the shared descriptor builder.
+        assert_eq!(
+            number(
+                &mut runtime,
+                "Object.getOwnPropertyDescriptor([7], '0').value"
+            ),
+            7.0
+        );
+        eval_ok(
+            &mut runtime,
+            "var accessor = {}; Object.defineProperty(accessor, 'x', { get: function () { return 9; } });",
+        );
+        assert_eq!(number(&mut runtime, "accessor.x"), 9.0);
+        assert_eq!(
+            eval_ok(
+                &mut runtime,
+                "typeof Object.getOwnPropertyDescriptor(accessor, 'x').get"
+            ),
+            Value::String("function".into())
+        );
+        // A missing target raises a normal TypeError, never an engine abort.
+        let error = runtime
+            .eval("Object.getOwnPropertyDescriptor(undefined, 'x')")
+            .expect_err("should fail");
+        assert!(error.message.starts_with("TypeError:"), "{error}");
+    }
+
+    #[test]
+    fn object_property_enumeration_and_prototype_statics() {
+        let mut runtime = Runtime::new();
+        eval_ok(
+            &mut runtime,
+            "var names = Object.getOwnPropertyNames([1, 2]);",
+        );
+        assert_eq!(
+            eval_ok(&mut runtime, "names.indexOf('0') >= 0"),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            eval_ok(&mut runtime, "names.indexOf('1') >= 0"),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            eval_ok(&mut runtime, "names.indexOf('length') >= 0"),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            eval_ok(
+                &mut runtime,
+                "Object.getOwnPropertySymbols({ x: 1 }).length"
+            ),
+            Value::Number(0.0)
+        );
+        assert_eq!(
+            eval_ok(
+                &mut runtime,
+                "Object.getPrototypeOf({}) === Object.prototype"
+            ),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            eval_ok(&mut runtime, "Object.getPrototypeOf(Object.create(null))"),
+            Value::Null
+        );
+        eval_ok(
+            &mut runtime,
+            "var parent = { inherited: 1 }; var child = {}; Object.setPrototypeOf(child, parent);",
+        );
+        assert_eq!(number(&mut runtime, "child.inherited"), 1.0);
+        assert_eq!(
+            eval_ok(&mut runtime, "Object.getPrototypeOf(child) === parent"),
+            Value::Bool(true)
+        );
+        eval_ok(
+            &mut runtime,
+            "var defined = {}; Object.defineProperty(defined, 'x', { value: 3 });",
+        );
+        assert_eq!(number(&mut runtime, "defined.x"), 3.0);
+        eval_ok(
+            &mut runtime,
+            "Object.defineProperties(defined, { y: { value: 4 }, z: { value: 5 } });",
+        );
+        assert_eq!(number(&mut runtime, "defined.y + defined.z"), 9.0);
+        eval_ok(
+            &mut runtime,
+            "var created = Object.create(parent, { own: { value: 8 } });",
+        );
+        assert_eq!(number(&mut runtime, "created.own + created.inherited"), 9.0);
+    }
+
+    #[test]
+    fn object_freeze_and_seal_predicates() {
+        let mut runtime = Runtime::new();
+        eval_ok(&mut runtime, "var frozen = Object.freeze({ a: 1 });");
+        assert_eq!(
+            eval_ok(&mut runtime, "Object.isFrozen(frozen)"),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            eval_ok(&mut runtime, "Object.isSealed(frozen)"),
+            Value::Bool(true)
+        );
+        eval_ok(&mut runtime, "var sealed = Object.seal({ b: 2 });");
+        assert_eq!(
+            eval_ok(&mut runtime, "Object.isSealed(sealed)"),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            eval_ok(&mut runtime, "Object.isFrozen(sealed)"),
+            Value::Bool(false)
+        );
+        assert_eq!(
+            eval_ok(&mut runtime, "Object.isFrozen(5)"),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            eval_ok(&mut runtime, "Object.freeze(5)"),
+            Value::Number(5.0)
+        );
+    }
+
+    #[test]
+    fn in_operator_boxes_non_nullish_rhs_and_errors_cleanly() {
+        let mut runtime = Runtime::new();
+        assert_eq!(eval_ok(&mut runtime, "'x' in { x: 1 }"), Value::Bool(true));
+        assert_eq!(
+            eval_ok(&mut runtime, "'length' in 'abc'"),
+            Value::Bool(true)
+        );
+        assert_eq!(eval_ok(&mut runtime, "'toString' in 5"), Value::Bool(true));
+        assert_eq!(
+            eval_ok(&mut runtime, "'toString' in true"),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            eval_ok(&mut runtime, "'nope' in { x: 1 }"),
+            Value::Bool(false)
+        );
+        let error = runtime.eval("'x' in null").expect_err("should fail");
+        assert!(error.message.starts_with("TypeError:"), "{error}");
+        assert!(error.message.contains("must be an object"), "{error}");
+        assert!(error.message.contains("null"), "{error}");
+        let error = runtime.eval("'x' in undefined").expect_err("should fail");
+        assert!(error.message.starts_with("TypeError:"), "{error}");
+        assert!(error.message.contains("must be an object"), "{error}");
+        // The runtime stays usable after the TypeError (no internal abort).
+        assert_eq!(eval_ok(&mut runtime, "1 + 1"), Value::Number(2.0));
+    }
+
+    #[test]
+    fn in_operator_accepts_host_object_wrappers() {
+        let mut runtime = Runtime::new();
+        let host = runtime.new_object();
+        runtime.define_host_method(
+            host.clone(),
+            "hostMethod",
+            Box::new(|_runtime, _this, _args| Ok(Value::Bool(true))),
+        );
+        runtime.set_property(host.clone(), "hostValue", Value::Number(42.0));
+        runtime.set_global("hostObject", host);
+        assert_eq!(
+            eval_ok(&mut runtime, "'hostMethod' in hostObject"),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            eval_ok(&mut runtime, "'hostValue' in hostObject"),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            eval_ok(&mut runtime, "'missing' in hostObject"),
+            Value::Bool(false)
+        );
+    }
+
+    #[test]
+    fn host_global_functions_have_a_prototype_for_feature_detection() {
+        let mut runtime = Runtime::new();
+        runtime.define_global_function(
+            "HostCtor",
+            Box::new(|_runtime, _this, _args| Ok(Value::Undefined)),
+        );
+        assert_eq!(
+            eval_ok(&mut runtime, "typeof HostCtor.prototype"),
+            Value::String("object".into())
+        );
+        assert_eq!(
+            eval_ok(&mut runtime, "HostCtor.prototype.constructor === HostCtor"),
+            Value::Bool(true)
+        );
+        // This is the exact pattern used by the IntersectionObserver polyfill.
+        assert_eq!(
+            eval_ok(&mut runtime, "'intersectionRatio' in HostCtor.prototype"),
+            Value::Bool(false)
+        );
+    }
+
+    #[test]
+    fn array_methods_accept_objects_with_length_and_index_properties() {
+        let mut runtime = Runtime::new();
+        eval_ok(
+            &mut runtime,
+            "var arrayLike = { length: 3, 0: 'a', 1: 'b', 2: 'c' };",
+        );
+        assert_eq!(
+            eval_ok(
+                &mut runtime,
+                "Array.prototype.slice.call(arrayLike).join('')"
+            ),
+            Value::String("abc".into())
+        );
+        assert_eq!(
+            eval_ok(
+                &mut runtime,
+                "Array.prototype.map.call(arrayLike, function (x) { return x + x; }).join('')"
+            ),
+            Value::String("aabbcc".into())
+        );
+        // Without `length`, numeric own keys are still iterated.
+        eval_ok(&mut runtime, "var sparse = { 2: 'c', 0: 'a', 1: 'b' };");
+        assert_eq!(
+            eval_ok(&mut runtime, "Array.prototype.slice.call(sparse).join('')"),
+            Value::String("abc".into())
+        );
+        // Plain objects still produce a clear TypeError.
+        let error = runtime
+            .eval("Array.prototype.map.call({}, function (x) { return x; })")
+            .expect_err("should fail");
+        assert!(error.message.contains("not array-like"), "{error}");
+    }
+
+    #[test]
+    fn array_prototype_slice_call_arguments_works() {
+        let mut runtime = Runtime::new();
+        eval_ok(
+            &mut runtime,
+            "function collect() { return Array.prototype.slice.call(arguments); }",
+        );
+        assert_eq!(
+            eval_ok(&mut runtime, "collect(1, 2, 3).join('-')"),
+            Value::String("1-2-3".into())
+        );
+        assert_eq!(number(&mut runtime, "collect(1, 2, 3).length"), 3.0);
+        eval_ok(
+            &mut runtime,
+            "function fake() { return Array.prototype.slice.call({ length: 2, 0: 'x', 1: 'y' }); }",
+        );
+        assert_eq!(
+            eval_ok(&mut runtime, "fake().join('')"),
+            Value::String("xy".into())
+        );
+    }
+
+    #[test]
+    fn eval_named_report_logs_errors_and_continues_the_batch() {
+        let mut runtime = Runtime::new();
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&lines);
+        runtime.set_console_sink(Box::new(move |line| {
+            captured.lock().unwrap().push(line.to_owned());
+        }));
+        assert_eq!(
+            runtime
+                .eval_named_report("missingFunction()", "bad.js")
+                .expect("reported"),
+            Value::Undefined
+        );
+        assert_eq!(
+            runtime
+                .eval_named_report("var x = 41; x + 1", "good.js")
+                .expect("second script still runs"),
+            Value::Number(42.0)
+        );
+        assert!(lines.lock().unwrap()[0].contains("bad.js"));
     }
 }

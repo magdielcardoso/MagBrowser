@@ -32,6 +32,7 @@ pub mod element;
 pub mod events;
 pub mod fetch;
 pub mod form;
+pub mod globals;
 pub mod indexed_db;
 pub mod location;
 pub mod observers;
@@ -39,6 +40,7 @@ pub mod service_worker;
 pub mod shadow;
 pub mod storage;
 pub mod timers;
+pub mod traversal;
 pub mod url_search_params;
 pub mod websocket;
 pub mod xhr;
@@ -214,6 +216,13 @@ impl HostState {
         self.observers.set_layout_box_resolver(resolver);
     }
 
+    /// Records a console line (used by the host to surface script errors).
+    pub fn push_console(&mut self, line: impl Into<String>) {
+        if let Ok(mut lines) = self.console.lock() {
+            lines.push(line.into());
+        }
+    }
+
     /// Drains collected console output.
     pub fn take_console(&mut self) -> Vec<String> {
         match self.console.lock() {
@@ -253,6 +262,7 @@ pub fn install(
 
     console::install(runtime, &state);
     document::install(runtime, &state);
+    traversal::install(runtime, &state);
     timers::install(runtime, &state);
     storage::install(runtime, &state);
     location::install(runtime, &state);
@@ -268,6 +278,7 @@ pub fn install(
     service_worker::install(runtime, &state);
     websocket::install(runtime, &state);
     indexed_db::install(runtime, &state);
+    globals::install(runtime, &state);
 
     state
 }

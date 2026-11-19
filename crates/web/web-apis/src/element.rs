@@ -30,13 +30,27 @@ pub fn require_node(runtime: &mut Runtime, value: &Value) -> Result<NodeId, JsEr
 
 /// Wraps a DOM node into a JavaScript object, reusing cached wrappers.
 pub fn wrap(runtime: &mut Runtime, state: &Rc<RefCell<HostState>>, node: NodeId) -> Value {
-    if let Some(existing) = state.borrow().elements.get(&node.0).cloned() {
+    if let Some(existing) = state.borrow().elements.get(&node.0).cloned()
+        && node_id_of(runtime, &existing) == Some(node)
+    {
         return existing;
     }
     let object = runtime.new_object();
+    // The wrapper cache lives in Rust (`HostState::elements`), which the JS
+    // collector cannot see. Without a GC root a wrapper with no live script
+    // reference is swept, leaving the cached `Value::Object(id)` pointing at a
+    // dead heap slot. The next lookup then finds no `getAttribute` (or any
+    // other member) on it and throws `getAttribute is not a function`.
+    // Root the wrapper before installing its members: those allocations can
+    // trigger a collection cycle mid-construction. Rooting also keeps wrapper
+    // identity stable, as in a real browser (`document.body === document.body`).
+    runtime.add_gc_root(object.clone());
     let node_type = node_type(state, node);
     runtime.set_property(object.clone(), "__node", Value::Number(node.0 as f64));
     runtime.set_property(object.clone(), "nodeType", Value::Number(node_type as f64));
+    // Make `wrapper instanceof HTMLElement` (etc.) work with the shared DOM
+    // prototypes installed in `globals`.
+    crate::globals::apply_element_prototype(runtime, state, &object, node);
     define_element_members(runtime, state, object.clone());
     crate::shadow::install_element_shadow(runtime, state, object.clone());
     crate::cssom::install_element_cssom(runtime, state, object.clone(), node);
@@ -69,7 +83,11 @@ fn is_form(state: &Rc<RefCell<HostState>>, node: NodeId) -> bool {
         .is_some_and(|name| name.eq_ignore_ascii_case("form"))
 }
 
-fn define_element_members(runtime: &mut Runtime, state: &Rc<RefCell<HostState>>, object: Value) {
+pub(crate) fn define_element_members(
+    runtime: &mut Runtime,
+    state: &Rc<RefCell<HostState>>,
+    object: Value,
+) {
     runtime.define_host_method(object.clone(), "getAttribute", {
         let state = state.clone();
         Box::new(move |runtime, this, args| {
@@ -179,6 +197,28 @@ fn define_element_members(runtime: &mut Runtime, state: &Rc<RefCell<HostState>>,
                 Mutation::child_list(parent, Vec::new(), vec![child], siblings.0, siblings.1),
             );
             Ok(Value::Null)
+        })
+    });
+
+    runtime.define_host_method(object.clone(), "remove", {
+        let state = state.clone();
+        Box::new(move |runtime, this, _args| {
+            let node = require_node(runtime, &this)?;
+            let document = document_of(&state);
+            let siblings = {
+                let document = document.borrow();
+                (document.previous_sibling(node), document.next_sibling(node))
+            };
+            let parent = document.borrow().parent(node);
+            if let Some(parent) = parent
+                && document.borrow_mut().remove_child(parent, node)
+            {
+                record_mutation(
+                    &state,
+                    Mutation::child_list(parent, Vec::new(), vec![node], siblings.0, siblings.1),
+                );
+            }
+            Ok(Value::Undefined)
         })
     });
 
@@ -742,6 +782,37 @@ fn install_accessors(runtime: &mut Runtime, state: &Rc<RefCell<HostState>>, obje
         },
         { Box::new(|_runtime, _this, _args| Ok(Value::Undefined)) },
     );
+
+    runtime.define_accessor(
+        object.clone(),
+        "parentElement",
+        {
+            let state = state.clone();
+            Box::new(move |runtime, this, _args| {
+                let node = require_node(runtime, &this)?;
+                let document = document_of(&state);
+                let document = document.borrow();
+                match document.parent_element(node) {
+                    Some(parent) => {
+                        drop(document);
+                        Ok(wrap(runtime, &state, parent))
+                    }
+                    None => Ok(Value::Null),
+                }
+            })
+        },
+        { Box::new(|_runtime, _this, _args| Ok(Value::Undefined)) },
+    );
+
+    runtime.define_accessor(
+        object.clone(),
+        "ownerDocument",
+        Box::new(|runtime, _this, _args| {
+            let global = runtime.global();
+            Ok(runtime.get_property(&global, "document"))
+        }),
+        Box::new(|_runtime, _this, _args| Err(JsError::type_error("ownerDocument is read-only"))),
+    );
 }
 
 /// Returns `true` when the node is an element, text or document node.
@@ -890,6 +961,78 @@ mod tests {
         runtime.eval("document.getElementById('q').blur()").unwrap();
         assert_eq!(state.borrow().focused, None);
         assert_eq!(eval(&mut runtime, "document.activeElement"), "null");
+    }
+
+    /// The exact probe used by third-party scripts (e.g. YouTube's spf.js):
+    /// a freshly created element must own a working attribute API, and the
+    /// shared prototypes must expose those members too.
+    #[test]
+    fn created_element_exposes_prototype_methods_and_attribute_roundtrip() {
+        let (mut runtime, _document, _state) = setup("<html><body></body></html>");
+        runtime
+            .eval("const e = document.createElement('div'); e.setAttribute('x', '1');")
+            .unwrap();
+        assert_eq!(
+            runtime.eval("e.getAttribute('x') === '1'").unwrap(),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            runtime.eval("'getAttribute' in Element.prototype").unwrap(),
+            Value::Bool(true)
+        );
+        for expression in [
+            "'setAttribute' in Element.prototype",
+            "'matches' in Element.prototype",
+            "'appendChild' in Element.prototype",
+            "'remove' in Element.prototype",
+            "'classList' in Element.prototype",
+            "'style' in Element.prototype",
+            "'dataset' in Element.prototype",
+            "'children' in Element.prototype",
+            "'parentElement' in Element.prototype",
+            "'ownerDocument' in Element.prototype",
+            "e instanceof HTMLElement",
+            "e instanceof Element",
+            "e instanceof Node",
+            "e instanceof EventTarget",
+        ] {
+            assert_eq!(
+                runtime.eval(expression).unwrap(),
+                Value::Bool(true),
+                "{expression}"
+            );
+        }
+    }
+
+    /// A cached wrapper that is not held by any script survives a GC cycle.
+    /// Regression test for the `getAttribute is not a function` error: the JS
+    /// collector cannot see `HostState::elements`, so wrappers are rooted on
+    /// creation and revalidated when read back from the cache.
+    #[test]
+    fn cached_wrappers_survive_garbage_collection() {
+        let (mut runtime, _document, _state) =
+            setup("<html><body><div id='root'></div></body></html>");
+        runtime
+            .eval(
+                "var root = document.getElementById('root');\n\
+                 var child = document.createElement('div');\n\
+                 child.setAttribute('x', '1');\n\
+                 root.appendChild(child);",
+            )
+            .unwrap();
+        // Drop the only script-level reference to `child`; the DOM tree is
+        // host-side state, so the collector cannot reach the wrapper from it.
+        runtime.eval("child = null;").unwrap();
+        runtime.collect_garbage();
+        assert_eq!(
+            runtime.eval("root.children[0].getAttribute('x')").unwrap(),
+            Value::String("1".to_owned())
+        );
+        // Wrapper identity stays stable across a collection, as in a browser.
+        assert_eq!(
+            runtime.eval("document.body === document.body").unwrap(),
+            Value::Bool(true)
+        );
     }
 
     #[test]

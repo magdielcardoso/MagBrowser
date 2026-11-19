@@ -228,18 +228,40 @@ pub fn execute_scripts_with_loader(
     for script in scripts {
         match script.kind {
             ScriptKind::Classic => {
-                let _ = runtime.eval_named(&script.source, &script.name);
+                if let Err(error) = runtime.eval_named(&script.source, &script.name) {
+                    host.borrow_mut()
+                        .push_console(format!("[JS] {}: {error}", script.name));
+                }
             }
             ScriptKind::Module => {
                 // Inline modules have no fetch URL; use their unique synthetic
                 // name as the registry key so several of them are all evaluated.
                 let url = script.url.as_deref().unwrap_or(&script.name);
-                let _ = runtime.execute_module(url, &script.source, &script.name);
+                if let Err(error) = runtime.execute_module(url, &script.source, &script.name) {
+                    host.borrow_mut()
+                        .push_console(format!("[JS] {}: {error}", script.name));
+                }
             }
         }
         let _ = runtime.run_microtasks();
         executed += 1;
     }
+    browser_web_apis::drain_timers_now(&mut runtime, &host);
+    let _ = runtime.run_microtasks();
+
+    // Real browsers fire these after parsing/scripts; most site bootstraps
+    // (including YouTube's) build their DOM from listeners on these events.
+    browser_web_apis::document::set_ready_state(&mut runtime, &host, "interactive");
+    browser_web_apis::dispatch_event(
+        &mut runtime,
+        &host,
+        browser_dom::NodeId(0),
+        "DOMContentLoaded",
+    );
+    let _ = runtime.run_microtasks();
+    browser_web_apis::document::set_ready_state(&mut runtime, &host, "complete");
+    browser_web_apis::dispatch_event(&mut runtime, &host, browser_dom::NodeId(0), "load");
+    let _ = runtime.run_microtasks();
     browser_web_apis::drain_timers_now(&mut runtime, &host);
     let _ = runtime.run_microtasks();
 

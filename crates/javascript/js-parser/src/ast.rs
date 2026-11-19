@@ -341,6 +341,34 @@ pub struct Property {
     pub pos: Position,
 }
 
+impl Property {
+    /// Whether this property is an object spread (`...expr`). Spread
+    /// properties carry an empty string key and an [`Expr::Spread`] value.
+    pub fn is_spread(&self) -> bool {
+        matches!(self.value, Expr::Spread(_))
+    }
+
+    /// The accessor kind of an object literal getter or setter method.
+    ///
+    /// The parser uses the spec-compliant function name `"get <name>"` or
+    /// `"set <name>"` for accessor methods, so no extra field is needed on
+    /// [`Property`]. Regular properties and methods return `None`.
+    pub fn accessor_kind(&self) -> Option<MethodKind> {
+        let Expr::Function(function) = &self.value else {
+            return None;
+        };
+        let name = function.name.as_deref()?;
+        let key = self.key.as_key_string();
+        if name == format!("get {key}") {
+            Some(MethodKind::Getter)
+        } else if name == format!("set {key}") {
+            Some(MethodKind::Setter)
+        } else {
+            None
+        }
+    }
+}
+
 /// Unary operators.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UnaryOp {

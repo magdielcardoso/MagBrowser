@@ -86,6 +86,17 @@ pub fn install(runtime: &mut Runtime, state: &Rc<RefCell<HostState>>) {
         })
     });
 
+    runtime.define_host_method(location.clone(), "reload", {
+        let state = state.clone();
+        Box::new(move |_runtime, _this, _args| {
+            let current = state.borrow().url.clone();
+            if let Some(current) = current {
+                state.borrow_mut().navigation = Some(current);
+            }
+            Ok(Value::Undefined)
+        })
+    });
+
     runtime.set_global("location", location.clone());
     let global = runtime.global();
     runtime.set_property(global, "location", location);
@@ -181,6 +192,16 @@ mod tests {
         assert_eq!(
             state.borrow().navigation.as_deref(),
             Some("https://example.com/dir/next")
+        );
+    }
+
+    #[test]
+    fn reload_navigates_to_the_current_url() {
+        let (mut runtime, state) = setup(Some("https://example.com/dir/page"));
+        runtime.eval("location.reload()").unwrap();
+        assert_eq!(
+            state.borrow().navigation.as_deref(),
+            Some("https://example.com/dir/page")
         );
     }
 }

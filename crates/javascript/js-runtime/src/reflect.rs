@@ -63,7 +63,7 @@ fn proxy_constructor(
 
 /// Convert a property-key argument to the internal string key. Well-known
 /// symbols carry a private `\0` prefixed key which is preserved here.
-fn key_from(runtime: &mut Runtime, value: &Value) -> Result<String, JsError> {
+pub(crate) fn key_from(runtime: &mut Runtime, value: &Value) -> Result<String, JsError> {
     if let Value::Object(id) = value
         && let Some(Value::String(key)) = runtime.get_own_property(*id, "\u{0}symbol_key")
     {
@@ -128,7 +128,7 @@ fn reflect_own_keys(
     Ok(runtime.new_array(keys))
 }
 
-fn descriptor_value(runtime: &mut Runtime, descriptor: &PropertyData) -> Value {
+pub(crate) fn descriptor_value(runtime: &mut Runtime, descriptor: &PropertyData) -> Value {
     let object = runtime.new_object();
     match descriptor {
         PropertyData::Data(value) => {

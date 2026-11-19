@@ -69,6 +69,32 @@ pub(crate) enum ObjectKind {
     },
     /// A finalization registry whose registrations are inspected by the collector.
     FinalizationRegistry(Rc<RefCell<FinalizationRegistryState>>),
+    /// An ordered `Map` collection. Keys are compared with `SameValueZero`.
+    Map(Rc<RefCell<CollectionData>>),
+    /// An ordered `Set` collection. Keys are compared with `SameValueZero`.
+    Set(Rc<RefCell<CollectionData>>),
+    /// An identity-keyed `WeakMap`. Keys are object ids held weakly.
+    WeakMap(Rc<RefCell<CollectionData>>),
+    /// An identity-keyed `WeakSet`. Keys are object ids held weakly.
+    WeakSet(Rc<RefCell<CollectionData>>),
+}
+
+/// One entry in a `Map`, `Set`, `WeakMap` or `WeakSet`. For sets the `value`
+/// mirrors the `key`.
+#[derive(Clone)]
+pub(crate) struct CollectionEntry {
+    pub(crate) key: Value,
+    pub(crate) value: Value,
+    /// Heap generation of `key` when inserted. Used by the weak collections to
+    /// detect keys whose heap slot has been recycled (no real weak cleanup is
+    /// performed, but stale keys must never alias a newer object).
+    pub(crate) generation: u64,
+}
+
+/// Ordered storage shared by a collection object and its iterators.
+#[derive(Default)]
+pub(crate) struct CollectionData {
+    pub(crate) entries: Vec<CollectionEntry>,
 }
 
 /// A single `FinalizationRegistry.register` entry. Only the target id is held
@@ -93,6 +119,9 @@ pub(crate) struct Object {
     pub(crate) prototype: Option<ObjectId>,
     pub(crate) properties: Vec<(String, PropertyData)>,
     pub(crate) extensible: bool,
+    /// Whether `Object.freeze` has been applied. Writability is not modelled
+    /// per property, so this flag is what `Object.isFrozen` observes.
+    pub(crate) frozen: bool,
 }
 
 /// Well known prototype objects.
@@ -102,10 +131,15 @@ pub(crate) struct Prototypes {
     pub(crate) function: ObjectId,
     pub(crate) string: ObjectId,
     pub(crate) number: ObjectId,
+    pub(crate) bigint: ObjectId,
     pub(crate) boolean: ObjectId,
     pub(crate) error: ObjectId,
     pub(crate) promise: ObjectId,
     pub(crate) regexp: ObjectId,
+    pub(crate) map: ObjectId,
+    pub(crate) set: ObjectId,
+    pub(crate) weakmap: ObjectId,
+    pub(crate) weakset: ObjectId,
 }
 
 impl crate::Runtime {
@@ -120,6 +154,7 @@ impl crate::Runtime {
             prototype,
             properties: Vec::new(),
             extensible: true,
+            frozen: false,
         };
         let id = if let Some(index) = self.heap_free.pop() {
             // Bump the generation so weak references to the previous occupant
@@ -304,9 +339,11 @@ impl crate::Runtime {
                 | ObjectKind::Generator(_)
                 | ObjectKind::Proxy { .. }
                 | ObjectKind::WeakRef { .. }
-                | ObjectKind::FinalizationRegistry(_) => {
-                    object.properties.iter().any(|(name, _)| name == key)
-                }
+                | ObjectKind::FinalizationRegistry(_)
+                | ObjectKind::Map(_)
+                | ObjectKind::Set(_)
+                | ObjectKind::WeakMap(_)
+                | ObjectKind::WeakSet(_) => object.properties.iter().any(|(name, _)| name == key),
             },
             None => false,
         }
@@ -346,7 +383,11 @@ impl crate::Runtime {
             | ObjectKind::Generator(_)
             | ObjectKind::Proxy { .. }
             | ObjectKind::WeakRef { .. }
-            | ObjectKind::FinalizationRegistry(_) => {}
+            | ObjectKind::FinalizationRegistry(_)
+            | ObjectKind::Map(_)
+            | ObjectKind::Set(_)
+            | ObjectKind::WeakMap(_)
+            | ObjectKind::WeakSet(_) => {}
         }
         object
             .properties
@@ -433,6 +474,9 @@ impl crate::Runtime {
             }
             Value::Number(_) => Ok(self
                 .lookup_property(value, self.prototypes.number, key)?
+                .unwrap_or(Value::Undefined)),
+            Value::BigInt(_) => Ok(self
+                .lookup_property(value, self.prototypes.bigint, key)?
                 .unwrap_or(Value::Undefined)),
             Value::Bool(_) => Ok(self
                 .lookup_property(value, self.prototypes.boolean, key)?
@@ -693,6 +737,126 @@ impl crate::Runtime {
         }
     }
 
+    /// Snapshot the elements of any array-like value.
+    ///
+    /// Besides dense arrays this accepts objects with a numeric `length`
+    /// property and indexed slots (`0`, `1`, ...), which is how DOM collections
+    /// such as `NodeList` and `HTMLCollection` are represented by the host.
+    /// Strings are treated as array-likes of single code points so that generic
+    /// array methods (`Array.prototype.map.call("abc", ...)`) keep working.
+    ///
+    /// Returns `None` for values that cannot be consumed as a sequence, letting
+    /// callers raise a clear `TypeError` instead of an internal engine error.
+    #[allow(clippy::wrong_self_convention)] // getters may run and allocate, so this needs &mut self
+    pub(crate) fn to_array_like(&mut self, value: &Value) -> Option<Vec<Value>> {
+        const MAX_ARRAY_LIKE_LENGTH: usize = 1_000_000;
+        if let Some(items) = self.object_array_items(value) {
+            return Some(items);
+        }
+        match value {
+            Value::String(text) => Some(
+                text.chars()
+                    .map(|ch| Value::String(ch.to_string()))
+                    .collect(),
+            ),
+            Value::Object(_) => {
+                // The spec path: a numeric `length` with indexed slots. The
+                // indices may be stored as ordinary properties (host
+                // collections and `arguments`-like objects work this way), so
+                // read them through property access rather than array storage.
+                if let Ok(length) = self.get_property_checked(value, "length") {
+                    let number = length.to_number();
+                    if number.is_finite() && number >= 0.0 && number.fract() == 0.0 {
+                        let length = number as usize;
+                        if length <= MAX_ARRAY_LIKE_LENGTH {
+                            let mut items = Vec::with_capacity(length.min(1024));
+                            for index in 0..length {
+                                let key = index.to_string();
+                                let item = self
+                                    .get_property_checked(value, &key)
+                                    .unwrap_or(Value::Undefined);
+                                items.push(item);
+                            }
+                            return Some(items);
+                        }
+                    }
+                }
+                // Host collections sometimes omit `length` entirely but still
+                // expose their elements through numeric own properties.
+                self.sparse_array_like_items(value, MAX_ARRAY_LIKE_LENGTH)
+            }
+            _ => None,
+        }
+    }
+
+    /// Collect values from numeric own-property keys for objects that have no
+    /// usable `length` but still look like a collection. Returns `None` when
+    /// there is no numeric key, so callers can raise a descriptive `TypeError`
+    /// instead of treating an arbitrary object as a sequence.
+    #[allow(clippy::wrong_self_convention)]
+    fn sparse_array_like_items(&mut self, value: &Value, limit: usize) -> Option<Vec<Value>> {
+        let mut indexed: Vec<(usize, String)> = self
+            .object_keys(value)
+            .into_iter()
+            .filter_map(|key| array_index(&key).map(|index| (index, key)))
+            .collect();
+        if indexed.is_empty()
+            || indexed.len() > limit
+            || indexed.last().is_some_and(|(index, _)| *index >= limit)
+        {
+            return None;
+        }
+        indexed.sort_by_key(|(index, _)| *index);
+        let mut items = Vec::with_capacity(indexed.len());
+        for (_, key) in indexed {
+            items.push(
+                self.get_property_checked(value, &key)
+                    .unwrap_or(Value::Undefined),
+            );
+        }
+        Some(items)
+    }
+
+    /// Write a sequence back into an array-like value.
+    ///
+    /// Dense arrays use their native storage. Other objects get their indexed
+    /// properties and `length` rewritten; stale indices past the new length are
+    /// removed so the object matches the sequence exactly.
+    pub(crate) fn set_array_like_items(&mut self, value: &Value, items: Vec<Value>) {
+        if let Value::Object(id) = value
+            && self
+                .object(*id)
+                .is_some_and(|object| matches!(&object.kind, ObjectKind::Array(_)))
+        {
+            self.set_array_items(value, items);
+            return;
+        }
+        let Value::Object(id) = value else {
+            return;
+        };
+        let stale: Vec<String> = self
+            .object(*id)
+            .map(|object| {
+                object
+                    .properties
+                    .iter()
+                    .filter(|(name, _)| array_index(name).is_some_and(|index| index >= items.len()))
+                    .map(|(name, _)| name.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let length = items.len();
+        for (index, item) in items.into_iter().enumerate() {
+            self.define_data_property(*id, &index.to_string(), item);
+        }
+        self.define_data_property(*id, "length", Value::Number(length as f64));
+        for key in stale {
+            if let Some(object) = self.object_mut(*id) {
+                object.properties.retain(|(name, _)| name != &key);
+            }
+        }
+    }
+
     /// Replace the elements of an array.
     pub(crate) fn set_array_items(&mut self, value: &Value, items: Vec<Value>) {
         if let Value::Object(id) = value
@@ -705,12 +869,61 @@ impl crate::Runtime {
         }
     }
 
+    /// Coerce a value to an object for operations such as `in`.
+    ///
+    /// Globals and host objects are always `Value::Object` already. Primitives
+    /// with a prototype (strings, numbers and booleans) are boxed into a
+    /// temporary object so property queries keep working instead of surfacing
+    /// an internal `right-hand side of 'in' is not an object` error. Only
+    /// `undefined` and `null` cannot be represented as an object.
+    #[allow(clippy::wrong_self_convention)] // boxing allocates into the object heap
+    pub(crate) fn to_object_value(&mut self, value: &Value) -> Option<Value> {
+        match value {
+            Value::Object(_) => Some(value.clone()),
+            Value::String(text) => {
+                let id = self.alloc_object(ObjectKind::Ordinary, Some(self.prototypes.string));
+                self.define_data_property(id, "length", Value::Number(text.chars().count() as f64));
+                for (index, ch) in text.chars().enumerate() {
+                    self.define_data_property(
+                        id,
+                        &index.to_string(),
+                        Value::String(ch.to_string()),
+                    );
+                }
+                Some(Value::Object(id))
+            }
+            Value::Number(number) => {
+                let id = self.alloc_object(ObjectKind::Ordinary, Some(self.prototypes.number));
+                self.define_data_property(id, "valueOf", Value::Number(*number));
+                Some(Value::Object(id))
+            }
+            Value::Bool(boolean) => {
+                let id = self.alloc_object(ObjectKind::Ordinary, Some(self.prototypes.boolean));
+                self.define_data_property(id, "valueOf", Value::Bool(*boolean));
+                Some(Value::Object(id))
+            }
+            Value::BigInt(integer) => {
+                let id = self.alloc_object(ObjectKind::Ordinary, Some(self.prototypes.bigint));
+                let wrapper = Value::Object(id);
+                let primitive = Value::BigInt(integer.clone());
+                self.define_host_method(
+                    wrapper.clone(),
+                    "valueOf",
+                    Box::new(move |_, _, _| Ok(primitive.clone())),
+                );
+                Some(wrapper)
+            }
+            Value::Undefined | Value::Null => None,
+        }
+    }
+
     /// The prototype object of a value, when it has one.
     pub(crate) fn prototype_of(&self, value: &Value) -> Option<ObjectId> {
         match value {
             Value::Object(id) => self.object(*id).and_then(|object| object.prototype),
             Value::String(_) => Some(self.prototypes.string),
             Value::Number(_) => Some(self.prototypes.number),
+            Value::BigInt(_) => Some(self.prototypes.bigint),
             Value::Bool(_) => Some(self.prototypes.boolean),
             Value::Undefined | Value::Null => None,
         }

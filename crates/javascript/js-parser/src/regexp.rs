@@ -2,9 +2,18 @@
 //!
 //! The dialect is a deliberately small JavaScript-flavoured subset: literal
 //! characters, `.`, character classes, the `\d \w \s` families (and their
-//! negations), `\b`/`\B`, greedy and lazy quantifiers, anchors, alternation and
-//! capturing and non-capturing groups. The flags `g`, `i`, `m` and `s` are
-//! understood.
+//! negations), `\b`/`\B`, greedy and lazy quantifiers, anchors, alternation,
+//! capturing and non-capturing groups, lookahead and lookbehind assertions,
+//! and numeric (`\1` .. `\9`) and named (`\k<name>`) backreferences. The flags
+//! `g`, `i`, `m`, `s`, `u`, `v`, `y` and `d` are understood. Character classes
+//! follow Annex B web semantics: a hyphen next to a class escape is a literal
+//! `-`.
+//!
+//! The `u` (unicode) and `v` (unicode sets) flags are accepted so real-world
+//! scripts compile. Full Unicode mode is approximated: text is matched as a
+//! sequence of Unicode scalar values (`char`), which is already how the engine
+//! works, so astral code points are treated as single characters rather than
+//! UTF-16 surrogate pairs.
 
 use std::fmt;
 
@@ -19,6 +28,10 @@ pub struct RegexFlags {
     pub multiline: bool,
     /// `s`: `.` also matches line terminators.
     pub dot_all: bool,
+    /// `u`: unicode mode. Code points are treated as single characters.
+    pub unicode: bool,
+    /// `v`: unicode sets mode (accepted; matching is the same as `u` here).
+    pub unicode_sets: bool,
     /// `y`: match only at `lastIndex` (sticky matching).
     pub sticky: bool,
     /// `d`: produce the start/end indices of each captured group.
@@ -35,6 +48,8 @@ impl RegexFlags {
                 'i' => &mut parsed.ignore_case,
                 'm' => &mut parsed.multiline,
                 's' => &mut parsed.dot_all,
+                'u' => &mut parsed.unicode,
+                'v' => &mut parsed.unicode_sets,
                 'y' => &mut parsed.sticky,
                 'd' => &mut parsed.has_indices,
                 other => {
@@ -67,6 +82,12 @@ impl RegexFlags {
         }
         if self.dot_all {
             text.push('s');
+        }
+        if self.unicode {
+            text.push('u');
+        }
+        if self.unicode_sets {
+            text.push('v');
         }
         if self.sticky {
             text.push('y');
@@ -133,6 +154,18 @@ enum Inst {
     Char(char),
     Any,
     Class(Class),
+    /// Match the text most recently captured by the given group. A group that
+    /// did not participate in the match acts as an empty backreference.
+    Backref(usize),
+    /// A zero-width lookaround assertion. The nested program is run at (or,
+    /// for lookbehind, just before) the current position. Every successful
+    /// outcome becomes a continuation so the assertion can be backtracked
+    /// into, just like in JavaScript.
+    Lookaround {
+        behind: bool,
+        negative: bool,
+        program: Vec<Inst>,
+    },
     Save(usize),
     Split(usize, usize),
     Jump(usize),
@@ -202,6 +235,12 @@ enum Node {
     Char(char),
     Any,
     Class(Class),
+    Backref(usize),
+    Lookaround {
+        behind: bool,
+        negative: bool,
+        node: Box<Node>,
+    },
     Seq(Vec<Node>),
     Alt(Vec<Node>),
     Repeat {
@@ -285,19 +324,67 @@ impl Regex {
             return None;
         }
         let group_count = self.capture_count;
+        let captures = vec![None; 2 * (group_count + 1)];
+        let mut budget: usize = 400_000;
+        let (matched_end, captures) = self
+            .run_program(&self.program, text, position, captures, &mut budget)
+            .into_iter()
+            .next()?;
+        let start = captures.first().copied().flatten().unwrap_or(position);
+        let end = captures.get(1).copied().flatten().unwrap_or(matched_end);
+        let mut groups = Vec::with_capacity(group_count + 1);
+        for group in 0..=group_count {
+            let from = captures.get(group * 2).copied().flatten();
+            let to = captures.get(group * 2 + 1).copied().flatten();
+            groups.push(match (from, to) {
+                (Some(from), Some(to)) if from <= to && to <= text.len() => {
+                    Some(text[from..to].iter().collect())
+                }
+                _ => None,
+            });
+        }
+        let ranges = (0..=group_count)
+            .map(|group| {
+                let from = captures.get(group * 2).copied().flatten();
+                let to = captures.get(group * 2 + 1).copied().flatten();
+                match (from, to) {
+                    (Some(from), Some(to)) if from <= to && to <= text.len() => Some((from, to)),
+                    _ => None,
+                }
+            })
+            .collect();
+        Some(RegexMatch {
+            start,
+            end,
+            groups,
+            ranges,
+        })
+    }
+
+    /// Run `program` from `start`, collecting every successful path in the
+    /// engine's backtracking order. Nested lookaround programs share the
+    /// global `budget` so a pathological pattern cannot spin forever.
+    fn run_program(
+        &self,
+        program: &[Inst],
+        text: &[char],
+        start: usize,
+        captures: Vec<Option<usize>>,
+        budget: &mut usize,
+    ) -> Vec<(usize, Vec<Option<usize>>)> {
         let mut stack = vec![Frame {
             pc: 0,
-            pos: position,
-            captures: vec![None; 2 * (group_count + 1)],
+            pos: start,
+            captures,
         }];
-        let mut budget: usize = 400_000;
+        let mut results = Vec::new();
         while let Some(mut frame) = stack.pop() {
             loop {
-                if budget == 0 {
-                    return None;
+                if *budget == 0 {
+                    return results;
                 }
-                budget -= 1;
-                let Some(inst) = self.program.get(frame.pc) else {
+                *budget -= 1;
+                let Some(inst) = program.get(frame.pc) else {
                     break;
                 };
                 match inst {
@@ -337,6 +424,80 @@ impl Regex {
                             frame.pos += 1;
                             frame.pc += 1;
                         } else {
+                            break;
+                        }
+                    }
+                    Inst::Backref(group) => {
+                        let from = frame.captures.get(group * 2).copied().flatten();
+                        let to = frame.captures.get(group * 2 + 1).copied().flatten();
+                        match (from, to) {
+                            (Some(from), Some(to)) if from <= to && to <= text.len() => {
+                                let captured = &text[from..to];
+                                let remaining = text.get(frame.pos..).unwrap_or(&[]);
+                                if captured.len() <= remaining.len()
+                                    && captured
+                                        .iter()
+                                        .zip(remaining.iter())
+                                        .all(|(a, b)| chars_equal(*a, *b, self.flags.ignore_case))
+                                {
+                                    frame.pos += captured.len();
+                                    frame.pc += 1;
+                                } else {
+                                    break;
+                                }
+                            }
+                            // Per ECMAScript semantics, a group that did not
+                            // participate matches the empty string here.
+                            _ => frame.pc += 1,
+                        }
+                    }
+                    Inst::Lookaround {
+                        behind,
+                        negative,
+                        program: inner,
+                    } => {
+                        let mut outcomes = Vec::new();
+                        if *behind {
+                            // A lookbehind succeeds when the nested program can
+                            // match a span ending exactly at the current spot.
+                            for candidate in 0..=frame.pos {
+                                let mut found = self.run_program(
+                                    inner,
+                                    text,
+                                    candidate,
+                                    frame.captures.clone(),
+                                    budget,
+                                );
+                                found.retain(|(end, _)| *end == frame.pos);
+                                outcomes.extend(found);
+                            }
+                        } else {
+                            outcomes = self.run_program(
+                                inner,
+                                text,
+                                frame.pos,
+                                frame.captures.clone(),
+                                budget,
+                            );
+                        }
+                        if *negative {
+                            if outcomes.is_empty() {
+                                frame.pc += 1;
+                            } else {
+                                break;
+                            }
+                        } else {
+                            // The assertion is zero-width: each successful
+                            // inner path resumes at the original position,
+                            // carrying the captures it made. Pushing them all
+                            // lets the caller backtrack into the assertion.
+                            for (_, captures) in outcomes.into_iter().rev() {
+                                stack.push(Frame {
+                                    pc: frame.pc + 1,
+                                    pos: frame.pos,
+                                    captures,
+                                });
+                            }
                             break;
                         }
                     }
@@ -406,43 +567,13 @@ impl Regex {
                         }
                     }
                     Inst::Match => {
-                        let captures = &frame.captures;
-                        let start = captures.first().copied().flatten().unwrap_or(position);
-                        let end = captures.get(1).copied().flatten().unwrap_or(frame.pos);
-                        let mut groups = Vec::with_capacity(group_count + 1);
-                        for group in 0..=group_count {
-                            let from = captures.get(group * 2).copied().flatten();
-                            let to = captures.get(group * 2 + 1).copied().flatten();
-                            groups.push(match (from, to) {
-                                (Some(from), Some(to)) if from <= to && to <= text.len() => {
-                                    Some(text[from..to].iter().collect())
-                                }
-                                _ => None,
-                            });
-                        }
-                        let ranges = (0..=group_count)
-                            .map(|group| {
-                                let from = captures.get(group * 2).copied().flatten();
-                                let to = captures.get(group * 2 + 1).copied().flatten();
-                                match (from, to) {
-                                    (Some(from), Some(to)) if from <= to && to <= text.len() => {
-                                        Some((from, to))
-                                    }
-                                    _ => None,
-                                }
-                            })
-                            .collect();
-                        return Some(RegexMatch {
-                            start,
-                            end,
-                            groups,
-                            ranges,
-                        });
+                        results.push((frame.pos, frame.captures));
+                        break;
                     }
                 }
             }
         }
-        None
+        results
     }
 }
 
@@ -685,9 +816,28 @@ impl RegexParser {
                             index: None,
                             node: Box::new(node),
                         }
+                    } else if self.peek().is_some_and(|ch| matches!(ch, '=' | '!')) {
+                        let negative = self.next() == Some('!');
+                        let node = self.parse_alternation()?;
+                        self.expect_close_group()?;
+                        Node::Lookaround {
+                            behind: false,
+                            negative,
+                            node: Box::new(node),
+                        }
                     } else if self.peek() == Some('<')
-                        && !matches!(self.peek_at(1), Some('=') | Some('!'))
+                        && matches!(self.peek_at(1), Some('=') | Some('!'))
                     {
+                        self.pos += 1; // `<`
+                        let negative = self.next() == Some('!');
+                        let node = self.parse_alternation()?;
+                        self.expect_close_group()?;
+                        Node::Lookaround {
+                            behind: true,
+                            negative,
+                            node: Box::new(node),
+                        }
+                    } else if self.peek() == Some('<') {
                         let name = self.parse_group_name()?;
                         self.capture_count += 1;
                         let index = self.capture_count;
@@ -702,9 +852,10 @@ impl RegexParser {
                             node: Box::new(node),
                         }
                     } else {
-                        return Err(RegexError::new(
-                            "unsupported group modifier in regular expression",
-                        ));
+                        let modifier = self.peek().map(|ch| ch.to_string()).unwrap_or_default();
+                        return Err(RegexError::new(format!(
+                            "unsupported group modifier `(?{modifier}` in regular expression"
+                        )));
                     }
                 } else {
                     self.capture_count += 1;
@@ -806,10 +957,51 @@ impl RegexParser {
                     Node::Char('c')
                 }
             }
+            'k' => {
+                if self.peek() == Some('<') {
+                    let name = self.parse_group_name()?;
+                    let index = self
+                        .group_names
+                        .iter()
+                        .position(|existing| existing.as_deref() == Some(name.as_str()))
+                        .ok_or_else(|| {
+                            RegexError::new(format!(
+                                "invalid named backreference `\\k<{name}>` in regular expression"
+                            ))
+                        })?;
+                    Node::Backref(index)
+                } else {
+                    // Annex B identity escape when `\k` is not a named
+                    // backreference.
+                    Node::Char('k')
+                }
+            }
             digit if digit.is_ascii_digit() => {
-                return Err(RegexError::new(
-                    "backreferences are not supported in regular expressions",
-                ));
+                // `\0` is handled above; here we have `1` .. `9`. Read the
+                // whole run of digits so `\10` can refer to group ten when it
+                // exists. Otherwise only the first digit is a backreference
+                // and the rest are literal characters.
+                let first = self.pos - 1;
+                let mut end = self.pos;
+                while self.chars.get(end).is_some_and(|ch| ch.is_ascii_digit()) {
+                    end += 1;
+                }
+                let digits: String = self.chars[first..end].iter().collect();
+                let whole: usize = digits.parse().unwrap_or(usize::MAX);
+                if whole >= 1 && whole <= self.capture_count {
+                    self.pos = end;
+                    Node::Backref(whole)
+                } else {
+                    let single = digit.to_digit(10).unwrap() as usize;
+                    if single <= self.capture_count {
+                        self.pos = first + 1;
+                        Node::Backref(single)
+                    } else {
+                        return Err(RegexError::new(format!(
+                            "invalid backreference `\\{digits}` in regular expression"
+                        )));
+                    }
+                }
             }
             other => Node::Char(other),
         })
@@ -885,10 +1077,15 @@ impl RegexParser {
                         }
                         items.push(ClassItem::Range(from, to));
                     }
-                    _ => {
-                        return Err(RegexError::new(
-                            "character class range endpoints must be characters",
-                        ));
+                    // Annex B / web reality: a `-` that cannot form a range
+                    // because one endpoint is a class escape (`\w`, `\d`,
+                    // `\s`, ...) is just a literal hyphen. Escaped characters
+                    // such as `\.` are still ordinary endpoints, so ranges
+                    // between them keep working.
+                    (start, end) => {
+                        items.push(start.into_item());
+                        items.push(ClassItem::Range('-', '-'));
+                        items.push(end.into_item());
                     }
                 }
             } else {
@@ -949,6 +1146,21 @@ fn compile_node(node: &Node, program: &mut Vec<Inst>) {
         Node::Char(ch) => program.push(Inst::Char(*ch)),
         Node::Any => program.push(Inst::Any),
         Node::Class(class) => program.push(Inst::Class(class.clone())),
+        Node::Backref(group) => program.push(Inst::Backref(*group)),
+        Node::Lookaround {
+            behind,
+            negative,
+            node,
+        } => {
+            let mut inner = Vec::new();
+            compile_node(node, &mut inner);
+            inner.push(Inst::Match);
+            program.push(Inst::Lookaround {
+                behind: *behind,
+                negative: *negative,
+                program: inner,
+            });
+        }
         Node::Seq(items) => {
             for item in items {
                 compile_node(item, program);
@@ -1184,9 +1396,303 @@ mod tests {
     }
 
     #[test]
-    fn rejects_bad_named_groups_and_lookbehind() {
+    fn rejects_bad_named_groups_and_group_modifiers() {
         assert!(Regex::new("(?<a", "").is_err());
         assert!(Regex::new("(?<a-b>x)", "").is_err());
-        assert!(Regex::new("(?<=a)b", "").is_err());
+        assert!(Regex::new("(?>a)", "").is_err());
+        let error = Regex::new("(?>a)", "").expect_err("unsupported modifier");
+        assert!(error.message.contains("unsupported group modifier"));
+    }
+
+    #[test]
+    fn numeric_backreferences_match_previous_captures() {
+        let found = matched(r"(\w+)\s+\1", "", "say go go now");
+        assert_eq!(found.start, 4);
+        assert_eq!(found.end, 9);
+        assert_eq!(found.groups[0].as_deref(), Some("go go"));
+        assert_eq!(found.groups[1].as_deref(), Some("go"));
+
+        assert!(is_match(r"^(\d)\1$", "", "77"));
+        assert!(!is_match(r"^(\d)\1$", "", "78"));
+        assert!(is_match(r"^(\d)(\d)\2\1$", "", "1221"));
+        // A group that did not participate matches the empty string.
+        assert!(is_match(r"^(a)?b\1$", "", "b"));
+        // Multi-digit backreferences resolve to the group with that number.
+        assert!(is_match(
+            r"^(a)(b)(c)(d)(e)(f)(g)(h)(i)(j)\10$",
+            "",
+            "abcdefghijj"
+        ));
+    }
+
+    #[test]
+    fn named_backreferences_match_previous_captures() {
+        let found = matched(r"(?<word>\w+)\s+\k<word>", "", "echo hi hi there");
+        assert_eq!(found.groups[0].as_deref(), Some("hi hi"));
+        assert_eq!(found.groups[1].as_deref(), Some("hi"));
+
+        assert!(is_match(r"^(?<x>a)(?<y>b)\k<y>\k<x>$", "", "abba"));
+        assert!(is_match(r"^(?<tag>[a-z]+)<\/\k<tag>>$", "", "p</p>"));
+        // Named and numeric backreferences can point at the same group.
+        assert!(is_match(r"^(?<x>a)\1\k<x>$", "", "aaa"));
+        // The `i` flag applies to the backreference as well.
+        assert!(is_match(r"^(?<x>a)\k<x>$", "i", "aA"));
+    }
+
+    #[test]
+    fn backreferences_honour_ignore_case_sticky_and_indices() {
+        assert!(is_match(r"^(a)\1$", "i", "aA"));
+        assert!(!is_match(r"^(a)\1$", "", "aA"));
+
+        let regex = Regex::new(r"(?<a>ab)\k<a>", "dy").expect("compile");
+        let chars: Vec<char> = "zzabab".chars().collect();
+        assert!(regex.find_from(&chars, 0).is_none());
+        let found = regex.find_from(&chars, 2).expect("match");
+        assert_eq!(found.groups[1].as_deref(), Some("ab"));
+        assert_eq!(found.ranges[0], Some((2, 6)));
+        assert_eq!(found.ranges[1], Some((2, 4)));
+    }
+
+    #[test]
+    fn invalid_backreferences_are_syntax_errors() {
+        assert!(Regex::new(r"\1", "").is_err()); // no groups at all
+        assert!(Regex::new(r"(a)\2", "").is_err()); // out of range
+        assert!(Regex::new(r"\1(a)", "").is_err()); // forward reference
+        assert!(Regex::new(r"\k<x>", "").is_err()); // name not defined
+        assert!(Regex::new(r"(a)\k<other>", "").is_err()); // unknown name
+        assert!(Regex::new(r"\k<x>(?<x>a)", "").is_err()); // forward named reference
+        assert!(Regex::new(r"(?<x>a)\k<x", "").is_err()); // unterminated name
+    }
+
+    #[test]
+    fn youtube_script_tag_pattern_with_numeric_backreference() {
+        // Exact pattern from spf.js line 53 and network.js line 29:
+        // /\x3c(script|style)([\s\S]*?)\x3e([\s\S]*?)\x3c\/\1\x3e/ig
+        let regex = Regex::new(
+            r"\x3c(script|style)([\s\S]*?)\x3e([\s\S]*?)\x3c\/\1\x3e",
+            "ig",
+        )
+        .expect("compile");
+        assert_eq!(regex.capture_count(), 3);
+
+        let chars: Vec<char> = "<script>var x=1;</script><style>a{}</style>"
+            .chars()
+            .collect();
+        let first = regex.find_from(&chars, 0).expect("first match");
+        assert_eq!(
+            first.groups[0].as_deref(),
+            Some("<script>var x=1;</script>")
+        );
+        assert_eq!(first.groups[1].as_deref(), Some("script"));
+        assert_eq!(first.groups[2].as_deref(), Some(""));
+        assert_eq!(first.groups[3].as_deref(), Some("var x=1;"));
+
+        let second = regex.find_from(&chars, first.end).expect("second match");
+        assert_eq!(second.groups[1].as_deref(), Some("style"));
+        assert_eq!(second.groups[3].as_deref(), Some("a{}"));
+
+        // The backreference ties the closing tag to the opening tag.
+        assert!(!regex.is_match("<script>x</style>"));
+        // With `i`, the backreference comparison is case insensitive too.
+        assert!(regex.is_match("<SCRIPT>x</ScRiPt>"));
+    }
+
+    #[test]
+    fn youtube_web_animations_pattern_with_numeric_backreference() {
+        // From web-animations-next-lite.min.js line 80: /(N|D)O\1/g
+        let regex = Regex::new(r"(N|D)O\1", "g").expect("compile");
+        assert!(regex.is_match("NON"));
+        assert!(regex.is_match("DOD"));
+        assert!(!regex.is_match("NOX"));
+    }
+
+    #[test]
+    fn positive_and_negative_lookahead_are_zero_width() {
+        assert!(is_match(r"^(?=a)a$", "", "a"));
+        assert!(!is_match(r"^(?=a)b$", "", "b"));
+        assert!(is_match(r"^(?!a)b$", "", "b"));
+        assert!(!is_match(r"^(?!a)a$", "", "a"));
+
+        let found = matched(r"(?=b)b", "", "abc");
+        assert_eq!(found.start, 1);
+        assert_eq!(found.end, 2);
+        assert_eq!(found.groups[0].as_deref(), Some("b"));
+
+        // Captures made inside a positive lookahead are kept.
+        let found = matched(r"(?=(a))a", "", "a");
+        assert_eq!(found.groups[1].as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn lookahead_can_be_backtracked_into() {
+        // Greedy `a+` inside the assertion first consumes both `a`s; the
+        // engine must backtrack inside the lookahead to leave one for `a`.
+        let found = matched(r"(?=(a+)a)a+b", "", "aab");
+        assert_eq!(found.groups[0].as_deref(), Some("aab"));
+        assert_eq!(found.groups[1].as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn lookbehind_assertions() {
+        let found = matched(r"(?<=ab)c", "", "abc");
+        assert_eq!(found.start, 2);
+        assert_eq!(found.end, 3);
+        assert_eq!(found.groups[0].as_deref(), Some("c"));
+        assert!(!is_match(r"(?<=ab)c", "", "ac"));
+
+        assert!(is_match(r"(?<!ab)c", "", "ac"));
+        assert!(!is_match(r"(?<!ab)c", "", "abc"));
+
+        // Variable-length lookbehind is supported by trying each start.
+        assert!(is_match(r"(?<=a+)b", "", "aaab"));
+        assert!(!is_match(r"(?<=a+)b", "", "cb"));
+
+        // Captures made inside a lookbehind are kept too.
+        let found = matched(r"(?<=(ab))c", "", "abc");
+        assert_eq!(found.groups[1].as_deref(), Some("ab"));
+
+        // Variable-length lookbehind prefers the longest match, like V8.
+        let found = matched(r"(?<=(a+))b", "", "aaab");
+        assert_eq!(found.groups[1].as_deref(), Some("aaa"));
+    }
+
+    #[test]
+    fn youtube_css_custom_property_pattern_with_lookahead() {
+        // Exact pattern from webcomponents-sd.js line 149:
+        // /(?:^|[;\s{]\s*)(--[\w-]*?)\s*:\s*(?:((?:'(?:\\'|.)*?'|"(?:\\"|.)*?"|\([^)]*?\)|[^};{])+)|\{([^}]*)\}(?:(?=[;\s}])|$))/gi
+        let regex = Regex::new(
+            r#"(?:^|[;\s{]\s*)(--[\w-]*?)\s*:\s*(?:((?:'(?:\\'|.)*?'|"(?:\\"|.)*?"|\([^)]*?\)|[^};{])+)|\{([^}]*)\}(?:(?=[;\s}])|$))"#,
+            "gi",
+        )
+        .expect("compile");
+        assert_eq!(regex.capture_count(), 3);
+
+        let chars: Vec<char> = "--brand: red;".chars().collect();
+        let found = regex.find_from(&chars, 0).expect("custom property");
+        assert_eq!(found.groups[1].as_deref(), Some("--brand"));
+        assert_eq!(found.groups[2].as_deref(), Some("red"));
+
+        let chars: Vec<char> = ":root { --brand: #f00; }".chars().collect();
+        let found = regex.find_from(&chars, 0).expect("inside a rule");
+        assert_eq!(found.start, 6);
+        assert_eq!(found.groups[1].as_deref(), Some("--brand"));
+        assert_eq!(found.groups[2].as_deref(), Some("#f00"));
+
+        // The `{ ... }` value branch relies on `(?=[;\s}])`.
+        let chars: Vec<char> = "--bg: { color: red };".chars().collect();
+        let found = regex.find_from(&chars, 0).expect("brace value");
+        assert_eq!(found.groups[1].as_deref(), Some("--bg"));
+        assert_eq!(found.groups[2], None);
+        assert_eq!(found.groups[3].as_deref(), Some(" color: red "));
+    }
+
+    #[test]
+    fn lookaround_composes_with_backreferences_and_named_groups() {
+        let found = matched(r"(?<w>\w+)(?=\s+\k<w>)", "", "go go");
+        assert_eq!(found.groups[1].as_deref(), Some("go"));
+        assert_eq!(found.end, 2);
+        assert!(is_match(r"(?<w>\w+)\s+(?=\k<w>)\k<w>", "", "go go"));
+    }
+
+    #[test]
+    fn youtube_main_module_pattern_with_class_escape_hyphen() {
+        // Exact pattern from YouTube's main module:
+        // /(^\/[^\/])|(^#)|(^[\w-\d]*:)/
+        let regex = Regex::new(r"(^\/[^\/])|(^#)|(^[\w-\d]*:)", "").expect("compile");
+
+        let found = matched(r"(^\/[^\/])|(^#)|(^[\w-\d]*:)", "", "/path");
+        assert_eq!(found.groups[0].as_deref(), Some("/p"));
+        assert_eq!(found.groups[1].as_deref(), Some("/p"));
+
+        let found = matched(r"(^\/[^\/])|(^#)|(^[\w-\d]*:)", "", "#frag");
+        assert_eq!(found.groups[0].as_deref(), Some("#"));
+        assert_eq!(found.groups[2].as_deref(), Some("#"));
+
+        for text in ["scheme:", "a-b:", "123:"] {
+            assert!(regex.is_match(text), "{text} should match");
+        }
+        // The hyphen between `\w` and `\d` is a literal class member.
+        assert!(is_match(r"^[\w-\d]*$", "", "-"));
+    }
+
+    #[test]
+    fn youtube_main_module_direction_pattern_with_class_escape_hyphen() {
+        // Exact pattern from YouTube's main module:
+        // /([\s\w-#\.\[\]\*]*):dir\((ltr|rtl)\)/g
+        let regex = Regex::new(r"([\s\w-#\.\[\]\*]*):dir\((ltr|rtl)\)", "g").expect("compile");
+        assert_eq!(regex.capture_count(), 2);
+
+        let found = matched(
+            r"([\s\w-#\.\[\]\*]*):dir\((ltr|rtl)\)",
+            "",
+            "width:dir(ltr)",
+        );
+        assert_eq!(found.groups[0].as_deref(), Some("width:dir(ltr)"));
+        assert_eq!(found.groups[1].as_deref(), Some("width"));
+        assert_eq!(found.groups[2].as_deref(), Some("ltr"));
+
+        let found = matched(
+            r"([\s\w-#\.\[\]\*]*):dir\((ltr|rtl)\)",
+            "",
+            "a-b[0].x *:dir(rtl)",
+        );
+        assert_eq!(found.groups[1].as_deref(), Some("a-b[0].x *"));
+        assert_eq!(found.groups[2].as_deref(), Some("rtl"));
+
+        // The literal hyphen is part of the class.
+        assert!(is_match(r"^[\s\w-#\.\[\]\*]+$", "", "-"));
+    }
+
+    #[test]
+    fn youtube_main_module_unicode_flag() {
+        // YouTube's main module contains regex literals with the `u` (unicode)
+        // flag (e.g. patterns using `\u{...}` code-point escapes). The module is
+        // versioned, so the exact line/column of a given pattern moves between
+        // releases; this representative pattern exercises the same flag and
+        // the same approximation of Unicode semantics.
+        let regex = Regex::new(r"^(?:\w|\u{1F600})+$", "gu").expect("compile");
+        assert!(regex.flags().unicode);
+        assert!(regex.flags().global);
+        assert_eq!(regex.flags().as_string(), "gu");
+
+        // Astral code points are matched as single characters, not as UTF-16
+        // surrogate pairs, and the pattern above compiles and runs with `u`.
+        assert!(regex.is_match("abc\u{1F600}"));
+        assert!(regex.is_match("\u{1F600}\u{1F600}"));
+        assert!(!regex.is_match("abc!"));
+
+        // `u` composes with every previously supported flag.
+        let combined = Regex::new(r"^[a-z]+$", "gimsuyd").expect("compile");
+        assert!(combined.flags().global);
+        assert!(combined.flags().ignore_case);
+        assert!(combined.flags().multiline);
+        assert!(combined.flags().dot_all);
+        assert!(combined.flags().sticky);
+        assert!(combined.flags().unicode);
+        assert!(combined.flags().has_indices);
+
+        // `v` (unicode sets) is accepted as well, and duplicates are still
+        // rejected for both new flags.
+        let sets = Regex::new(r"\w+", "v").expect("compile");
+        assert!(sets.flags().unicode_sets);
+        assert_eq!(sets.flags().as_string(), "v");
+        assert!(Regex::new("a", "uu").is_err());
+        assert!(Regex::new("a", "vv").is_err());
+    }
+
+    #[test]
+    fn character_class_ranges_still_work() {
+        assert!(is_match(r"^[a-z]+$", "", "hello"));
+        assert!(!is_match(r"^[a-z]+$", "", "HELLO"));
+        assert!(is_match(r"^[\x30-\x39]+$", "", "0123"));
+        assert!(is_match(r"^[\.-a]+$", "", "/0."));
+        assert!(is_match(r"^[a-]+$", "", "-"));
+        assert!(is_match(r"^[-a]+$", "", "-"));
+        // Real out-of-order ranges are still rejected.
+        assert!(Regex::new(r"[z-a]", "").is_err());
+        assert!(Regex::new(r"[a-\.]", "").is_err());
+        // A hyphen at the edge of a class escape is literal in both positions.
+        assert!(is_match(r"^[\d-]+$", "", "-7"));
+        assert!(is_match(r"^[a-\w]+$", "", "a-9"));
     }
 }

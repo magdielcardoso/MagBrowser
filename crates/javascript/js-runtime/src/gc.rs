@@ -63,10 +63,15 @@ impl crate::Runtime {
         values.push(Value::Object(self.prototypes.function));
         values.push(Value::Object(self.prototypes.string));
         values.push(Value::Object(self.prototypes.number));
+        values.push(Value::Object(self.prototypes.bigint));
         values.push(Value::Object(self.prototypes.boolean));
         values.push(Value::Object(self.prototypes.error));
         values.push(Value::Object(self.prototypes.promise));
         values.push(Value::Object(self.prototypes.regexp));
+        values.push(Value::Object(self.prototypes.map));
+        values.push(Value::Object(self.prototypes.set));
+        values.push(Value::Object(self.prototypes.weakmap));
+        values.push(Value::Object(self.prototypes.weakset));
         values.push(self.completion_value.clone());
         values.extend(self.gc_roots.iter().cloned());
         values.extend(self.temp_roots.iter().cloned());
@@ -234,6 +239,25 @@ fn mark_object(
                 scopes.extend(frame.block_scopes.iter().copied());
                 if let Some(promise) = &frame.promise {
                     values.push(promise.clone());
+                }
+            }
+        }
+        // Strong collections trace both keys and values.
+        ObjectKind::Map(data) | ObjectKind::Set(data) => {
+            if let Ok(data) = data.try_borrow() {
+                for entry in &data.entries {
+                    values.push(entry.key.clone());
+                    values.push(entry.value.clone());
+                }
+            }
+        }
+        // Weak collections hold their keys weakly: only values are traced.
+        // Key object ids are never traced, and stale ids are ignored on lookup
+        // via the generation captured at insertion time.
+        ObjectKind::WeakMap(data) | ObjectKind::WeakSet(data) => {
+            if let Ok(data) = data.try_borrow() {
+                for entry in &data.entries {
+                    values.push(entry.value.clone());
                 }
             }
         }

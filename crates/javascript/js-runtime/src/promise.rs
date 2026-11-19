@@ -87,6 +87,20 @@ impl crate::Runtime {
         }
     }
 
+    /// The `Promise.resolve` assimilation step: promises pass through, other
+    /// values are wrapped in a new fulfilled promise.
+    #[allow(clippy::wrong_self_convention)] // wrapping a non-promise allocates a new promise
+    pub(crate) fn to_promise_value(&mut self, value: Value) -> Value {
+        if let Value::Object(id) = &value
+            && self.promise_state(*id).is_some()
+        {
+            return value;
+        }
+        let (id, _state) = self.new_promise();
+        self.resolve_promise(id, value);
+        Value::Object(id)
+    }
+
     fn schedule_reaction(&mut self, state: Rc<RefCell<PromiseState>>, reaction: Reaction) {
         self.microtasks
             .push_back(Box::new(move |runtime: &mut crate::Runtime| {
@@ -162,8 +176,16 @@ impl crate::Runtime {
             self.define_data_property(*id, "prototype", Value::Object(prototype));
             let resolve = self.new_builtin_value("resolve", 1, promise_resolve);
             let reject = self.new_builtin_value("reject", 1, promise_reject);
+            let all = self.new_builtin_value("all", 1, promise_all);
+            let all_settled = self.new_builtin_value("allSettled", 1, promise_all_settled);
+            let any = self.new_builtin_value("any", 1, promise_any);
+            let race = self.new_builtin_value("race", 1, promise_race);
             self.define_data_property(*id, "resolve", resolve);
             self.define_data_property(*id, "reject", reject);
+            self.define_data_property(*id, "all", all);
+            self.define_data_property(*id, "allSettled", all_settled);
+            self.define_data_property(*id, "any", any);
+            self.define_data_property(*id, "race", race);
         }
         self.declare_global("Promise", constructor);
     }
@@ -270,9 +292,192 @@ fn promise_resolve(
     args: Vec<Value>,
 ) -> Result<Value, JsError> {
     let value = args.first().cloned().unwrap_or(Value::Undefined);
+    Ok(runtime.to_promise_value(value))
+}
+
+#[derive(Clone, Copy)]
+enum Combinator {
+    All,
+    AllSettled,
+    Any,
+    Race,
+}
+
+fn promise_all(
+    runtime: &mut crate::Runtime,
+    this: Value,
+    args: Vec<Value>,
+) -> Result<Value, JsError> {
+    promise_combine(runtime, this, args, Combinator::All)
+}
+
+fn promise_all_settled(
+    runtime: &mut crate::Runtime,
+    this: Value,
+    args: Vec<Value>,
+) -> Result<Value, JsError> {
+    promise_combine(runtime, this, args, Combinator::AllSettled)
+}
+
+fn promise_any(
+    runtime: &mut crate::Runtime,
+    this: Value,
+    args: Vec<Value>,
+) -> Result<Value, JsError> {
+    promise_combine(runtime, this, args, Combinator::Any)
+}
+
+fn promise_race(
+    runtime: &mut crate::Runtime,
+    this: Value,
+    args: Vec<Value>,
+) -> Result<Value, JsError> {
+    promise_combine(runtime, this, args, Combinator::Race)
+}
+
+fn promise_combine(
+    runtime: &mut crate::Runtime,
+    _this: Value,
+    args: Vec<Value>,
+    kind: Combinator,
+) -> Result<Value, JsError> {
+    let iterable = args.first().cloned().unwrap_or(Value::Undefined);
+    let Some(items) = runtime.to_array_like(&iterable) else {
+        let (id, _state) = runtime.new_promise();
+        runtime.reject_promise(
+            id,
+            JsError::type_error("Promise combinator requires an iterable").thrown_value(),
+        );
+        return Ok(Value::Object(id));
+    };
+
     let (id, _state) = runtime.new_promise();
-    runtime.resolve_promise(id, value);
-    Ok(Value::Object(id))
+    let result = Value::Object(id);
+    let results = match kind {
+        Combinator::All | Combinator::AllSettled => {
+            let array = runtime.new_array(vec![Value::Undefined; items.len()]);
+            // Native handlers are invisible to the GC, so keep shared state on
+            // the returned promise, which the script normally keeps alive.
+            runtime.define_data_property(id, "\u{0}promise_results", array.clone());
+            array
+        }
+        Combinator::Any | Combinator::Race => Value::Undefined,
+    };
+    let errors = match kind {
+        Combinator::Any => {
+            let array = runtime.new_array(vec![Value::Undefined; items.len()]);
+            runtime.define_data_property(id, "\u{0}promise_errors", array.clone());
+            array
+        }
+        _ => Value::Undefined,
+    };
+
+    if items.is_empty() {
+        match kind {
+            Combinator::All | Combinator::AllSettled => {
+                runtime.resolve_promise(id, results);
+            }
+            Combinator::Any | Combinator::Race => {
+                runtime.reject_promise(id, JsError::new("no promises to settle").thrown_value());
+            }
+        }
+        return Ok(result);
+    }
+
+    let remaining = Rc::new(RefCell::new(items.len()));
+    let mark = runtime.temp_roots.len();
+    for (index, item) in items.into_iter().enumerate() {
+        let promise = runtime.to_promise_value(item);
+        runtime.temp_roots.push(promise.clone());
+
+        let fulfilled_results = results.clone();
+        let fulfilled_remaining = Rc::clone(&remaining);
+        let on_fulfilled = runtime.new_native_value(
+            "promiseFulfilled",
+            1,
+            Box::new(move |rt, _this, args| {
+                let value = args.first().cloned().unwrap_or(Value::Undefined);
+                match kind {
+                    Combinator::All => {
+                        rt.set_property(fulfilled_results.clone(), &index.to_string(), value);
+                    }
+                    Combinator::AllSettled => {
+                        let outcome = rt.new_object();
+                        rt.set_property(
+                            outcome.clone(),
+                            "status",
+                            Value::String("fulfilled".to_owned()),
+                        );
+                        rt.set_property(outcome.clone(), "value", value);
+                        rt.set_property(fulfilled_results.clone(), &index.to_string(), outcome);
+                    }
+                    Combinator::Any | Combinator::Race => {
+                        rt.resolve_promise(id, value);
+                        return Ok(Value::Undefined);
+                    }
+                }
+                let mut remaining = fulfilled_remaining.borrow_mut();
+                *remaining -= 1;
+                if *remaining == 0 {
+                    rt.resolve_promise(id, fulfilled_results.clone());
+                }
+                Ok(Value::Undefined)
+            }),
+        );
+        runtime.temp_roots.push(on_fulfilled.clone());
+
+        let rejected_results = results.clone();
+        let rejected_errors = errors.clone();
+        let rejected_remaining = Rc::clone(&remaining);
+        let on_rejected = runtime.new_native_value(
+            "promiseRejected",
+            1,
+            Box::new(move |rt, _this, args| {
+                let reason = args.first().cloned().unwrap_or(Value::Undefined);
+                match kind {
+                    Combinator::All | Combinator::Race => {
+                        rt.reject_promise(id, reason);
+                        return Ok(Value::Undefined);
+                    }
+                    Combinator::AllSettled => {
+                        let outcome = rt.new_object();
+                        rt.set_property(
+                            outcome.clone(),
+                            "status",
+                            Value::String("rejected".to_owned()),
+                        );
+                        rt.set_property(outcome.clone(), "reason", reason);
+                        rt.set_property(rejected_results.clone(), &index.to_string(), outcome);
+                    }
+                    Combinator::Any => {
+                        rt.set_property(rejected_errors.clone(), &index.to_string(), reason);
+                    }
+                }
+                let mut remaining = rejected_remaining.borrow_mut();
+                *remaining -= 1;
+                if *remaining == 0 {
+                    match kind {
+                        Combinator::AllSettled => {
+                            rt.resolve_promise(id, rejected_results.clone());
+                        }
+                        Combinator::Any => {
+                            rt.reject_promise(
+                                id,
+                                JsError::new("all promises rejected").thrown_value(),
+                            );
+                        }
+                        Combinator::All | Combinator::Race => {}
+                    }
+                }
+                Ok(Value::Undefined)
+            }),
+        );
+        runtime.temp_roots.push(on_rejected.clone());
+
+        let _ = then_impl(runtime, promise, Some(on_fulfilled), Some(on_rejected))?;
+    }
+    runtime.temp_roots.truncate(mark);
+    Ok(result)
 }
 
 fn promise_reject(
@@ -289,6 +494,41 @@ fn promise_reject(
 #[cfg(test)]
 mod tests {
     use crate::value::Value;
+
+    #[test]
+    fn static_combinators_are_installed_and_settle() {
+        let mut runtime = crate::Runtime::new();
+        runtime
+            .eval(
+                "var out = {}; \
+                 Promise.all([Promise.resolve(1), 2]).then(function (values) { out.all = values.join(','); }); \
+                 Promise.allSettled([Promise.reject('bad'), 3]).then(function (values) { \
+                     out.settled = values.map(function (entry) { return entry.status; }).join(','); \
+                 }); \
+                 Promise.any([Promise.reject('x'), Promise.resolve('ok')]).then(function (value) { out.any = value; }); \
+                 Promise.race([Promise.resolve('fast')]).then(function (value) { out.race = value; });",
+            )
+            .expect("eval");
+        for _ in 0..8 {
+            runtime.run_microtasks().expect("microtasks");
+        }
+        assert_eq!(
+            runtime.eval("out.all").expect("eval"),
+            Value::String("1,2".to_owned())
+        );
+        assert_eq!(
+            runtime.eval("out.settled").expect("eval"),
+            Value::String("rejected,fulfilled".to_owned())
+        );
+        assert_eq!(
+            runtime.eval("out.any").expect("eval"),
+            Value::String("ok".to_owned())
+        );
+        assert_eq!(
+            runtime.eval("out.race").expect("eval"),
+            Value::String("fast".to_owned())
+        );
+    }
 
     #[test]
     fn then_handlers_run_in_registration_order() {

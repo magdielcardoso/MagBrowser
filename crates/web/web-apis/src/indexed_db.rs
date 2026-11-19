@@ -399,6 +399,7 @@ fn idb_value_from_js(runtime: &mut Runtime, value: Value) -> IdbValue {
         Value::Bool(flag) => IdbValue::Bool(flag),
         Value::Number(number) => IdbValue::Number(number),
         Value::String(text) => IdbValue::String(text),
+        Value::BigInt(_) => IdbValue::String(value.to_string_value()),
         Value::Object(_) => {
             let json = runtime.get_global("JSON");
             let stringify = runtime.get_property(&json, "stringify");

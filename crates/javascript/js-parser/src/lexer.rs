@@ -387,8 +387,8 @@ impl<'a> Lexer<'a> {
             self.bump();
             return self.scan_template_part();
         }
-        if is_ident_start(ch) {
-            return Ok(self.scan_identifier());
+        if is_ident_start(ch) || (ch == '\\' && self.peek_at(1) == Some('u')) {
+            return self.scan_identifier();
         }
         if ch == '/' && self.regex_allowed {
             return self.scan_regex();
@@ -466,20 +466,46 @@ impl<'a> Lexer<'a> {
         Ok(TokenKind::Regex { pattern, flags })
     }
 
-    fn scan_identifier(&mut self) -> TokenKind {
-        let start = self.pos;
+    fn scan_identifier(&mut self) -> Result<TokenKind, ParseError> {
+        let mut text = String::new();
+        if self.peek_char() == Some('\\') {
+            // Identifiers may begin with a Unicode escape sequence, for
+            // example the `\\u0275prov` marker used by Angular-compiled code.
+            let ch = self.scan_identifier_escape()?;
+            if !is_ident_start(ch) {
+                return Err(self.error("invalid unicode escape in identifier"));
+            }
+            text.push(ch);
+        } else if let Some(ch) = self.bump() {
+            text.push(ch);
+        }
         while let Some(ch) = self.peek_char() {
             if is_ident_continue(ch) {
                 self.bump();
+                text.push(ch);
+            } else if ch == '\\' && self.peek_at(1) == Some('u') {
+                let escaped = self.scan_identifier_escape()?;
+                if !is_ident_continue(escaped) {
+                    return Err(self.error("invalid unicode escape in identifier"));
+                }
+                text.push(escaped);
             } else {
                 break;
             }
         }
-        let text: String = self.chars[start..self.pos].iter().collect();
-        match Keyword::from_text(&text) {
+        Ok(match Keyword::from_text(&text) {
             Some(keyword) => TokenKind::Keyword(keyword),
             None => TokenKind::Identifier(text),
-        }
+        })
+    }
+
+    /// Scan a `\\uXXXX` or `\\u{...}` escape at the start of the cursor. The
+    /// backslash must still be present; on return it and the escape have been
+    /// consumed and the decoded character is produced.
+    fn scan_identifier_escape(&mut self) -> Result<char, ParseError> {
+        self.bump(); // `\\`
+        self.scan_escape()?
+            .ok_or_else(|| self.error("invalid unicode escape in identifier"))
     }
 
     fn scan_number(&mut self) -> Result<TokenKind, ParseError> {
