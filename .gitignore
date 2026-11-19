@@ -4,3 +4,6 @@
 .DS_Store
 /output
 /tests/snapshots/*.actual.png
+
+# accidental rustc/rustfmt outputs
+/lib
