@@ -50,6 +50,65 @@ impl Layer {
     }
 }
 
+/// A GPU-agnostic snapshot of one layer at composite time.
+///
+/// This is the bridge between the layer tree and a backend: the GPU presenter
+/// turns the affine `transform` into its shader matrix and uses `opacity` and
+/// `z_index` to order and draw the layer. It deliberately holds no pixels and
+/// no wgpu types so the compositor stays GPU-free.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LayerComposite {
+    /// Layer that produced this snapshot.
+    pub id: LayerId,
+    /// Stacking order; larger values are drawn later.
+    pub z_index: i32,
+    /// Opacity in `[0, 1]`.
+    pub opacity: f32,
+    /// Unscrolled bounds in document coordinates.
+    pub bounds: Rect,
+    /// Scroll offset applied by this layer.
+    pub scroll: (f32, f32),
+    /// Affine `[a, b, c, d, e, f]` mapping local pixels to document pixels.
+    pub transform: [f32; 6],
+}
+
+impl LayerComposite {
+    /// Snapshots a layer's current composite state.
+    pub fn from_layer(layer: &Layer) -> Self {
+        Self {
+            id: layer.id,
+            z_index: layer.z_index,
+            opacity: layer.opacity,
+            bounds: layer.bounds,
+            scroll: layer.scroll,
+            transform: [
+                1.0,
+                0.0,
+                0.0,
+                1.0,
+                layer.bounds.x - layer.scroll.0,
+                layer.bounds.y - layer.scroll.1,
+            ],
+        }
+    }
+
+    /// Maps a local point into document coordinates.
+    pub fn map_point(&self, x: f32, y: f32) -> (f32, f32) {
+        let t = &self.transform;
+        (t[0] * x + t[2] * y + t[4], t[1] * x + t[3] * y + t[5])
+    }
+
+    /// Bounds after applying the layer's scroll offset.
+    pub fn visible_bounds(&self) -> Rect {
+        Rect::new(
+            self.bounds.x - self.scroll.0,
+            self.bounds.y - self.scroll.1,
+            self.bounds.width,
+            self.bounds.height,
+        )
+    }
+}
+
 /// The compositor layer tree.
 #[derive(Debug, Clone, Default)]
 pub struct LayerTree {
@@ -151,6 +210,17 @@ impl LayerTree {
     pub fn tile_count(&self) -> usize {
         self.layers.iter().map(|l| l.tiles.len()).sum()
     }
+
+    /// Snapshots every layer in back-to-front paint order.
+    ///
+    /// Layers are sorted by `z_index` and then by id, so a backend can feed the
+    /// result straight into a multi-layer compositor.
+    pub fn composite_layers(&self) -> Vec<LayerComposite> {
+        let mut layers: Vec<LayerComposite> =
+            self.layers.iter().map(LayerComposite::from_layer).collect();
+        layers.sort_by_key(|layer| (layer.z_index, layer.id.0));
+        layers
+    }
 }
 
 #[cfg(test)]
@@ -192,6 +262,35 @@ mod tests {
         assert_eq!(layers.layers().len(), 1);
         assert!(layers.tile_count() > 0);
         assert!(layers.has_damage());
+    }
+
+    #[test]
+    fn composite_snapshots_follow_stacking_order_and_transform() {
+        let layout = tree();
+        let mut layers = LayerTree::build(
+            &layout,
+            Size {
+                width: 100.0,
+                height: 100.0,
+            },
+        );
+        // Give the root a scroll offset and a z-index to verify the snapshot.
+        let root = &mut layers.layers_mut()[0];
+        root.scroll = (5.0, 7.0);
+        root.z_index = 2;
+        root.opacity = 0.75;
+        let snapshots = layers.composite_layers();
+        assert_eq!(snapshots.len(), layers.layers().len());
+        let first = &snapshots[0];
+        assert_eq!(first.id, layers.layers()[0].id);
+        assert_eq!(first.z_index, 2);
+        assert!((first.opacity - 0.75).abs() < f32::EPSILON);
+        let bounds = layers.layers()[0].bounds;
+        assert_eq!(
+            first.map_point(3.0, 4.0),
+            (bounds.x - 5.0 + 3.0, bounds.y - 7.0 + 4.0)
+        );
+        assert_eq!(first.visible_bounds().x, bounds.x - 5.0);
     }
 
     #[test]

@@ -8,6 +8,11 @@ use browser_js::{JsError, Runtime, Value};
 
 use crate::HostState;
 use crate::form::FormSubmission;
+use crate::observers::Mutation;
+
+fn record_mutation(state: &Rc<RefCell<HostState>>, mutation: Mutation) {
+    crate::observers::record_mutation(state, mutation);
+}
 
 /// Reads the hidden node id of a wrapper object.
 pub fn node_id_of(runtime: &mut Runtime, value: &Value) -> Option<NodeId> {
@@ -91,7 +96,9 @@ fn define_element_members(runtime: &mut Runtime, state: &Rc<RefCell<HostState>>,
             let name = args[0].to_string_value();
             let value = args[1].to_string_value();
             let document = document_of(&state);
+            let old_value = document.borrow().attr(node, &name).map(str::to_owned);
             document.borrow_mut().set_attr(node, &name, &value);
+            record_mutation(&state, Mutation::attributes(node, name, old_value));
             Ok(Value::Undefined)
         })
     });
@@ -105,7 +112,9 @@ fn define_element_members(runtime: &mut Runtime, state: &Rc<RefCell<HostState>>,
                 .map(Value::to_string_value)
                 .ok_or_else(|| JsError::type_error("removeAttribute needs a name"))?;
             let document = document_of(&state);
+            let old_value = document.borrow().attr(node, &name).map(str::to_owned);
             document.borrow_mut().remove_attr(node, &name);
+            record_mutation(&state, Mutation::attributes(node, name, old_value));
             Ok(Value::Undefined)
         })
     });
@@ -133,9 +142,14 @@ fn define_element_members(runtime: &mut Runtime, state: &Rc<RefCell<HostState>>,
                 .ok_or_else(|| JsError::type_error("appendChild needs a node"))
                 .and_then(|v| require_node(runtime, v))?;
             let document = document_of(&state);
+            let previous = document.borrow().last_child(parent);
             if !document.borrow_mut().append_child(parent, child) {
                 return Err(JsError::new("appendChild failed (cycle or unknown node)"));
             }
+            record_mutation(
+                &state,
+                Mutation::child_list(parent, vec![child], Vec::new(), previous, None),
+            );
             Ok(args[0].clone())
         })
     });
@@ -149,9 +163,20 @@ fn define_element_members(runtime: &mut Runtime, state: &Rc<RefCell<HostState>>,
                 .ok_or_else(|| JsError::type_error("removeChild needs a node"))
                 .and_then(|v| require_node(runtime, v))?;
             let document = document_of(&state);
+            let siblings = {
+                let document = document.borrow();
+                (
+                    document.previous_sibling(child),
+                    document.next_sibling(child),
+                )
+            };
             if !document.borrow_mut().remove_child(parent, child) {
                 return Err(JsError::new("removeChild failed"));
             }
+            record_mutation(
+                &state,
+                Mutation::child_list(parent, Vec::new(), vec![child], siblings.0, siblings.1),
+            );
             Ok(Value::Null)
         })
     });
@@ -166,12 +191,23 @@ fn define_element_members(runtime: &mut Runtime, state: &Rc<RefCell<HostState>>,
             let new_node = require_node(runtime, &args[0])?;
             let reference = require_node(runtime, &args[1])?;
             let document = document_of(&state);
+            let previous = document.borrow().previous_sibling(reference);
             if !document
                 .borrow_mut()
                 .insert_before(parent, new_node, reference)
             {
                 return Err(JsError::new("insertBefore failed"));
             }
+            record_mutation(
+                &state,
+                Mutation::child_list(
+                    parent,
+                    vec![new_node],
+                    Vec::new(),
+                    previous,
+                    Some(reference),
+                ),
+            );
             Ok(args[0].clone())
         })
     });
@@ -380,7 +416,9 @@ fn install_accessors(runtime: &mut Runtime, state: &Rc<RefCell<HostState>>, obje
                 let node = require_node(runtime, &this)?;
                 let value = args.first().map(Value::to_string_value).unwrap_or_default();
                 let document = document_of(&state);
+                let old_value = document.borrow().attr(node, "id").map(str::to_owned);
                 document.borrow_mut().set_attr(node, "id", &value);
+                record_mutation(&state, Mutation::attributes(node, "id", old_value));
                 Ok(Value::Undefined)
             })
         },
@@ -407,7 +445,9 @@ fn install_accessors(runtime: &mut Runtime, state: &Rc<RefCell<HostState>>, obje
                 let node = require_node(runtime, &this)?;
                 let value = args.first().map(Value::to_string_value).unwrap_or_default();
                 let document = document_of(&state);
+                let old_value = document.borrow().attr(node, "class").map(str::to_owned);
                 document.borrow_mut().set_attr(node, "class", &value);
+                record_mutation(&state, Mutation::attributes(node, "class", old_value));
                 Ok(Value::Undefined)
             })
         },
@@ -431,7 +471,13 @@ fn install_accessors(runtime: &mut Runtime, state: &Rc<RefCell<HostState>>, obje
                 let node = require_node(runtime, &this)?;
                 let text = args.first().map(Value::to_string_value).unwrap_or_default();
                 let document = document_of(&state);
+                let removed = document.borrow().children(node).to_vec();
                 document.borrow_mut().set_text_content(node, &text);
+                let added = document.borrow().children(node).to_vec();
+                record_mutation(
+                    &state,
+                    Mutation::child_list(node, added, removed, None, None),
+                );
                 Ok(Value::Undefined)
             })
         },
@@ -458,17 +504,23 @@ fn install_accessors(runtime: &mut Runtime, state: &Rc<RefCell<HostState>>, obje
                 let node = require_node(runtime, &this)?;
                 let html = args.first().map(Value::to_string_value).unwrap_or_default();
                 let document = document_of(&state);
-                {
+                let (removed, added) = {
                     let mut document = document.borrow_mut();
+                    let removed = document.children(node).to_vec();
                     let fragment = browser_html_parser::parse_fragment(&mut document, node, &html);
                     let children: Vec<NodeId> = document.children(node).to_vec();
                     for child in children {
                         document.remove_child(node, child);
                     }
-                    for child in fragment {
-                        document.append_child(node, child);
+                    for child in &fragment {
+                        document.append_child(node, *child);
                     }
-                }
+                    (removed, fragment)
+                };
+                record_mutation(
+                    &state,
+                    Mutation::child_list(node, added, removed, None, None),
+                );
                 Ok(Value::Undefined)
             })
         },
@@ -495,7 +547,9 @@ fn install_accessors(runtime: &mut Runtime, state: &Rc<RefCell<HostState>>, obje
                 let node = require_node(runtime, &this)?;
                 let value = args.first().map(Value::to_string_value).unwrap_or_default();
                 let document = document_of(&state);
+                let old_value = document.borrow().attr(node, "value").map(str::to_owned);
                 document.borrow_mut().set_attr(node, "value", &value);
+                record_mutation(&state, Mutation::attributes(node, "value", old_value));
                 Ok(Value::Undefined)
             })
         },
@@ -518,11 +572,16 @@ fn install_accessors(runtime: &mut Runtime, state: &Rc<RefCell<HostState>>, obje
                 let node = require_node(runtime, &this)?;
                 let checked = args.first().is_some_and(Value::is_truthy);
                 let document = document_of(&state);
+                let old_value = document
+                    .borrow()
+                    .has_attr(node, "checked")
+                    .then(String::new);
                 if checked {
                     document.borrow_mut().set_attr(node, "checked", "");
                 } else {
                     document.borrow_mut().remove_attr(node, "checked");
                 }
+                record_mutation(&state, Mutation::attributes(node, "checked", old_value));
                 Ok(Value::Undefined)
             })
         },
@@ -545,11 +604,16 @@ fn install_accessors(runtime: &mut Runtime, state: &Rc<RefCell<HostState>>, obje
                 let node = require_node(runtime, &this)?;
                 let disabled = args.first().is_some_and(Value::is_truthy);
                 let document = document_of(&state);
+                let old_value = document
+                    .borrow()
+                    .has_attr(node, "disabled")
+                    .then(String::new);
                 if disabled {
                     document.borrow_mut().set_attr(node, "disabled", "");
                 } else {
                     document.borrow_mut().remove_attr(node, "disabled");
                 }
+                record_mutation(&state, Mutation::attributes(node, "disabled", old_value));
                 Ok(Value::Undefined)
             })
         },

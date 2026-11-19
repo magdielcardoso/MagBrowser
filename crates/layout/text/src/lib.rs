@@ -1,8 +1,10 @@
 //! Font metrics, text rasterisation, shaping and line breaking.
 //!
 //! The text layer ships an embedded, open-licensed Inter outline face (SIL OFL
-//! 1.1) with proportional advances. Glyphs are anti-aliased by the in-engine
-//! rasterizer, so both page text and window chrome are smooth at any size.
+//! 1.1) with proportional advances, GPOS pair kerning and GSUB ligatures.
+//! Glyphs are anti-aliased by the in-engine rasterizer, so both page text and
+//! window chrome are smooth at any size. [`shape`] and [`Font::measure`] share
+//! one layout engine, so the measured width always matches the positioned run.
 //!
 //! ```
 //! use browser_text::{Font, line_break, shape, rasterize_cached};

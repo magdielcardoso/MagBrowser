@@ -40,6 +40,47 @@ pub fn build_with_images(layout: &LayoutTree, images: &HashMap<NodeId, ImageData
     list
 }
 
+/// Builds the standard display list together with the extended effect commands
+/// ([`crate::effects::EffectsList`]) for a laid-out page.
+///
+/// This is the bridge for callers that need mask / clip-path / blend / gradient
+/// effects: the regular list stays executable by the current rasterizer while the
+/// effects list holds data the raster/compositor owner can execute (see the
+/// integration notes at the top of [`crate::effects`]). Raw declaration strings for
+/// properties `browser_style` does not model yet can be supplied via `raw`.
+pub fn build_with_effects(
+    layout: &LayoutTree,
+    images: &HashMap<NodeId, ImageData>,
+    raw: &HashMap<NodeId, crate::effects::RawEffects>,
+) -> (DisplayList, crate::effects::EffectsList) {
+    (
+        build_with_images(layout, images),
+        crate::effects::build_effects_with(layout, raw),
+    )
+}
+
+/// Paints one box (and its descendants) into a fresh display list.
+///
+/// Used by [`crate::effects`] to capture the content a mask, clip or blend group
+/// applies to. Uses no decoded images; callers that need `<img>` pixels should build
+/// the main display list with [`build_with_images`] instead.
+#[doc(hidden)]
+pub fn paint_box_commands(layout: &LayoutTree, index: usize, dx: f32, dy: f32) -> DisplayList {
+    let mut list = DisplayList::new();
+    let images = HashMap::new();
+    let mut image_indices = HashMap::new();
+    paint_box_content(
+        layout,
+        index,
+        &mut list,
+        dx,
+        dy,
+        &images,
+        &mut image_indices,
+    );
+    list
+}
+
 /// Key for the process-wide inline-SVG rasterization cache.
 ///
 /// `crate::rasterize` derives the output entirely from the serialized source,
@@ -564,7 +605,10 @@ fn split_top_level(input: &str) -> Vec<&str> {
 }
 
 /// Parses a CSS gradient angle, including `to <side>` keywords.
-fn parse_angle(input: &str) -> Option<f32> {
+///
+/// Kept crate-visible so the conic-gradient parser in [`crate::effects`] can share
+/// the same angle semantics as linear gradients.
+pub(crate) fn parse_angle(input: &str) -> Option<f32> {
     let lower = input.trim().to_ascii_lowercase();
     if let Some(direction) = lower.strip_prefix("to ") {
         let words: Vec<&str> = direction.split_whitespace().collect();
@@ -857,6 +901,9 @@ mod tests {
                         "linear-gradient(to right, red, blue)".to_string(),
                     ),
                 );
+                // Keep this paint-side test independent of how layout resolves
+                // an explicit CSS height (which has changed across engines).
+                b.rect = Rect::new(0.0, 0.0, 40.0, 40.0);
             }
         }
         let list = build(&tree);
@@ -865,6 +912,111 @@ mod tests {
                 .iter()
                 .any(|command| matches!(command, DisplayCommand::DrawLinearGradient { .. })),
             "expected a DrawLinearGradient command"
+        );
+    }
+
+    #[test]
+    fn radial_and_conic_background_emit_effect_commands() {
+        let mut tree = page("body { margin: 0; width: 40px; height: 40px; }", "");
+        for b in &mut tree.boxes {
+            if b.node.is_some() {
+                b.style.set(
+                    browser_style::Property::BackgroundImage,
+                    browser_style::ComputedValue::Str(
+                        "radial-gradient(circle, red, blue)".to_string(),
+                    ),
+                );
+            }
+        }
+        let effects = crate::effects::build_effects(&tree);
+        assert!(
+            effects.commands.iter().any(|command| matches!(
+                command,
+                crate::effects::ExtendedCommand::DrawRadialGradient { .. }
+            )),
+            "expected a DrawRadialGradient effect command"
+        );
+
+        for b in &mut tree.boxes {
+            if b.node.is_some() {
+                b.style.set(
+                    browser_style::Property::BackgroundImage,
+                    browser_style::ComputedValue::Str(
+                        "conic-gradient(from 45deg, red, blue)".to_string(),
+                    ),
+                );
+            }
+        }
+        let effects = crate::effects::build_effects(&tree);
+        assert!(
+            effects.commands.iter().any(|command| matches!(
+                command,
+                crate::effects::ExtendedCommand::DrawConicGradient { .. }
+            )),
+            "expected a DrawConicGradient effect command"
+        );
+    }
+
+    #[test]
+    fn raw_effects_emit_mask_clip_and_blend_commands() {
+        let tree = page("body { margin: 0; width: 40px; height: 40px; }", "x");
+        let node = tree
+            .boxes
+            .iter()
+            .find_map(|b| b.node)
+            .expect("body box has a node");
+        let mut raw = HashMap::new();
+        raw.insert(
+            node,
+            crate::effects::RawEffects {
+                mask_image: Some("linear-gradient(to right, white, transparent)".to_string()),
+                clip_path: Some("inset(10px)".to_string()),
+                mix_blend_mode: Some("multiply".to_string()),
+                backdrop_filter: Some("blur(4px)".to_string()),
+                border_image: Some("url(b.png) 30 / 10px".to_string()),
+                outline: Some("2px solid red".to_string()),
+                outline_offset: Some("3px".to_string()),
+                image_rendering: None,
+                webkit_mask_image: None,
+                mask_luminance: false,
+            },
+        );
+        let (list, effects) = build_with_effects(&tree, &HashMap::new(), &raw);
+        assert!(!list.commands.is_empty());
+        assert!(
+            effects.commands.iter().any(|command| matches!(
+                command,
+                crate::effects::ExtendedCommand::DrawMasked { .. }
+            )),
+            "expected a mask command"
+        );
+        assert!(
+            effects.commands.iter().any(|command| matches!(
+                command,
+                crate::effects::ExtendedCommand::DrawClipped { .. }
+            )),
+            "expected a clip-path command"
+        );
+        assert!(
+            effects.commands.iter().any(|command| matches!(
+                command,
+                crate::effects::ExtendedCommand::DrawBlended { .. }
+            )),
+            "expected a blend command"
+        );
+        assert!(
+            effects.commands.iter().any(|command| matches!(
+                command,
+                crate::effects::ExtendedCommand::DrawBorderImage { .. }
+            )),
+            "expected a border-image command"
+        );
+        assert!(
+            effects.commands.iter().any(|command| matches!(
+                command,
+                crate::effects::ExtendedCommand::DrawOutline { .. }
+            )),
+            "expected an outline command"
         );
     }
 

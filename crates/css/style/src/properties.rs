@@ -189,6 +189,28 @@ pub enum Property {
     Filter,
     /// `text-shadow` (a comma-separated list of shadow layers).
     TextShadow,
+    /// `margin-inline-start`
+    MarginInlineStart,
+    /// `margin-inline-end`
+    MarginInlineEnd,
+    /// `padding-inline-start`
+    PaddingInlineStart,
+    /// `padding-inline-end`
+    PaddingInlineEnd,
+    /// `border-inline-start-width`
+    BorderInlineStartWidth,
+    /// `border-inline-end-width`
+    BorderInlineEndWidth,
+    /// `inset-inline-start`
+    InsetInlineStart,
+    /// `inset-inline-end`
+    InsetInlineEnd,
+    /// `inline-size`
+    InlineSize,
+    /// `block-size`
+    BlockSize,
+    /// `scrollbar-width`
+    ScrollbarWidth,
 }
 
 impl Property {
@@ -283,6 +305,17 @@ impl Property {
         Property::ObjectFit,
         Property::Filter,
         Property::TextShadow,
+        Property::MarginInlineStart,
+        Property::MarginInlineEnd,
+        Property::PaddingInlineStart,
+        Property::PaddingInlineEnd,
+        Property::BorderInlineStartWidth,
+        Property::BorderInlineEndWidth,
+        Property::InsetInlineStart,
+        Property::InsetInlineEnd,
+        Property::InlineSize,
+        Property::BlockSize,
+        Property::ScrollbarWidth,
     ];
 
     /// The CSS name of the property.
@@ -377,6 +410,17 @@ impl Property {
             Property::ObjectFit => "object-fit",
             Property::Filter => "filter",
             Property::TextShadow => "text-shadow",
+            Property::MarginInlineStart => "margin-inline-start",
+            Property::MarginInlineEnd => "margin-inline-end",
+            Property::PaddingInlineStart => "padding-inline-start",
+            Property::PaddingInlineEnd => "padding-inline-end",
+            Property::BorderInlineStartWidth => "border-inline-start-width",
+            Property::BorderInlineEndWidth => "border-inline-end-width",
+            Property::InsetInlineStart => "inset-inline-start",
+            Property::InsetInlineEnd => "inset-inline-end",
+            Property::InlineSize => "inline-size",
+            Property::BlockSize => "block-size",
+            Property::ScrollbarWidth => "scrollbar-width",
         }
     }
 
@@ -499,6 +543,17 @@ pub fn initial_value(property: Property) -> Option<ComputedValue> {
         Property::Direction => ComputedValue::keyword("ltr"),
         Property::BorderRadius => ComputedValue::BorderRadius(BorderRadius::default()),
         Property::BoxShadow | Property::TextShadow => ComputedValue::Shadows(ShadowList::default()),
+        Property::MarginInlineStart
+        | Property::MarginInlineEnd
+        | Property::PaddingInlineStart
+        | Property::PaddingInlineEnd
+        | Property::BorderInlineStartWidth
+        | Property::BorderInlineEndWidth
+        | Property::InsetInlineStart
+        | Property::InsetInlineEnd
+        | Property::InlineSize
+        | Property::BlockSize
+        | Property::ScrollbarWidth => ComputedValue::keyword("auto"),
         Property::Transform => ComputedValue::Transform(TransformList::default()),
         Property::AspectRatio => ComputedValue::AspectRatio(AspectRatio::Auto),
         Property::ObjectFit => ComputedValue::ObjectFit(ObjectFit::default()),

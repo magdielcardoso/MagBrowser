@@ -5,7 +5,7 @@ use std::rc::Rc;
 use browser_js_parser::Stmt;
 
 use crate::errors::JsError;
-use crate::object::{BuiltinFn, HostFunction, ObjectKind};
+use crate::object::{BuiltinFn, HostFunction, ObjectKind, SYMBOL_ASYNC_ITERATOR_KEY};
 use crate::scope::{BindingKind, ScopeId};
 use crate::value::{ObjectId, Value};
 
@@ -105,12 +105,18 @@ impl crate::Runtime {
         }
     }
 
-    /// Whether a value can be called.
+    /// Whether a value can be called. Proxies over callables are callable too.
     pub(crate) fn is_callable(&self, value: &Value) -> bool {
         match value {
-            Value::Object(id) => self
-                .object(*id)
-                .is_some_and(|object| matches!(&object.kind, ObjectKind::Function(_))),
+            Value::Object(id) => self.object_is_callable(*id),
+            _ => false,
+        }
+    }
+
+    fn object_is_callable(&self, id: ObjectId) -> bool {
+        match self.object(id).map(|object| &object.kind) {
+            Some(ObjectKind::Function(_)) => true,
+            Some(ObjectKind::Proxy { target, .. }) => self.is_callable(target),
             _ => false,
         }
     }
@@ -122,6 +128,15 @@ impl crate::Runtime {
         this: Value,
         args: Vec<Value>,
     ) -> Result<Value, JsError> {
+        // A proxy over a callable dispatches to its `apply` trap when present,
+        // otherwise the call is forwarded to the target.
+        if let Some((target, handler)) = self.as_proxy(callee) {
+            if let Some(trap) = self.proxy_trap(&handler, "apply") {
+                let arguments = self.new_array(args);
+                return self.call_function(&trap, handler, vec![target, this, arguments]);
+            }
+            return self.call_function(&target, this, args);
+        }
         let Value::Object(id) = callee else {
             return Err(JsError::type_error(format!(
                 "{} is not a function",
@@ -151,6 +166,44 @@ impl crate::Runtime {
                 error.ensure_stack(&self.call_stack);
                 Err(error)
             }
+        }
+    }
+
+    /// Internal `[[Construct]]` used by both `new` and `Reflect.construct`.
+    /// Proxies may redirect construction through their `construct` trap.
+    pub(crate) fn construct_value(
+        &mut self,
+        constructor: Value,
+        args: Vec<Value>,
+        new_target: Value,
+    ) -> Result<Value, JsError> {
+        if let Some((target, handler)) = self.as_proxy(&constructor) {
+            if let Some(trap) = self.proxy_trap(&handler, "construct") {
+                let arguments = self.new_array(args);
+                return self.call_function(&trap, handler, vec![target, arguments, new_target]);
+            }
+            return self.construct_value(target, args, new_target);
+        }
+        if !self.is_callable(&constructor) {
+            return Err(JsError::type_error(format!(
+                "{} is not a constructor",
+                constructor.to_string_value()
+            )));
+        }
+        let prototype = match self.get_property_checked(&new_target, "prototype")? {
+            Value::Object(id) => Some(id),
+            _ => Some(self.prototypes.object),
+        };
+        let instance = Value::Object(self.alloc_object(ObjectKind::Ordinary, prototype));
+        let mark = self.temp_roots.len();
+        self.temp_roots.push(instance.clone());
+        let result = self.call_function(&constructor, instance.clone(), args);
+        self.temp_roots.truncate(mark);
+        let result = result?;
+        if matches!(result, Value::Object(_)) {
+            Ok(result)
+        } else {
+            Ok(instance)
         }
     }
 
@@ -301,6 +354,16 @@ impl crate::Runtime {
                 let generator = Value::Object(
                     self.alloc_object(ObjectKind::Generator(frame), Some(self.generator_prototype)),
                 );
+                if function.is_async {
+                    let method = self.new_builtin_value(
+                        "[Symbol.asyncIterator]",
+                        0,
+                        crate::builtins::generator_self_iterator,
+                    );
+                    if let Value::Object(generator_id) = &generator {
+                        self.define_data_property(*generator_id, SYMBOL_ASYNC_ITERATOR_KEY, method);
+                    }
+                }
                 self.gc_scope_roots.pop();
                 return Ok(generator);
             }

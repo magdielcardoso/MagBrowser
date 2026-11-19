@@ -26,6 +26,7 @@
 
 pub mod cascade;
 pub mod computed;
+pub mod conditions;
 pub mod inheritance;
 pub mod interpret;
 pub mod media_queries;
@@ -34,6 +35,7 @@ pub mod specificity;
 pub mod ua;
 pub mod variables;
 
+mod nesting;
 mod selector_index;
 
 use std::collections::{HashMap, HashSet};
@@ -44,7 +46,9 @@ use browser_css::{
 use browser_dom::{Document, NodeId};
 use browser_selectors::{ElementState, PseudoElement, Selector, Specificity};
 
+use cascade::{NO_SCOPE, UNLAYERED, pack_order};
 use selector_index::{NodeKeys, RuleKind, SelectorIndex};
+use variables::{PropertyRegistry, substitute_with_registry};
 
 pub use browser_css::{Color, Origin};
 pub use cascade::Candidate;
@@ -55,6 +59,7 @@ pub use computed::{
     TextDecoration, TransformFunction, TransformList, Visibility, WhiteSpace,
     border_width_property, margin_property, padding_property,
 };
+pub use conditions::{ContainerContext, ContainerSize};
 pub use media_queries::{MediaContext, media_matches};
 pub use properties::Property;
 
@@ -176,6 +181,8 @@ pub struct StyledTree {
     /// Unsupported declarations found while computing this tree, in source
     /// order. Exposed as visible diagnostics (see [`Self::unsupported_declarations`]).
     unsupported: Vec<UnsupportedDeclaration>,
+    /// `@property` registrations used for typed custom-property fallbacks.
+    property_registry: PropertyRegistry,
     /// Font size of the root element, used for `rem`.
     pub root_font_size: f32,
 }
@@ -188,6 +195,7 @@ impl StyledTree {
             customs: HashMap::new(),
             pseudos: HashMap::new(),
             unsupported: Vec::new(),
+            property_registry: PropertyRegistry::new(),
             root_font_size: 16.0,
         }
     }
@@ -283,7 +291,7 @@ struct CustomDeclaration {
 }
 
 impl CustomDeclaration {
-    fn weight(&self) -> (u8, u8, u8, u32, u32, u32, usize) {
+    fn weight(&self) -> (u8, u8, u8, u32, u32, u32, u32, u32, usize) {
         Candidate {
             property: Property::Color,
             value: self.value.clone(),
@@ -329,10 +337,11 @@ fn expand_pending(
     tree: &mut StyledTree,
     candidates: &mut Vec<Candidate>,
 ) {
+    let registry = tree.property_registry.clone();
     candidates.clear();
     for entry in pending.drain(..) {
         let value = if has_unresolved_var(&entry.declaration.value) {
-            match variables::substitute(&entry.declaration.value, customs) {
+            match substitute_with_registry(&entry.declaration.value, customs, &registry) {
                 Some(value) => value,
                 None => {
                     tree.unsupported.push(UnsupportedDeclaration {
@@ -381,6 +390,8 @@ pub struct StyleEngine {
     diagnostics: Vec<ParseDiagnostic>,
     /// Selectors parsed once and indexed for fast rule matching.
     index: SelectorIndex,
+    /// Custom properties registered with `@property`.
+    property_registry: PropertyRegistry,
 }
 
 impl StyleEngine {
@@ -398,12 +409,16 @@ impl StyleEngine {
             imported_urls: HashSet::new(),
             diagnostics: Vec::new(),
             index,
+            property_registry: PropertyRegistry::new(),
         }
     }
 
-    /// Rebuilds the selector index after stylesheets change.
+    /// Rebuilds the selector index and the `@property` registry after
+    /// stylesheets change.
     fn rebuild_index(&mut self) {
         self.index = SelectorIndex::build(&self.user_agent, &self.user, &self.author);
+        self.property_registry =
+            collect_property_registrations(&self.user_agent, &self.user, &self.author);
     }
 
     /// Updates the viewport used for media queries and viewport units.
@@ -481,7 +496,11 @@ impl StyleEngine {
             return Vec::new();
         }
 
-        let sheet = Stylesheet::parse(css, origin);
+        // Flatten CSS nesting before handing the text to the parser, which
+        // only understands flat style rules. Returns `css` unchanged when no
+        // nested rule is present, so existing cascades stay byte-identical.
+        let flattened = nesting::flatten(css);
+        let sheet = Stylesheet::parse(&flattened, origin);
         let mut requests = Vec::new();
         let mut seen = HashSet::new();
         Self::collect_imports(
@@ -576,9 +595,26 @@ impl StyleEngine {
         doc: &Document,
         states: &HashMap<NodeId, ElementState>,
     ) -> StyledTree {
+        self.compute_with_container(doc, states, &HashMap::new())
+    }
+
+    /// Computes styles with an explicit container-size context.
+    ///
+    /// `containers` maps an element to the query container it should be
+    /// evaluated against. Elements without an entry use a context whose
+    /// unnamed size is the engine's viewport; named containers can be added
+    /// with [`ContainerContext::with_named`]. This is what makes `@container`
+    /// rules match during the cascade.
+    pub fn compute_with_container(
+        &self,
+        doc: &Document,
+        states: &HashMap<NodeId, ElementState>,
+        containers: &HashMap<NodeId, ContainerContext>,
+    ) -> StyledTree {
         let mut tree = StyledTree::new();
-        // At-rules the cascade ignores are recorded as visible diagnostics (not
-        // silently dropped) so callers can surface them in a DevTools console.
+        tree.property_registry = self.property_registry.clone();
+        // Modern at-rules are recorded as visible compatibility diagnostics
+        // (not silently dropped) so callers can surface them in DevTools.
         for sheets in [
             std::slice::from_ref(&self.user_agent),
             self.user.as_slice(),
@@ -620,6 +656,12 @@ impl StyleEngine {
                 .unwrap_or_default();
             let state = states.get(&node).unwrap_or(&default_state);
             let keys = NodeKeys::new(doc, node);
+            let container_ctx = containers.get(&node).cloned().unwrap_or_else(|| {
+                ContainerContext::new(ContainerSize {
+                    width: self.viewport.width,
+                    height: self.viewport.height,
+                })
+            });
 
             pending.clear();
             custom_decls.clear();
@@ -627,10 +669,22 @@ impl StyleEngine {
             // Only rules whose right-hand compound could match this element
             // are considered, and they are visited in source order so `order`
             // matches the naive full scan exactly.
-            self.index
-                .lookup(RuleKind::Normal, &keys, &media_ok, &mut candidates);
+            self.index.lookup(
+                RuleKind::Normal,
+                &keys,
+                &media_ok,
+                &container_ctx,
+                &mut candidates,
+            );
             for &index in &candidates {
                 let rule = self.index.rule(index);
+                let proximity = match &rule.scope {
+                    Some(scope) => match scope.proximity(doc, node, state) {
+                        Some(proximity) => proximity,
+                        None => continue,
+                    },
+                    None => NO_SCOPE,
+                };
                 if !selector_matches(doc, node, &rule.selector, state) {
                     continue;
                 }
@@ -643,7 +697,7 @@ impl StyleEngine {
                         false,
                         &mut pending,
                         &mut custom_decls,
-                        order,
+                        pack_order(order, rule.layer, proximity),
                     );
                 }
             }
@@ -665,7 +719,7 @@ impl StyleEngine {
                         false,
                         &mut pending,
                         &mut custom_decls,
-                        order,
+                        pack_order(order, UNLAYERED, NO_SCOPE),
                     );
                 }
             }
@@ -682,7 +736,7 @@ impl StyleEngine {
                         true,
                         &mut pending,
                         &mut custom_decls,
-                        order,
+                        pack_order(order, UNLAYERED, NO_SCOPE),
                     );
                 }
             }
@@ -699,7 +753,9 @@ impl StyleEngine {
                 }
             }
             for (name, declaration) in custom_winners {
-                if let Some(value) = variables::substitute(&declaration.value, &customs) {
+                if let Some(value) =
+                    substitute_with_registry(&declaration.value, &customs, &tree.property_registry)
+                {
                     customs.insert(name, value);
                 }
             }
@@ -730,6 +786,7 @@ impl StyleEngine {
                     kind,
                     &keys,
                     &media_ok,
+                    &container_ctx,
                     state,
                     &mut pseudo_candidates,
                 ) else {
@@ -796,11 +853,12 @@ impl StyleEngine {
         kind: RuleKind,
         keys: &NodeKeys<'_>,
         media_ok: &[bool],
+        containers: &ContainerContext,
         state: &ElementState,
         out: &mut Vec<usize>,
     ) -> Option<PseudoElement> {
         self.index
-            .pseudo_element_for(kind, doc, node, keys, media_ok, state, out)
+            .pseudo_element_for(kind, doc, node, keys, media_ok, containers, state, out)
     }
 
     /// Computes the style of a generated text box, inheriting from its host
@@ -845,8 +903,9 @@ impl StyleEngine {
                 }
             }
         }
+        let registry = tree.property_registry.clone();
         for (name, declaration) in custom_winners {
-            if let Some(value) = variables::substitute(&declaration.value, &customs) {
+            if let Some(value) = substitute_with_registry(&declaration.value, &customs, &registry) {
                 customs.insert(name, value);
             }
         }
@@ -878,12 +937,17 @@ impl StyleEngine {
             _ => return Vec::new(),
         };
         let mut out = Vec::new();
+        let containers = ContainerContext::new(ContainerSize {
+            width: self.viewport.width,
+            height: self.viewport.height,
+        });
         self.pseudo_element_for(
             doc,
             node,
             kind,
             &keys,
             &media_ok,
+            &containers,
             &ElementState::default(),
             &mut out,
         )
@@ -940,6 +1004,7 @@ impl StyleEngine {
     ) -> ComputedStyle {
         let mut style = ComputedStyle::default();
         let parent_font_size = parent.font_size();
+        let registry = tree.property_registry.clone();
 
         let base_ctx = interpret::InterpretContext {
             font_size: parent_font_size,
@@ -956,7 +1021,7 @@ impl StyleEngine {
             .cloned();
         let font_size = match font_size_winner {
             Some(candidate) => {
-                let value = variables::substitute(&candidate.value, customs)
+                let value = substitute_with_registry(&candidate.value, customs, &registry)
                     .unwrap_or_else(|| candidate.value.clone());
                 match inheritance::WideKeyword::detect(&value) {
                     Some(keyword) => {
@@ -979,7 +1044,7 @@ impl StyleEngine {
             if winner.property == Property::FontSize {
                 continue;
             }
-            let value = match variables::substitute(&winner.value, customs) {
+            let value = match substitute_with_registry(&winner.value, customs, &registry) {
                 Some(value) => value,
                 None => {
                     // An unresolved `var()` is the one declaration we cannot
@@ -994,21 +1059,33 @@ impl StyleEngine {
                     continue;
                 }
             };
-            let computed = match inheritance::WideKeyword::detect(&value) {
-                Some(keyword) => inheritance::apply_wide(keyword, winner.property, Some(parent)),
-                None => match value.ident() {
-                    // `interpret::interpret` predates the inline container
-                    // keywords and rejects them. Keep them verbatim so
-                    // `ComputedStyle::display()` can map them to the new
-                    // `Display::InlineFlex` / `Display::InlineGrid` variants.
-                    // Every other value follows the normal interpret path.
-                    Some(keyword @ ("inline-flex" | "inline-grid"))
-                        if winner.property == Property::Display =>
-                    {
-                        Some(ComputedValue::keyword(keyword))
+            // `env()`/`attr()` cannot be resolved into typed values here, but
+            // on properties that accept opaque text we keep the authored text
+            // as a string instead of dropping the declaration. Numeric/length
+            // contexts keep the historical "unsupported + diagnostic" path.
+            let opaque_function = is_opaque_text_property(winner.property)
+                && interpret::env_or_attr(&value).is_some();
+            let computed = if opaque_function {
+                interpret::env_or_attr(&value)
+            } else {
+                match inheritance::WideKeyword::detect(&value) {
+                    Some(keyword) => {
+                        inheritance::apply_wide(keyword, winner.property, Some(parent))
                     }
-                    _ => interpret::interpret(winner.property, &value, &ctx),
-                },
+                    None => match value.ident() {
+                        // `interpret::interpret` predates the inline container
+                        // keywords and rejects them. Keep them verbatim so
+                        // `ComputedStyle::display()` can map them to the new
+                        // `Display::InlineFlex` / `Display::InlineGrid` variants.
+                        // Every other value follows the normal interpret path.
+                        Some(keyword @ ("inline-flex" | "inline-grid"))
+                            if winner.property == Property::Display =>
+                        {
+                            Some(ComputedValue::keyword(keyword))
+                        }
+                        _ => interpret::interpret(winner.property, &value, &ctx),
+                    },
+                }
             };
             match computed {
                 Some(computed) => {
@@ -1016,7 +1093,10 @@ impl StyleEngine {
                     // when it contains syntax we cannot act on (for example a
                     // `min()` inside a grid track list). Surface it as a
                     // diagnostic rather than silently degrading the layout.
-                    if is_raw_text_property(winner.property) && value_has_unsupported_syntax(&value)
+                    // Gracefully kept `env()`/`attr()` strings are exempt.
+                    if !opaque_function
+                        && is_raw_text_property(winner.property)
+                        && value_has_unsupported_syntax(&value)
                     {
                         tree.unsupported.push(UnsupportedDeclaration {
                             node,
@@ -1295,12 +1375,67 @@ fn is_raw_text_property(property: Property) -> bool {
     )
 }
 
-/// Describes an at-rule the cascade ignores, if `rule` is one of them.
+/// Properties whose values can be kept as opaque strings when they contain an
+/// unresolvable `env()` or `attr()` call.
+fn is_opaque_text_property(property: Property) -> bool {
+    is_raw_text_property(property)
+        || matches!(property, Property::FontFamily | Property::ListStyleType)
+}
+
+/// Builds the `@property` registry from all of the engine's stylesheets.
+///
+/// Later registrations with the same name win, matching normal cascade order.
+fn collect_property_registrations(
+    user_agent: &Stylesheet,
+    user: &[Stylesheet],
+    author: &[Stylesheet],
+) -> PropertyRegistry {
+    fn visit(rules: &[Rule], registry: &mut PropertyRegistry) {
+        for rule in rules {
+            match rule {
+                Rule::Property(property) => {
+                    registry.insert(
+                        property.name.clone(),
+                        variables::PropertyRegistration {
+                            syntax: property.syntax.clone(),
+                            inherits: property.inherits.unwrap_or(false),
+                            initial_value: property.initial_value.clone(),
+                        },
+                    );
+                }
+                Rule::Media(rule) => visit(&rule.rules, registry),
+                Rule::Supports(rule) if conditions::supports_condition_matches(&rule.condition) => {
+                    visit(&rule.rules, registry)
+                }
+                Rule::Container(rule) => visit(&rule.rules, registry),
+                Rule::LayerBlock(rule) => visit(&rule.rules, registry),
+                Rule::Scope(rule) => visit(&rule.rules, registry),
+                Rule::StartingStyle(rule) => visit(&rule.rules, registry),
+                _ => {}
+            }
+        }
+    }
+
+    let mut registry = PropertyRegistry::new();
+    visit(&user_agent.rules, &mut registry);
+    for sheet in user {
+        visit(&sheet.rules, &mut registry);
+    }
+    for sheet in author {
+        visit(&sheet.rules, &mut registry);
+    }
+    registry
+}
+
+/// Describes an at-rule that is surfaced as a compatibility diagnostic.
+///
+/// Most of these are now evaluated by the cascade; the diagnostic is retained
+/// so existing callers that surface "modern at-rule seen" notices keep working.
 fn unsupported_at_rule(rule: &Rule) -> Option<(&'static str, String)> {
     match rule {
-        Rule::Supports(_) => Some(("@supports", "conditional rule ignored".to_string())),
-        Rule::Container(_) => Some(("@container", "container query ignored".to_string())),
-        Rule::LayerStatement(_) => Some(("@layer", "layer order ignored".to_string())),
+        Rule::Supports(_) => Some(("@supports", "conditional rule evaluated".to_string())),
+        Rule::Container(_) => Some(("@container", "container query evaluated".to_string())),
+        Rule::LayerStatement(_) => Some(("@layer", "layer order applied".to_string())),
         Rule::LayerBlock(layer) => Some((
             "@layer",
             layer
@@ -1308,7 +1443,7 @@ fn unsupported_at_rule(rule: &Rule) -> Option<(&'static str, String)> {
                 .clone()
                 .unwrap_or_else(|| "anonymous".to_string()),
         )),
-        Rule::Scope(_) => Some(("@scope", "scoped rule ignored".to_string())),
+        Rule::Scope(_) => Some(("@scope", "scoped rule applied".to_string())),
         Rule::StartingStyle(_) => Some((
             "@starting-style",
             "transition starting styles ignored".to_string(),
@@ -1318,8 +1453,9 @@ fn unsupported_at_rule(rule: &Rule) -> Option<(&'static str, String)> {
     }
 }
 
-/// Collects diagnostics for at-rules the cascade ignores, including ones
-/// nested inside supported (or unsupported) conditional groups.
+/// Collects compatibility diagnostics for modern at-rules, including ones
+/// nested inside conditional groups. `@starting-style` is the one rule in this
+/// set the normal computed-style cascade still ignores.
 fn collect_unsupported_at_rules(rules: &[Rule], out: &mut Vec<UnsupportedDeclaration>) {
     for rule in rules {
         if let Some((name, detail)) = unsupported_at_rule(rule) {
@@ -1736,6 +1872,23 @@ mod tests {
         let style = styled.get(p).unwrap();
         assert_eq!(style.font_size(), 13.0);
         assert_eq!(style.line_height(), LineHeight::Px(27.0));
+    }
+
+    #[test]
+    fn logical_and_scrollbar_properties_survive_compute() {
+        let (doc, _html, _body, p) = document();
+        let engine = engine_with(
+            "#target { margin-inline-start: 12px; inline-size: 200px; scrollbar-width: none; }",
+        );
+        let styled = engine.compute(&doc);
+        let style = styled.get(p).unwrap();
+        assert_eq!(
+            Property::from_name("margin-inline-start"),
+            Some(Property::MarginInlineStart)
+        );
+        assert!(style.get(Property::MarginInlineStart).is_some());
+        assert!(style.get(Property::InlineSize).is_some());
+        assert!(style.get(Property::ScrollbarWidth).is_some());
     }
 
     #[test]
@@ -2480,5 +2633,236 @@ mod tests {
             let reference = naive_compute(&engine, &doc, &states);
             assert_eq!(dump_styled(&fast), dump_styled(&reference));
         }
+    }
+
+    // ---- Conditional at-rule evaluation ---------------------------------
+
+    #[test]
+    fn supports_includes_matching_rules_and_excludes_unsupported_ones() {
+        let (doc, _html, _body, p) = document();
+        let engine = engine_with(
+            "p { color: black; } \
+             @supports (display: grid) { p { color: red; } } \
+             @supports (not-a-property: value) { p { color: blue; } } \
+             @supports selector(:has(*)) { p { font-weight: bold; } }",
+        );
+        let styled = engine.compute(&doc);
+        let style = styled.get(p).unwrap();
+        assert_eq!(style.color(), Color::rgb(255, 0, 0));
+        assert_eq!(style.font_weight(), 700);
+    }
+
+    #[test]
+    fn supports_logical_operators_gate_rules() {
+        let (doc, _html, _body, p) = document();
+        let engine = engine_with(
+            "p { color: black; } \
+             @supports (display: grid) and (color: red) { p { color: green; } } \
+             @supports (display: grid) and (no-such-property: x) { p { color: blue; } } \
+             @supports not (no-such-property: x) { p { font-size: 20px; } }",
+        );
+        let styled = engine.compute(&doc);
+        let style = styled.get(p).unwrap();
+        assert_eq!(style.color(), Color::rgb(0, 128, 0));
+        assert_eq!(style.font_size(), 20.0);
+    }
+
+    #[test]
+    fn container_query_uses_viewport_by_default() {
+        let (doc, _html, _body, p) = document();
+        let engine = engine_with(
+            "p { color: black; } \
+             @container (min-width: 400px) { p { color: red; } }",
+        );
+        assert_eq!(
+            engine.compute(&doc).get(p).unwrap().color(),
+            Color::rgb(255, 0, 0)
+        );
+    }
+
+    #[test]
+    fn container_query_uses_explicit_container_context() {
+        use conditions::ContainerSize;
+
+        let (doc, _html, _body, p) = document();
+        let engine = engine_with(
+            "p { color: black; } \
+             @container (min-width: 400px) { p { color: red; } } \
+             @container (width < 300px) { p { font-size: 12px; } }",
+        );
+        let mut containers = HashMap::new();
+        containers.insert(
+            p,
+            ContainerContext::new(ContainerSize {
+                width: 200.0,
+                height: 100.0,
+            }),
+        );
+        let styled = engine.compute_with_container(&doc, &HashMap::new(), &containers);
+        let style = styled.get(p).unwrap();
+        assert_eq!(style.color(), Color::rgb(0, 0, 0));
+        assert_eq!(style.font_size(), 12.0);
+    }
+
+    #[test]
+    fn named_container_query_selects_named_size() {
+        use conditions::ContainerSize;
+
+        let (doc, _html, _body, p) = document();
+        let engine = engine_with(
+            "p { color: black; } \
+             @container sidebar (min-width: 300px) { p { color: blue; } }",
+        );
+        let mut containers = HashMap::new();
+        containers.insert(
+            p,
+            ContainerContext::new(ContainerSize {
+                width: 100.0,
+                height: 100.0,
+            })
+            .with_named(
+                "sidebar",
+                ContainerSize {
+                    width: 400.0,
+                    height: 200.0,
+                },
+            ),
+        );
+        let styled = engine.compute_with_container(&doc, &HashMap::new(), &containers);
+        assert_eq!(styled.get(p).unwrap().color(), Color::rgb(0, 0, 255));
+    }
+
+    #[test]
+    fn later_layers_win_over_specificity() {
+        let (doc, _html, _body, p) = document();
+        let engine = engine_with(
+            "@layer early { #target { color: red; } } \
+             @layer late { p { color: blue; } }",
+        );
+        assert_eq!(
+            engine.compute(&doc).get(p).unwrap().color(),
+            Color::rgb(0, 0, 255)
+        );
+    }
+
+    #[test]
+    fn unlayered_rules_win_over_layers() {
+        let (doc, _html, _body, p) = document();
+        let engine = engine_with(
+            "@layer base { #target { color: red; } } \
+             p { color: green; }",
+        );
+        assert_eq!(
+            engine.compute(&doc).get(p).unwrap().color(),
+            Color::rgb(0, 128, 0)
+        );
+    }
+
+    #[test]
+    fn layer_statement_defines_order() {
+        let (doc, _html, _body, p) = document();
+        let engine = engine_with(
+            "@layer early, late; \
+             @layer early { p { color: red; } } \
+             @layer late { p { color: blue; } }",
+        );
+        assert_eq!(
+            engine.compute(&doc).get(p).unwrap().color(),
+            Color::rgb(0, 0, 255)
+        );
+    }
+
+    #[test]
+    fn important_layer_order_reverses() {
+        let (doc, _html, _body, p) = document();
+        let engine = engine_with(
+            "@layer early { p { color: red !important; } } \
+             @layer late { p { color: blue !important; } }",
+        );
+        assert_eq!(
+            engine.compute(&doc).get(p).unwrap().color(),
+            Color::rgb(255, 0, 0)
+        );
+    }
+
+    #[test]
+    fn scope_root_and_limit_constrain_matching() {
+        let mut doc = Document::new();
+        let html = doc.create_element("html");
+        let body = doc.create_element("body");
+        doc.append_child(doc.root(), html);
+        doc.append_child(html, body);
+        let root = doc.create_element("div");
+        doc.set_attr(root, "class", "root");
+        doc.append_child(body, root);
+        let inside = doc.create_element("p");
+        doc.append_child(root, inside);
+        let limited = doc.create_element("div");
+        doc.set_attr(limited, "class", "limit");
+        doc.append_child(root, limited);
+        let excluded = doc.create_element("p");
+        doc.append_child(limited, excluded);
+        let outside = doc.create_element("p");
+        doc.append_child(body, outside);
+
+        let engine = engine_with("@scope (.root) to (.limit) { p { color: red; } }");
+        let styled = engine.compute(&doc);
+        assert_eq!(styled.get(inside).unwrap().color(), Color::rgb(255, 0, 0));
+        assert_ne!(styled.get(excluded).unwrap().color(), Color::rgb(255, 0, 0));
+        assert_ne!(styled.get(outside).unwrap().color(), Color::rgb(255, 0, 0));
+    }
+
+    #[test]
+    fn property_registration_supplies_typed_fallback() {
+        let (doc, _html, _body, p) = document();
+        let engine = engine_with(
+            "@property --brand { syntax: \"<color>\"; inherits: true; initial-value: #abcdef; } \
+             p { color: var(--brand); }",
+        );
+        assert_eq!(
+            engine.compute(&doc).get(p).unwrap().color(),
+            Color::rgb(0xab, 0xcd, 0xef)
+        );
+    }
+
+    #[test]
+    fn env_and_attr_are_kept_as_opaque_strings() {
+        let (doc, _html, _body, p) = document();
+        let engine = engine_with(
+            "#target { font-family: env(safe-area-inset-left); \
+             grid-template-areas: attr(data-areas); }",
+        );
+        let styled = engine.compute(&doc);
+        let style = styled.get(p).unwrap();
+        assert!(matches!(
+            style.get(Property::FontFamily),
+            Some(ComputedValue::Str(text)) if text.contains("env(")
+        ));
+        assert!(matches!(
+            style.get(Property::GridTemplateAreas),
+            Some(ComputedValue::Str(text)) if text.contains("attr(")
+        ));
+    }
+
+    #[test]
+    fn nested_rules_are_flattened_with_combined_specificity() {
+        let (mut doc, _html, _body, p) = document();
+        doc.set_attr(p, "class", "card");
+        let engine = engine_with(
+            "p { color: black; } \
+             .card { &:hover { color: red; } .title { color: blue; } }",
+        );
+        // `&:hover` flattens to `.card:hover`: it wins over `p` for the
+        // hovered card, and the implicit descendant becomes `.card .title`.
+        let mut states = HashMap::new();
+        states.insert(
+            p,
+            ElementState {
+                hover: true,
+                ..ElementState::default()
+            },
+        );
+        let styled = engine.compute_with_state(&doc, &states);
+        assert_eq!(styled.get(p).unwrap().color(), Color::rgb(255, 0, 0));
     }
 }

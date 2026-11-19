@@ -4,6 +4,7 @@ use browser_css::Color;
 use browser_layout::Rect;
 
 use crate::display_list::DisplayCommand;
+use crate::effects::{ConicGradient, ExtendedCommand, ImageRendering, RadialGradient};
 use crate::images::{FittedImage, ImagePosition, LengthOrPercentage};
 
 /// The CSS `background-position` of a background image.
@@ -53,6 +54,63 @@ pub fn background_command(rect: Rect, color: Color) -> Option<DisplayCommand> {
         return None;
     }
     Some(DisplayCommand::FillRect { rect, color })
+}
+
+/// Builds a radial-gradient effect command, or `None` when the box is empty.
+///
+/// Unlike [`crate::commands::linear_gradient_command`] this is an
+/// [`ExtendedCommand`]: the current software rasterizer has no radial-gradient
+/// primitive. See the integration notes in [`crate::effects`] for execution.
+pub fn radial_gradient_command(
+    rect: Rect,
+    gradient: RadialGradient,
+    radius: [f32; 4],
+) -> Option<ExtendedCommand> {
+    (!rect.is_empty()).then_some(ExtendedCommand::DrawRadialGradient {
+        rect,
+        gradient,
+        radius,
+    })
+}
+
+/// Parses a CSS `radial-gradient()` string and builds an effect command.
+pub fn radial_gradient_command_from_css(
+    rect: Rect,
+    radius: [f32; 4],
+    css: &str,
+) -> Option<ExtendedCommand> {
+    radial_gradient_command(rect, RadialGradient::parse(css)?, radius)
+}
+
+/// Builds a conic-gradient effect command, or `None` when the box is empty.
+///
+/// See the integration notes in [`crate::effects`] for execution.
+pub fn conic_gradient_command(
+    rect: Rect,
+    gradient: ConicGradient,
+    radius: [f32; 4],
+) -> Option<ExtendedCommand> {
+    (!rect.is_empty()).then_some(ExtendedCommand::DrawConicGradient {
+        rect,
+        gradient,
+        radius,
+    })
+}
+
+/// Parses a CSS `conic-gradient()` string and builds an effect command.
+pub fn conic_gradient_command_from_css(
+    rect: Rect,
+    radius: [f32; 4],
+    css: &str,
+) -> Option<ExtendedCommand> {
+    conic_gradient_command(rect, ConicGradient::parse(css)?, radius)
+}
+
+/// Resolves an `image-rendering` declaration into its command-data hint.
+///
+/// `None` (or an unrecognised value) means `auto`, matching CSS.
+pub fn image_rendering_hint(raw: Option<&str>) -> ImageRendering {
+    raw.and_then(ImageRendering::parse).unwrap_or_default()
 }
 
 /// Composites a translucent colour over an opaque backdrop (useful for previews).
@@ -269,5 +327,31 @@ mod tests {
             BackgroundPosition::from_percentages(1.0, 1.0),
         );
         assert_eq!(destination, Rect::new(50.0, 50.0, 50.0, 50.0));
+    }
+
+    #[test]
+    fn radial_and_conic_css_build_effect_commands() {
+        let rect = Rect::new(0.0, 0.0, 20.0, 20.0);
+        let radial =
+            radial_gradient_command_from_css(rect, [0.0; 4], "radial-gradient(circle, red, blue)");
+        assert!(matches!(
+            radial,
+            Some(ExtendedCommand::DrawRadialGradient { .. })
+        ));
+        let conic = conic_gradient_command_from_css(
+            rect,
+            [0.0; 4],
+            "conic-gradient(from 45deg, red, blue)",
+        );
+        assert!(matches!(
+            conic,
+            Some(ExtendedCommand::DrawConicGradient { .. })
+        ));
+        assert!(radial_gradient_command_from_css(rect, [0.0; 4], "not-a-gradient").is_none());
+        assert_eq!(
+            image_rendering_hint(Some("pixelated")),
+            ImageRendering::Pixelated
+        );
+        assert_eq!(image_rendering_hint(None), ImageRendering::Auto);
     }
 }

@@ -38,6 +38,7 @@ use super::{
     UiState,
 };
 use crate::chrome::CHROME_HEIGHT;
+use crate::ui_extra::{ContextAction, ContextMenu};
 
 /// Corner radius for UI fields and buttons.
 const RADIUS: f32 = 7.0;
@@ -47,6 +48,10 @@ const TAB_RADIUS: f32 = 6.0;
 const SUPERSAMPLE: u32 = 2;
 /// Samples per axis for icon coverage.
 const ICON_SUB: usize = 4;
+/// Translucent yellow used for the active find-in-page match.
+const FIND_CURRENT: Color = Color::rgba(255, 193, 7, 190);
+/// Translucent yellow used for the other find-in-page matches.
+const FIND_MATCH: Color = Color::rgba(255, 224, 94, 130);
 
 /// A shared text painter; glyph coverage is cached inside `browser-text`.
 fn atlas() -> &'static GlyphAtlas {
@@ -86,12 +91,14 @@ struct ChromeKey {
     tab_count: usize,
     active: usize,
     caret_x_bits: Option<u32>,
+    tab_drag_source: Option<usize>,
+    tab_drag_target: Option<usize>,
 }
 
 impl ChromeKey {
     fn new(browser: &Browser, ui: &UiState, chrome: &ChromeLayout, scale: f32) -> Self {
         let shape_scale = device_scale(scale) * SUPERSAMPLE as f32;
-        let (_titles, active) = browser.tabs().titles();
+        let (_titles, active) = ui.tab_titles(browser);
         let focus = ui.address.is_focused();
         Self {
             width_bits: chrome.width.to_bits(),
@@ -108,6 +115,8 @@ impl ChromeKey {
             } else {
                 None
             },
+            tab_drag_source: ui.tab_drag_source,
+            tab_drag_target: ui.tab_drag_target,
         }
     }
 }
@@ -145,7 +154,7 @@ fn build_chrome_base(
         PAGE_SURROUND,
     );
 
-    let (_titles, active) = browser.tabs().titles();
+    let (_titles, active) = ui.tab_titles(browser);
     let pad = PADDING * shape_scale;
 
     // Tabs: active tab is a white card with a hairline and an accent underline.
@@ -169,6 +178,24 @@ fn build_chrome_base(
             );
         } else if ui.hover == Some(ChromePart::Tab(index)) {
             fill_rounded(&mut list, rect, TAB_RADIUS * shape_scale, HOVER);
+        }
+        if Some(index) == ui.tab_drag_source {
+            fill_rounded(
+                &mut list,
+                rect,
+                TAB_RADIUS * shape_scale,
+                Color::rgba(100, 100, 110, 70),
+            );
+        }
+        if Some(index) == ui.tab_drag_target {
+            stroke_rounded(
+                &mut list,
+                rect,
+                TAB_RADIUS * shape_scale,
+                shape_scale,
+                ACCENT,
+                Color::rgba(255, 255, 255, 0),
+            );
         }
         if (ui.hover == Some(ChromePart::CloseTab(index))
             || ui.pressed == Some(ChromePart::CloseTab(index)))
@@ -357,16 +384,46 @@ impl ChromeCache {
         page: Option<&ImageBuffer>,
         scale: f32,
     ) -> ImageBuffer {
+        self.render_frame_scaled(browser, ui, chrome, page, scale, scale)
+    }
+
+    /// Composes a frame with separate scales for chrome and page content.
+    ///
+    /// `scale` stays the device pixel ratio so chrome (and the output image
+    /// size) remain readable and exactly match the window. `page_scale` is the
+    /// device ratio multiplied by the logical zoom level; the page image is
+    /// rasterized at that scale and composited 1:1 into the page rect, so zoom
+    /// magnifies content without magnifying the UI. `composite_page` clips the
+    /// magnified image to the page rect so it never bleeds over the chrome.
+    pub fn render_frame_scaled(
+        &self,
+        browser: &Browser,
+        ui: &UiState,
+        chrome: &ChromeLayout,
+        page: Option<&ImageBuffer>,
+        scale: f32,
+        page_scale: f32,
+    ) -> ImageBuffer {
         let device = device_scale(scale);
+        let page_device = device_scale(page_scale);
+        let zoom = if device > 0.0 {
+            page_device / device
+        } else {
+            1.0
+        };
         let mut image = self.chrome_base(browser, ui, chrome, scale);
         if let Some(page) = page
             && !chrome.page.is_empty()
         {
             composite_page(&mut image, page, chrome.page, device);
         }
+        paint_find_highlights(&mut image, ui, chrome, device, zoom);
         paint_icons(&mut image, ui, chrome, device);
-        let (titles, active) = browser.tabs().titles();
+        let (titles, active) = ui.tab_titles(browser);
         paint_text(&mut image, ui, chrome, &titles, active, device);
+        if ui.find_open {
+            paint_find_bar(&mut image, ui, chrome, device);
+        }
         image
     }
 }
@@ -410,6 +467,23 @@ pub fn render_window_with_page(
     global_cache().render_frame(browser, ui, chrome, page, scale)
 }
 
+/// Variant of [`render_window_with_page`] with an independent page render scale.
+///
+/// The native window uses this for `Ctrl+Plus` / `Ctrl+Minus` / `Ctrl+0`: the
+/// page is rasterized at `page_scale` (device ratio x logical zoom) while the
+/// chrome and the output image stay at `scale` (plain device ratio).
+#[allow(dead_code)] // Wired into `window_app.rs` by the native-window integration.
+pub fn render_window_with_page_scaled(
+    browser: &Browser,
+    ui: &UiState,
+    chrome: &ChromeLayout,
+    scale: f32,
+    page: Option<&ImageBuffer>,
+    page_scale: f32,
+) -> ImageBuffer {
+    global_cache().render_frame_scaled(browser, ui, chrome, page, scale, page_scale)
+}
+
 /// Reduces a supersampled image by averaging `factor x factor` blocks.
 fn downsample(source: &ImageBuffer, factor: usize) -> ImageBuffer {
     let width = source.width / factor as u32;
@@ -444,11 +518,18 @@ fn downsample(source: &ImageBuffer, factor: usize) -> ImageBuffer {
 fn composite_page(image: &mut ImageBuffer, page: &ImageBuffer, rect: Rect, scale: f32) {
     let x = (rect.x * scale).round() as i32;
     let y = (rect.y * scale).round() as i32;
+    // A zoomed page image is larger than the viewport. Clip to the page rect so
+    // magnified content never paints over the tab strip, toolbar or status pill.
+    let right = ((rect.x + rect.width) * scale).round() as i32;
+    let bottom = ((rect.y + rect.height) * scale).round() as i32;
     for py in 0..page.height as i32 {
+        let dy = y + py;
+        if dy < 0 || dy >= bottom || dy >= image.height as i32 {
+            continue;
+        }
         for px in 0..page.width as i32 {
             let dx = x + px;
-            let dy = y + py;
-            if dx < 0 || dy < 0 || dx >= image.width as i32 || dy >= image.height as i32 {
+            if dx < 0 || dx >= right || dx >= image.width as i32 {
                 continue;
             }
             let src = (py as usize * page.width as usize + px as usize) * 4;
@@ -816,6 +897,212 @@ fn paint_text(
         MUTED_INK,
         Some((chrome.status.width - 2.0 * PADDING) * scale),
     );
+}
+
+/// Paints approximate rectangles for every find-in-page match over the page.
+///
+/// Highlights are a per-frame layer so changing the query never invalidates the
+/// cached chrome base. They are clipped to the page rectangle and use the same
+/// zoom transform as the page image, keeping them registered with the text.
+fn paint_find_highlights(
+    image: &mut ImageBuffer,
+    ui: &UiState,
+    chrome: &ChromeLayout,
+    device: f32,
+    zoom: f32,
+) {
+    if !ui.find_open || ui.find_highlights.is_empty() || zoom <= 0.0 {
+        return;
+    }
+    let clip = scaled_rect(chrome.page, device);
+    for highlight in &ui.find_highlights {
+        if highlight.is_empty() {
+            continue;
+        }
+        let rect = Rect::new(
+            (chrome.page.x + highlight.x * zoom) * device,
+            (chrome.page.y + highlight.y * zoom) * device,
+            highlight.width * zoom * device,
+            highlight.height * zoom * device,
+        );
+        let color = if highlight.current {
+            FIND_CURRENT
+        } else {
+            FIND_MATCH
+        };
+        fill_rect_alpha(image, rect, clip, color);
+    }
+}
+
+/// Paints the find bar card, query field, match counter and control icons.
+fn paint_find_bar(image: &mut ImageBuffer, ui: &UiState, chrome: &ChromeLayout, device: f32) {
+    let bar = scaled_rect(chrome.find_bar, device);
+    let radius = 8.0 * device;
+    fill_polygons(image, &[rounded_rect_polygon(bar, radius, 5)], HAIRLINE);
+    fill_polygons(
+        image,
+        &[rounded_rect_polygon(inset(bar, device), radius - device, 5)],
+        Color::rgb(255, 255, 255),
+    );
+
+    let field = scaled_rect(chrome.find_input, device);
+    let field_border = if ui.find_focused { ACCENT } else { HAIRLINE };
+    fill_polygons(
+        image,
+        &[rounded_rect_polygon(field, 5.0 * device, 4)],
+        field_border,
+    );
+    fill_polygons(
+        image,
+        &[rounded_rect_polygon(inset(field, device), 4.0 * device, 4)],
+        Color::rgb(255, 255, 255),
+    );
+
+    let font = Font::sans();
+    let counter = match (ui.find.current_index(), ui.find.match_count()) {
+        (_, 0) => "0/0".to_string(),
+        (Some(index), total) => format!("{}/{}", index + 1, total),
+        (None, total) => format!("0/{total}"),
+    };
+    let counter_width = font.measure(&counter, FONT_SIZE) + 8.0;
+    let query_width = (chrome.find_input.width - counter_width - 12.0).max(0.0);
+    let query = fit_text(ui.find.query(), query_width, font, FONT_SIZE);
+    atlas().paint_text_centered(
+        image,
+        (chrome.find_input.x + 6.0) * device,
+        field.y,
+        field.height,
+        &query,
+        FONT_SIZE * device,
+        INK,
+        Some(query_width * device),
+    );
+    atlas().paint_text_centered(
+        image,
+        (chrome.find_input.right() - counter_width) * device,
+        field.y,
+        field.height,
+        &counter,
+        FONT_SIZE * device,
+        MUTED_INK,
+        Some(counter_width * device),
+    );
+
+    fill_polygons(image, &chevron(chrome.find_prev, false, device), MUTED_INK);
+    fill_polygons(image, &chevron(chrome.find_next, true, device), MUTED_INK);
+    fill_polygons(
+        image,
+        &close_icon(chrome.find_close, device, 1.0),
+        MUTED_INK,
+    );
+}
+
+/// Paints a context menu over the composed window.
+///
+/// The model owns the item rectangles and labels; this function only turns them
+/// into pixels. It is called by the native window after [`render_window_with_page`].
+#[allow(dead_code)] // Wired into `window_app.rs` by the native-window integration.
+pub fn render_context_menu(
+    image: &mut ImageBuffer,
+    menu: &ContextMenu,
+    hover: Option<ContextAction>,
+    scale: f32,
+) {
+    let Some(bounds) = menu.bounds() else {
+        return;
+    };
+    let rect = Rect::new(
+        bounds.x * scale,
+        bounds.y * scale,
+        bounds.width * scale,
+        bounds.height * scale,
+    );
+    let radius = 8.0 * scale;
+    // A faint offset shadow, then a hairline-bordered white card.
+    let shadow = Rect::new(
+        rect.x + 2.0 * scale,
+        rect.y + 3.0 * scale,
+        rect.width,
+        rect.height,
+    );
+    fill_polygons(
+        image,
+        &[rounded_rect_polygon(shadow, radius, 5)],
+        Color::rgba(0, 0, 0, 28),
+    );
+    fill_polygons(image, &[rounded_rect_polygon(rect, radius, 5)], HAIRLINE);
+    fill_polygons(
+        image,
+        &[rounded_rect_polygon(inset(rect, scale), radius - scale, 5)],
+        Color::rgb(255, 255, 255),
+    );
+
+    for item in &menu.items {
+        if item.enabled && hover == Some(item.action) {
+            let row = Rect::new(
+                item.bounds.x * scale,
+                item.bounds.y * scale,
+                item.bounds.width * scale,
+                item.bounds.height * scale,
+            );
+            fill_rect_alpha(image, inset(row, scale), rect, HOVER);
+        }
+        let color = if item.enabled { INK } else { MUTED_INK };
+        atlas().paint_text_centered(
+            image,
+            (item.bounds.x + 12.0) * scale,
+            item.bounds.y * scale,
+            item.bounds.height * scale,
+            &item.label,
+            FONT_SIZE * scale,
+            color,
+            Some((item.bounds.width - 20.0) * scale),
+        );
+    }
+}
+
+/// Fills a rectangle with a translucent colour, clipped to `clip`.
+fn fill_rect_alpha(image: &mut ImageBuffer, rect: Rect, clip: Rect, color: Color) {
+    if color.a == 0 || rect.is_empty() {
+        return;
+    }
+    let x0 = rect.x.max(clip.x).max(0.0).ceil() as i32;
+    let y0 = rect.y.max(clip.y).max(0.0).ceil() as i32;
+    let x1 = rect
+        .right()
+        .min(clip.right())
+        .min(image.width as f32)
+        .floor() as i32;
+    let y1 = rect
+        .bottom()
+        .min(clip.bottom())
+        .min(image.height as f32)
+        .floor() as i32;
+    for y in y0..y1 {
+        for x in x0..x1 {
+            blend(image, x, y, color, color.a);
+        }
+    }
+}
+
+/// Builds a rounded rectangle as a polygon with `steps` samples per corner.
+fn rounded_rect_polygon(rect: Rect, radius: f32, steps: usize) -> Vec<(f32, f32)> {
+    let radius = radius.clamp(0.0, rect.width.min(rect.height) / 2.0);
+    let quarter = std::f32::consts::FRAC_PI_2;
+    let corners = [
+        (rect.right() - radius, rect.y + radius, -quarter),
+        (rect.right() - radius, rect.bottom() - radius, 0.0),
+        (rect.x + radius, rect.bottom() - radius, quarter),
+        (rect.x + radius, rect.y + radius, std::f32::consts::PI),
+    ];
+    let mut points = Vec::with_capacity(4 * (steps + 1));
+    for (cx, cy, start) in corners {
+        for step in 0..=steps {
+            let angle = start + quarter * step as f32 / steps as f32;
+            points.push((cx + radius * angle.cos(), cy + radius * angle.sin()));
+        }
+    }
+    points
 }
 
 fn caret_position(ui: &UiState, chrome: &ChromeLayout, scale: f32) -> Option<f32> {
@@ -1228,6 +1515,86 @@ mod tests {
         assert!(
             loading_count > 0 && loading_count < ready_count,
             "loading underline should be a shorter accent segment"
+        );
+    }
+
+    #[test]
+    fn find_bar_and_highlights_render_over_the_page() {
+        use crate::ui_extra::find_overlay::highlights;
+
+        let browser = browser();
+        let chrome = chrome();
+        let mut ui = UiState::new();
+        let plain = render_window(&browser, &ui, &chrome, 1.0);
+
+        ui.find_open = true;
+        ui.find_focused = true;
+        ui.find.set_query("Hello", &browser.page().text());
+        ui.find_highlights = highlights(browser.page(), &ui.find);
+        assert!(!ui.find_highlights.is_empty());
+        let with_find = render_window(&browser, &ui, &chrome, 1.0);
+
+        let changed = |rect: Rect| {
+            (rect.x as u32..rect.right() as u32)
+                .flat_map(|x| (rect.y as u32..rect.bottom() as u32).map(move |y| (x, y)))
+                .filter(|&(x, y)| plain.pixel(x, y) != with_find.pixel(x, y))
+                .count()
+        };
+        assert!(
+            changed(chrome.find_bar) > 100,
+            "the find bar must visibly change its overlay area"
+        );
+        let highlight = ui.find_highlights[0];
+        let mark = Rect::new(
+            chrome.page.x + highlight.x,
+            chrome.page.y + highlight.y,
+            highlight.width,
+            highlight.height,
+        );
+        assert!(changed(mark) > 0, "match rectangles must tint the page");
+    }
+
+    #[test]
+    fn context_menu_renders_its_rows() {
+        use crate::ui_extra::{ContextMenu, Point};
+
+        let browser = browser();
+        let chrome = chrome();
+        let ui = UiState::new();
+        let plain = render_window(&browser, &ui, &chrome, 1.0);
+        let menu = ContextMenu::new(Point::new(60.0, 120.0));
+
+        let mut with_menu = plain.clone();
+        render_context_menu(&mut with_menu, &menu, Some(ContextAction::Reload), 1.0);
+
+        let bounds = menu.bounds().unwrap();
+        let mut changed = 0;
+        for x in bounds.x as u32..(bounds.x + bounds.width) as u32 {
+            for y in bounds.y as u32..(bounds.y + bounds.height) as u32 {
+                if plain.pixel(x, y) != with_menu.pixel(x, y) {
+                    changed += 1;
+                }
+            }
+        }
+        assert!(changed > 100, "menu rows should be visible");
+    }
+
+    #[test]
+    fn separate_page_scale_keeps_chrome_size_and_clips_the_page() {
+        let browser = browser();
+        let ui = UiState::new();
+        let chrome = chrome();
+        let page = browser.render_scaled(2.0);
+        let image = render_window_with_page_scaled(&browser, &ui, &chrome, 1.0, Some(&page), 2.0);
+
+        // Chrome and the output image stay at the device scale, even though the
+        // page image carries twice the resolution.
+        assert_eq!((image.width, image.height), (800, 600));
+        assert_eq!(image.pixel(700, 10), [0xf0, 0xf0, 0xf3, 255]);
+        // Magnified page content is clipped to the page rectangle.
+        assert_eq!(
+            image.pixel(400, CHROME_HEIGHT as u32),
+            [0xd2, 0xd2, 0xd7, 255]
         );
     }
 

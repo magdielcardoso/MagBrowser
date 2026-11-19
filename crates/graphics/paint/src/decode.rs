@@ -48,14 +48,21 @@
 //!   are supported. Progressive (SOF2), extended-sequential (SOF1), lossless,
 //!   arithmetic-coded and 12-bit JPEGs are reported as unsupported.
 //!
+//! * **WebP** — RIFF/WebP containers with a `VP8L` lossless bitstream (all four
+//!   reversible transforms, colour cache, LZ77 backward references and
+//!   spatially varying Huffman codes) or a `VP8 ` lossy key frame (all intra
+//!   prediction modes, token probabilities, dequantized DCT/WHT, loop filter
+//!   and BT.601 YCbCr conversion). Extended-format `VP8X` files with an `ALPH`
+//!   alpha chunk are supported. Animated WebP, non-key frames and frames whose
+//!   canvas differs from the bitstream dimensions are reported as unsupported.
+//!
 //! # Unsupported formats
 //!
-//! WebP and AVIF are detected and reported as unsupported with a
-//! [`DecodeError`], never silently decoded as garbage. Progressive and other
-//! non-baseline JPEG modes are likewise reported as unsupported. Animated GIF
-//! frames after the first, APNG animation, and 16-bit PNG samples are not
-//! decoded. [`detect_format`] lets callers choose a fallback without attempting
-//! a decode.
+//! AVIF is detected and reported as unsupported with a [`DecodeError`], never
+//! silently decoded as garbage. Progressive and other non-baseline JPEG modes
+//! are likewise reported as unsupported. Animated GIF frames after the first,
+//! APNG animation, and 16-bit PNG samples are not decoded. [`detect_format`]
+//! lets callers choose a fallback without attempting a decode.
 
 use std::fmt;
 
@@ -228,9 +235,7 @@ pub fn decode(bytes: &[u8]) -> Result<ImageData, DecodeError> {
         Some(ImageFormat::Pnm) => decode_pnm(bytes),
         Some(ImageFormat::Ico) => decode_ico(bytes),
         Some(ImageFormat::Jpeg) => decode_jpeg(bytes),
-        Some(ImageFormat::Webp) => Err(DecodeError::unsupported(
-            "WebP (VP8/VP8L decoding is not implemented)",
-        )),
+        Some(ImageFormat::Webp) => decode_webp(bytes),
         Some(ImageFormat::Avif) => Err(DecodeError::unsupported(
             "AVIF (AV1 decoding is not implemented)",
         )),
@@ -2549,6 +2554,3006 @@ pub fn decode_jpeg(bytes: &[u8]) -> Result<ImageData, DecodeError> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// WebP (RIFF container with VP8L / VP8 bitstreams)
+// ---------------------------------------------------------------------------
+//
+// The decoders below are intentionally self-contained. VP8L uses an LSB-first
+// bit reader, canonical Huffman codes, an LZ77 backward-reference window, a
+// small colour cache and four reversible image transforms. VP8 decodes single
+// key frames (the only frame type WebP uses for still images): the boolean
+// entropy coder, all intra prediction modes, token probabilities, dequantized
+// 4x4 DCT/WHT, and the loop filter. Unsupported features produce a typed
+// DecodeError; no code path panics on hostile input.
+
+fn webp_err(message: impl Into<String>) -> DecodeError {
+    DecodeError::new(format!("WebP: {}", message.into()))
+}
+
+fn webp_unsupported(message: impl Into<String>) -> DecodeError {
+    DecodeError::unsupported(format!("WebP {}", message.into()))
+}
+
+fn webp_u16le(bytes: &[u8], offset: usize) -> Result<u16, DecodeError> {
+    let slice = bytes
+        .get(offset..offset + 2)
+        .ok_or_else(|| webp_err("truncated RIFF chunk"))?;
+    Ok(u16::from_le_bytes([slice[0], slice[1]]))
+}
+
+fn webp_u24le(bytes: &[u8], offset: usize) -> Result<u32, DecodeError> {
+    let slice = bytes
+        .get(offset..offset + 3)
+        .ok_or_else(|| webp_err("truncated RIFF chunk"))?;
+    Ok(u32::from(slice[0]) | (u32::from(slice[1]) << 8) | (u32::from(slice[2]) << 16))
+}
+
+fn webp_u32le(bytes: &[u8], offset: usize) -> Result<u32, DecodeError> {
+    let slice = bytes
+        .get(offset..offset + 4)
+        .ok_or_else(|| webp_err("truncated RIFF chunk"))?;
+    Ok(u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]))
+}
+
+fn div_round_up(value: usize, divisor: usize) -> Result<usize, DecodeError> {
+    if divisor == 0 {
+        return Err(webp_err("zero divisor in subsampled image size"));
+    }
+    Ok(value.div_ceil(divisor))
+}
+
+// -------------------------------------------------------------------------
+// VP8L (lossless)
+// -------------------------------------------------------------------------
+
+/// Least-significant-bit-first reader for VP8L entropy-coded data.
+struct Vp8LReader<'a> {
+    data: &'a [u8],
+    pos: usize,
+    buffer: u64,
+    bits: u32,
+}
+
+impl<'a> Vp8LReader<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self {
+            data,
+            pos: 0,
+            buffer: 0,
+            bits: 0,
+        }
+    }
+
+    fn read_bits(&mut self, count: u32) -> Result<u32, DecodeError> {
+        if count > 32 {
+            return Err(webp_err("VP8L read exceeds 32 bits"));
+        }
+        while self.bits < count {
+            let byte = *self
+                .data
+                .get(self.pos)
+                .ok_or_else(|| webp_err("truncated VP8L bitstream"))?;
+            self.pos += 1;
+            self.buffer |= u64::from(byte) << self.bits;
+            self.bits += 8;
+        }
+        let mask = if count == 0 { 0 } else { (1_u64 << count) - 1 };
+        let value = (self.buffer & mask) as u32;
+        self.buffer >>= count;
+        self.bits -= count;
+        Ok(value)
+    }
+
+    fn read_bit(&mut self) -> Result<u32, DecodeError> {
+        self.read_bits(1)
+    }
+}
+
+/// Canonical prefix code. A tree with a single symbol consumes no bits when
+/// decoded, matching libwebp's `VP8LBuildHuffmanTable` special case.
+struct Vp8LHuffman {
+    single: Option<usize>,
+    counts: [u16; 16],
+    symbols: Vec<u16>,
+}
+
+impl Vp8LHuffman {
+    fn from_lengths(lengths: &[u8]) -> Result<Self, DecodeError> {
+        let mut counts = [0_u16; 16];
+        let mut total = 0_usize;
+        let mut single = None;
+        for (symbol, &length) in lengths.iter().enumerate() {
+            if length > 15 {
+                return Err(webp_err("invalid VP8L Huffman code length"));
+            }
+            if length > 0 {
+                counts[usize::from(length)] += 1;
+                total += 1;
+                single = Some(symbol);
+            }
+        }
+        // libwebp requires a full binary tree (apart from the single-leaf
+        // special case). Reject over-subscribed sets; incomplete sets are
+        // harmless for a decoder that simply refuses unknown codes.
+        let mut left: i32 = 1;
+        for &count in counts.iter().skip(1) {
+            left = left * 2 - i32::from(count);
+            if left < 0 {
+                return Err(webp_err("over-subscribed VP8L Huffman code"));
+            }
+        }
+        if total == 1 {
+            return Ok(Self {
+                single,
+                counts,
+                symbols: Vec::new(),
+            });
+        }
+        let mut offsets = [0_u16; 16];
+        for length in 1..15 {
+            offsets[length + 1] = offsets[length] + counts[length];
+        }
+        let mut symbols = vec![0_u16; total];
+        for (symbol, &length) in lengths.iter().enumerate() {
+            if length > 0 {
+                let slot = usize::from(offsets[usize::from(length)]);
+                if slot >= symbols.len() {
+                    return Err(webp_err("over-subscribed VP8L Huffman code"));
+                }
+                symbols[slot] = u16::try_from(symbol)
+                    .map_err(|_| webp_err("VP8L Huffman symbol out of range"))?;
+                offsets[usize::from(length)] += 1;
+            }
+        }
+        Ok(Self {
+            single: None,
+            counts,
+            symbols,
+        })
+    }
+
+    fn decode(&self, reader: &mut Vp8LReader<'_>) -> Result<usize, DecodeError> {
+        if let Some(symbol) = self.single {
+            return Ok(symbol);
+        }
+        let mut code = 0_u32;
+        let mut first = 0_u32;
+        let mut index = 0_usize;
+        for length in 1..=15 {
+            code = (code << 1) | reader.read_bit()?;
+            let count = u32::from(self.counts[length]);
+            if code >= first && code - first < count {
+                return self
+                    .symbols
+                    .get(index + (code - first) as usize)
+                    .map(|&symbol| usize::from(symbol))
+                    .ok_or_else(|| webp_err("invalid VP8L Huffman code"));
+            }
+            index += count as usize;
+            first = (first + count) << 1;
+        }
+        Err(webp_err("invalid VP8L Huffman code"))
+    }
+}
+
+const VP8L_CODE_LENGTH_ORDER: [usize; 19] = [
+    17, 18, 0, 1, 2, 3, 4, 5, 16, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+];
+
+/// Reads one of the five prefix codes of a Huffman group (or a 19-symbol code
+/// length alphabet when `alphabet_size == 19` and this is used recursively).
+fn vp8l_read_huffman(
+    reader: &mut Vp8LReader<'_>,
+    alphabet_size: usize,
+) -> Result<Vp8LHuffman, DecodeError> {
+    let mut lengths = vec![0_u8; alphabet_size];
+    if reader.read_bit()? == 1 {
+        // Simple code length code: one or two literal symbols of length one.
+        let num_symbols = reader.read_bit()? as usize + 1;
+        let first_is_wide = reader.read_bit()?;
+        let bits = if first_is_wide == 1 { 8 } else { 1 };
+        let first = reader.read_bits(bits)? as usize;
+        // libwebp permits a simple-code symbol beyond this alphabet (the
+        // code is then effectively empty). Such a code is only valid if no
+        // symbol is ever decoded from it, so simply ignore the out-of-range
+        // length here.
+        if let Some(length) = lengths.get_mut(first) {
+            *length = 1;
+        }
+        if num_symbols == 2 {
+            let second = reader.read_bits(8)? as usize;
+            if let Some(length) = lengths.get_mut(second) {
+                *length = 1;
+            }
+        }
+        return Vp8LHuffman::from_lengths(&lengths);
+    }
+
+    let num_codes = reader.read_bits(4)? as usize + 4;
+    let mut code_length_lengths = [0_u8; 19];
+    for &slot in VP8L_CODE_LENGTH_ORDER.iter().take(num_codes) {
+        code_length_lengths[slot] = reader.read_bits(3)? as u8;
+    }
+    let code_length_code = Vp8LHuffman::from_lengths(&code_length_lengths)?;
+
+    let max_symbol = if reader.read_bit()? == 1 {
+        let length_nbits = 2 + 2 * reader.read_bits(3)?;
+        let max = 2 + reader.read_bits(length_nbits)? as usize;
+        if max > alphabet_size {
+            return Err(webp_err("VP8L max symbol exceeds alphabet"));
+        }
+        max
+    } else {
+        alphabet_size
+    };
+
+    let mut index = 0_usize;
+    let mut previous_length = 8_u8;
+    while index < max_symbol {
+        let symbol = code_length_code.decode(reader)?;
+        match symbol {
+            0..=15 => {
+                lengths[index] = symbol as u8;
+                if symbol != 0 {
+                    previous_length = symbol as u8;
+                }
+                index += 1;
+            }
+            16..=18 => {
+                let (extra_bits, offset) = match symbol {
+                    16 => (2_u32, 3_usize),
+                    17 => (3, 3),
+                    _ => (7, 11),
+                };
+                let repeat = reader.read_bits(extra_bits)? as usize + offset;
+                let end = index
+                    .checked_add(repeat)
+                    .ok_or_else(|| webp_err("VP8L code length repeat overflow"))?;
+                if end > alphabet_size {
+                    return Err(webp_err("VP8L code length repeat overruns alphabet"));
+                }
+                let value = if symbol == 16 { previous_length } else { 0 };
+                for slot in &mut lengths[index..end] {
+                    *slot = value;
+                }
+                index = end;
+            }
+            _ => return Err(webp_err("invalid VP8L code length symbol")),
+        }
+    }
+    Vp8LHuffman::from_lengths(&lengths)
+}
+
+/// Decodes a VP8L "prefix code + extra bits" integer (used for LZ77 lengths and
+/// distances).
+fn vp8l_lex(reader: &mut Vp8LReader<'_>, prefix: usize) -> Result<usize, DecodeError> {
+    if prefix < 4 {
+        return Ok(prefix + 1);
+    }
+    let extra_bits = ((prefix - 2) >> 1) as u32;
+    let offset = (2 + (prefix & 1)) << extra_bits;
+    Ok(offset + reader.read_bits(extra_bits)? as usize + 1)
+}
+
+/// Compact form of the 120 special (x, y) neighbours for VP8L distances.
+const VP8L_CODE_TO_PLANE: [u8; 120] = [
+    0x18, 0x07, 0x17, 0x19, 0x28, 0x06, 0x27, 0x29, 0x16, 0x1a, 0x26, 0x2a, 0x38, 0x05, 0x37, 0x39,
+    0x15, 0x1b, 0x36, 0x3a, 0x25, 0x2b, 0x48, 0x04, 0x47, 0x49, 0x14, 0x1c, 0x35, 0x3b, 0x46, 0x4a,
+    0x24, 0x2c, 0x58, 0x45, 0x4b, 0x34, 0x3c, 0x03, 0x57, 0x59, 0x13, 0x1d, 0x56, 0x5a, 0x23, 0x2d,
+    0x44, 0x4c, 0x55, 0x5b, 0x33, 0x3d, 0x68, 0x02, 0x67, 0x69, 0x12, 0x1e, 0x66, 0x6a, 0x22, 0x2e,
+    0x54, 0x5c, 0x43, 0x4d, 0x65, 0x6b, 0x32, 0x3e, 0x78, 0x01, 0x77, 0x79, 0x53, 0x5d, 0x11, 0x1f,
+    0x64, 0x6c, 0x42, 0x4e, 0x76, 0x7a, 0x21, 0x2f, 0x75, 0x7b, 0x31, 0x3f, 0x63, 0x6d, 0x52, 0x5e,
+    0x00, 0x74, 0x7c, 0x41, 0x4f, 0x10, 0x20, 0x62, 0x6e, 0x30, 0x73, 0x7d, 0x51, 0x5f, 0x40, 0x72,
+    0x7e, 0x61, 0x6f, 0x50, 0x71, 0x7f, 0x60, 0x70,
+];
+
+fn vp8l_distance(
+    reader: &mut Vp8LReader<'_>,
+    distance_symbol: usize,
+    width: usize,
+) -> Result<usize, DecodeError> {
+    let code = vp8l_lex(reader, distance_symbol)?;
+    if code == 0 {
+        return Err(webp_err("invalid VP8L distance code"));
+    }
+    if code > 120 {
+        return Ok(code - 120);
+    }
+    let plane = *VP8L_CODE_TO_PLANE
+        .get(code - 1)
+        .ok_or_else(|| webp_err("VP8L distance code out of range"))?;
+    let y_offset = i64::from(plane >> 4);
+    let x_offset = i64::from(8 - (plane & 0x0f));
+    let dist = y_offset * width as i64 + x_offset;
+    Ok(if dist < 1 { 1 } else { dist as usize })
+}
+
+/// One reversible transform applied to a VP8L image.
+enum Vp8LTransform {
+    Predictor {
+        size_bits: u32,
+        transform_width: usize,
+        modes: Vec<u8>,
+    },
+    Color {
+        size_bits: u32,
+        transform_width: usize,
+        /// [red_to_blue, green_to_blue, green_to_red] per block.
+        elements: Vec<[u8; 3]>,
+    },
+    SubtractGreen,
+    ColorIndex {
+        table: Vec<[u8; 4]>,
+        width_bits: u32,
+        input_width: usize,
+        output_width: usize,
+    },
+}
+
+/// Decodes one VP8L image stream. `level0` is true for the main image, which
+/// may carry transforms and multiple Huffman groups; sub-images (predictor,
+/// colour transform, palette, entropy image, ALPH data) have neither.
+/// Pixels are returned as ARGB quadruplets `[A, R, G, B]`.
+fn vp8l_decode_stream(
+    reader: &mut Vp8LReader<'_>,
+    width: usize,
+    height: usize,
+    level0: bool,
+) -> Result<Vec<[u8; 4]>, DecodeError> {
+    if width == 0 || height == 0 {
+        return Err(webp_err("VP8L image has a zero dimension"));
+    }
+    check_pixel_count(
+        u32::try_from(width).map_err(|_| webp_err("VP8L image too wide"))?,
+        u32::try_from(height).map_err(|_| webp_err("VP8L image too tall"))?,
+        "VP8L",
+    )?;
+
+    let mut transforms: Vec<Vp8LTransform> = Vec::new();
+    let mut current_width = width;
+
+    if level0 {
+        while reader.read_bit()? == 1 {
+            let transform_type = reader.read_bits(2)?;
+            match transform_type {
+                0 | 1 => {
+                    let size_bits = reader.read_bits(3)? + 2;
+                    let block = 1_usize << size_bits;
+                    let transform_width = div_round_up(current_width, block)?;
+                    let transform_height = div_round_up(height, block)?;
+                    let image =
+                        vp8l_decode_stream(reader, transform_width, transform_height, false)?;
+                    if transform_type == 0 {
+                        let modes: Vec<u8> = image.iter().map(|pixel| pixel[2]).collect();
+                        transforms.push(Vp8LTransform::Predictor {
+                            size_bits,
+                            transform_width,
+                            modes,
+                        });
+                    } else {
+                        let elements: Vec<[u8; 3]> = image
+                            .iter()
+                            .map(|pixel| [pixel[1], pixel[2], pixel[3]])
+                            .collect();
+                        transforms.push(Vp8LTransform::Color {
+                            size_bits,
+                            transform_width,
+                            elements,
+                        });
+                    }
+                }
+                2 => transforms.push(Vp8LTransform::SubtractGreen),
+                3 => {
+                    let table_size = reader.read_bits(8)? as usize + 1;
+                    let image = vp8l_decode_stream(reader, table_size, 1, false)?;
+                    let mut table = Vec::with_capacity(table_size);
+                    let mut previous = [0_u8; 4];
+                    for delta in image {
+                        let color = [
+                            previous[0].wrapping_add(delta[0]),
+                            previous[1].wrapping_add(delta[1]),
+                            previous[2].wrapping_add(delta[2]),
+                            previous[3].wrapping_add(delta[3]),
+                        ];
+                        table.push(color);
+                        previous = color;
+                    }
+                    let width_bits = if table_size <= 2 {
+                        3_u32
+                    } else if table_size <= 4 {
+                        2
+                    } else if table_size <= 16 {
+                        1
+                    } else {
+                        0
+                    };
+                    let output_width = current_width;
+                    current_width = div_round_up(current_width, 1_usize << width_bits)?;
+                    transforms.push(Vp8LTransform::ColorIndex {
+                        table,
+                        width_bits,
+                        input_width: current_width,
+                        output_width,
+                    });
+                }
+                _ => return Err(webp_err("invalid VP8L transform type")),
+            }
+        }
+    }
+
+    // Colour cache. Its symbols only extend the green alphabet.
+    let (cache_bits, cache_size) = if reader.read_bit()? == 1 {
+        let bits = reader.read_bits(4)?;
+        if bits > 11 {
+            return Err(webp_err("invalid VP8L colour cache size"));
+        }
+        (bits, 1_usize << bits)
+    } else {
+        (0, 0_usize)
+    };
+    let mut color_cache = vec![[0_u8; 4]; cache_size];
+
+    // Meta Huffman codes (main image only).
+    let mut meta_image: Option<Vec<usize>> = None;
+    let mut meta_bits = 0_u32;
+    let mut meta_width = 0_usize;
+    let mut num_groups = 1_usize;
+    if level0 && reader.read_bit()? == 1 {
+        meta_bits = reader.read_bits(3)? + 2;
+        let block = 1_usize << meta_bits;
+        meta_width = div_round_up(current_width, block)?;
+        let meta_height = div_round_up(height, block)?;
+        let image = vp8l_decode_stream(reader, meta_width, meta_height, false)?;
+        let mut groups: Vec<usize> = image
+            .iter()
+            .map(|pixel| (usize::from(pixel[1]) << 8) | usize::from(pixel[2]))
+            .collect();
+        let max_group = groups.iter().copied().max().unwrap_or(0);
+        if max_group > 65_535 {
+            return Err(webp_err("VP8L meta prefix code out of range"));
+        }
+        // Remap sparse group numbers to a dense range so a hostile stream
+        // cannot force a huge allocation.
+        let mut mapping = vec![usize::MAX; max_group + 1];
+        num_groups = 0;
+        for group in &mut groups {
+            if mapping[*group] == usize::MAX {
+                mapping[*group] = num_groups;
+                num_groups += 1;
+            }
+            *group = mapping[*group];
+        }
+        if num_groups > 1 {
+            meta_image = Some(groups);
+        } else {
+            meta_bits = 0;
+            meta_width = 0;
+            num_groups = 1;
+        }
+    }
+
+    // Five codes per group: green (+ length + cache), red, blue, alpha, dist.
+    let alphabets = [256 + 24 + cache_size, 256, 256, 256, 40];
+    let mut groups: Vec<Vec<Vp8LHuffman>> = Vec::with_capacity(num_groups);
+    for _ in 0..num_groups {
+        let mut codes = Vec::with_capacity(5);
+        for &alphabet in &alphabets {
+            codes.push(vp8l_read_huffman(reader, alphabet)?);
+        }
+        groups.push(codes);
+    }
+
+    let pixel_count = current_width
+        .checked_mul(height)
+        .ok_or_else(|| webp_err("VP8L image size overflow"))?;
+    let mut pixels = vec![[0_u8; 4]; pixel_count];
+    let mut index = 0_usize;
+    while index < pixel_count {
+        let group = match &meta_image {
+            Some(image) => {
+                let x = index % current_width;
+                let y = index / current_width;
+                let position = (y >> meta_bits)
+                    .checked_mul(meta_width)
+                    .and_then(|row| row.checked_add(x >> meta_bits))
+                    .ok_or_else(|| webp_err("VP8L meta image index overflow"))?;
+                *image
+                    .get(position)
+                    .ok_or_else(|| webp_err("VP8L meta image index out of range"))?
+            }
+            None => 0,
+        };
+        let codes = groups
+            .get(group)
+            .ok_or_else(|| webp_err("VP8L Huffman group out of range"))?;
+        let green_symbol = codes[0].decode(reader)?;
+        let pixel: [u8; 4] = if green_symbol < 256 {
+            let red = codes[1].decode(reader)? as u8;
+            let blue = codes[2].decode(reader)? as u8;
+            let alpha = codes[3].decode(reader)? as u8;
+            [alpha, red, green_symbol as u8, blue]
+        } else if green_symbol < 280 {
+            let length = vp8l_lex(reader, green_symbol - 256)?;
+            let distance_symbol = codes[4].decode(reader)?;
+            let distance = vp8l_distance(reader, distance_symbol, current_width)?;
+            if distance > index || length == 0 {
+                return Err(webp_err("invalid VP8L backward reference"));
+            }
+            let end = index
+                .checked_add(length)
+                .ok_or_else(|| webp_err("VP8L backward reference overflow"))?;
+            if end > pixel_count {
+                return Err(webp_err("VP8L backward reference exceeds image"));
+            }
+            for offset in 0..length {
+                let source = index - distance + offset;
+                let value = pixels[source];
+                pixels[index + offset] = value;
+            }
+            index = end;
+            continue;
+        } else {
+            *color_cache
+                .get(green_symbol - 280)
+                .ok_or_else(|| webp_err("VP8L colour cache index out of range"))?
+        };
+
+        if cache_size > 0 {
+            let argb = (u32::from(pixel[0]) << 24)
+                | (u32::from(pixel[1]) << 16)
+                | (u32::from(pixel[2]) << 8)
+                | u32::from(pixel[3]);
+            let hash = ((0x1e35_a7bd_u64 * u64::from(argb)) >> (32 - cache_bits)) as usize;
+            if let Some(slot) = color_cache.get_mut(hash) {
+                *slot = pixel;
+            }
+        }
+        pixels[index] = pixel;
+        index += 1;
+    }
+
+    // Inverse transforms are applied in the reverse of the order they were
+    // read. The colour-indexing transform changes the width, so each transform
+    // is paired with the resolution it was authored at.
+    let mut active_width = current_width;
+    for transform in transforms.iter().rev() {
+        match transform {
+            Vp8LTransform::Predictor {
+                size_bits,
+                transform_width,
+                modes,
+            } => {
+                vp8l_predictor_inverse(
+                    &mut pixels,
+                    active_width,
+                    height,
+                    *size_bits,
+                    *transform_width,
+                    modes,
+                )?;
+            }
+            Vp8LTransform::Color {
+                size_bits,
+                transform_width,
+                elements,
+            } => {
+                let block = 1_usize << *size_bits;
+                for y in 0..height {
+                    for x in 0..active_width {
+                        let position = (y >> *size_bits) * transform_width + (x >> *size_bits);
+                        let element = *elements
+                            .get(position)
+                            .ok_or_else(|| webp_err("VP8L colour transform index out of range"))?;
+                        let pixel = &mut pixels[y * active_width + x];
+                        let green = i16::from(pixel[2] as i8);
+                        let mut red = i16::from(pixel[1]);
+                        let mut blue = i16::from(pixel[3]);
+                        red += (i16::from(element[2] as i8) * green) >> 5;
+                        blue += (i16::from(element[1] as i8) * green) >> 5;
+                        blue += (i16::from(element[0] as i8) * i16::from(red as u8 as i8)) >> 5;
+                        pixel[1] = red as u8;
+                        pixel[3] = blue as u8;
+                        let _ = block;
+                    }
+                }
+            }
+            Vp8LTransform::SubtractGreen => {
+                for pixel in &mut pixels {
+                    pixel[1] = pixel[1].wrapping_add(pixel[2]);
+                    pixel[3] = pixel[3].wrapping_add(pixel[2]);
+                }
+            }
+            Vp8LTransform::ColorIndex {
+                table,
+                width_bits,
+                input_width,
+                output_width,
+            } => {
+                let group = 1_usize << *width_bits;
+                let index_bits = 8 / group;
+                let mask = (1_u8 << index_bits) - 1;
+                let mut expanded = vec![[0_u8; 4]; *output_width * height];
+                for y in 0..height {
+                    for packed_x in 0..*input_width {
+                        let packed = pixels[y * input_width + packed_x][2];
+                        for sub in 0..group {
+                            let x = packed_x * group + sub;
+                            if x >= *output_width {
+                                break;
+                            }
+                            let shift = sub * index_bits;
+                            let slot = usize::from((packed >> shift) & mask);
+                            expanded[y * output_width + x] =
+                                table.get(slot).copied().unwrap_or([0, 0, 0, 0]);
+                        }
+                    }
+                }
+                pixels = expanded;
+                active_width = *output_width;
+            }
+        }
+    }
+    if active_width != width {
+        return Err(webp_err("VP8L transform width does not match image"));
+    }
+    Ok(pixels)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn vp8l_predictor_inverse(
+    pixels: &mut [[u8; 4]],
+    width: usize,
+    height: usize,
+    size_bits: u32,
+    transform_width: usize,
+    modes: &[u8],
+) -> Result<(), DecodeError> {
+    let avg2 = |a: u8, b: u8| -> u8 { (u16::from(a) + u16::from(b)) as u8 / 2 };
+    let clamp = |value: i32| -> u8 { value.clamp(0, 255) as u8 };
+    for y in 0..height {
+        for x in 0..width {
+            let index = y * width + x;
+            let prediction: [u8; 4] = if index == 0 {
+                [255, 0, 0, 0]
+            } else if y == 0 {
+                pixels[index - 1]
+            } else if x == 0 {
+                pixels[index - width]
+            } else {
+                let position = (y >> size_bits) * transform_width + (x >> size_bits);
+                let mode = *modes
+                    .get(position)
+                    .ok_or_else(|| webp_err("VP8L predictor index out of range"))?;
+                let left = pixels[index - 1];
+                let top = pixels[index - width];
+                let top_left = pixels[index - width - 1];
+                let top_right = if x + 1 < width {
+                    pixels[index - width + 1]
+                } else {
+                    pixels[y * width]
+                };
+                let mut result = [0_u8; 4];
+                match mode {
+                    0 => result = [255, 0, 0, 0],
+                    1 => result = left,
+                    2 => result = top,
+                    3 => result = top_right,
+                    4 => result = top_left,
+                    5 => {
+                        for channel in 0..4 {
+                            result[channel] =
+                                avg2(avg2(left[channel], top_right[channel]), top[channel]);
+                        }
+                    }
+                    6 => {
+                        for channel in 0..4 {
+                            result[channel] = avg2(left[channel], top_left[channel]);
+                        }
+                    }
+                    7 => {
+                        for channel in 0..4 {
+                            result[channel] = avg2(left[channel], top[channel]);
+                        }
+                    }
+                    8 => {
+                        for channel in 0..4 {
+                            result[channel] = avg2(top_left[channel], top[channel]);
+                        }
+                    }
+                    9 => {
+                        for channel in 0..4 {
+                            result[channel] = avg2(top[channel], top_right[channel]);
+                        }
+                    }
+                    10 => {
+                        for channel in 0..4 {
+                            result[channel] = avg2(
+                                avg2(left[channel], top_left[channel]),
+                                avg2(top[channel], top_right[channel]),
+                            );
+                        }
+                    }
+                    11 => {
+                        let mut estimate = [0_i32; 4];
+                        for channel in 0..4 {
+                            estimate[channel] = i32::from(left[channel]) + i32::from(top[channel])
+                                - i32::from(top_left[channel]);
+                        }
+                        let distance_left: i32 = (0..4)
+                            .map(|channel| (estimate[channel] - i32::from(left[channel])).abs())
+                            .sum();
+                        let distance_top: i32 = (0..4)
+                            .map(|channel| (estimate[channel] - i32::from(top[channel])).abs())
+                            .sum();
+                        result = if distance_left < distance_top {
+                            left
+                        } else {
+                            top
+                        };
+                    }
+                    12 => {
+                        for channel in 0..4 {
+                            result[channel] = clamp(
+                                i32::from(left[channel]) + i32::from(top[channel])
+                                    - i32::from(top_left[channel]),
+                            );
+                        }
+                    }
+                    13 => {
+                        for channel in 0..4 {
+                            let average =
+                                (u16::from(left[channel]) + u16::from(top[channel])) as u8 / 2;
+                            result[channel] = clamp(
+                                i32::from(average)
+                                    + (i32::from(average) - i32::from(top_left[channel])) / 2,
+                            );
+                        }
+                    }
+                    _ => return Err(webp_err("invalid VP8L predictor mode")),
+                }
+                result
+            };
+            for channel in 0..4 {
+                pixels[index][channel] = pixels[index][channel].wrapping_add(prediction[channel]);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Decodes a complete VP8L chunk (including its 5-byte header) into RGBA8.
+fn decode_vp8l(data: &[u8]) -> Result<(u32, u32, Vec<u8>), DecodeError> {
+    if data.len() < 5 || data[0] != 0x2f {
+        return Err(webp_err("invalid VP8L signature"));
+    }
+    let mut reader = Vp8LReader::new(&data[1..]);
+    let width = reader.read_bits(14)? + 1;
+    let height = reader.read_bits(14)? + 1;
+    let _alpha_is_used = reader.read_bit()?;
+    if reader.read_bits(3)? != 0 {
+        return Err(webp_unsupported("VP8L versions other than 0"));
+    }
+    if width == 0 || height == 0 || width > MAX_DIMENSION || height > MAX_DIMENSION {
+        return Err(webp_err(format!(
+            "VP8L dimensions {width}x{height} are invalid or exceed the {MAX_DIMENSION} pixel limit"
+        )));
+    }
+    check_pixel_count(width, height, "VP8L")?;
+
+    let argb = vp8l_decode_stream(&mut reader, width as usize, height as usize, true)?;
+    let mut pixels = Vec::with_capacity(argb.len() * 4);
+    for color in argb {
+        pixels.extend_from_slice(&[color[1], color[2], color[3], color[0]]);
+    }
+    Ok((width, height, pixels))
+}
+
+const VP8_COEFFSPROBA0: [[[[u8; 11]; 3]; 8]; 4] = [
+    [
+        [
+            [128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128],
+            [128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128],
+            [128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128],
+        ],
+        [
+            [253, 136, 254, 255, 228, 219, 128, 128, 128, 128, 128],
+            [189, 129, 242, 255, 227, 213, 255, 219, 128, 128, 128],
+            [106, 126, 227, 252, 214, 209, 255, 255, 128, 128, 128],
+        ],
+        [
+            [1, 98, 248, 255, 236, 226, 255, 255, 128, 128, 128],
+            [181, 133, 238, 254, 221, 234, 255, 154, 128, 128, 128],
+            [78, 134, 202, 247, 198, 180, 255, 219, 128, 128, 128],
+        ],
+        [
+            [1, 185, 249, 255, 243, 255, 128, 128, 128, 128, 128],
+            [184, 150, 247, 255, 236, 224, 128, 128, 128, 128, 128],
+            [77, 110, 216, 255, 236, 230, 128, 128, 128, 128, 128],
+        ],
+        [
+            [1, 101, 251, 255, 241, 255, 128, 128, 128, 128, 128],
+            [170, 139, 241, 252, 236, 209, 255, 255, 128, 128, 128],
+            [37, 116, 196, 243, 228, 255, 255, 255, 128, 128, 128],
+        ],
+        [
+            [1, 204, 254, 255, 245, 255, 128, 128, 128, 128, 128],
+            [207, 160, 250, 255, 238, 128, 128, 128, 128, 128, 128],
+            [102, 103, 231, 255, 211, 171, 128, 128, 128, 128, 128],
+        ],
+        [
+            [1, 152, 252, 255, 240, 255, 128, 128, 128, 128, 128],
+            [177, 135, 243, 255, 234, 225, 128, 128, 128, 128, 128],
+            [80, 129, 211, 255, 194, 224, 128, 128, 128, 128, 128],
+        ],
+        [
+            [1, 1, 255, 128, 128, 128, 128, 128, 128, 128, 128],
+            [246, 1, 255, 128, 128, 128, 128, 128, 128, 128, 128],
+            [255, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128],
+        ],
+    ],
+    [
+        [
+            [198, 35, 237, 223, 193, 187, 162, 160, 145, 155, 62],
+            [131, 45, 198, 221, 172, 176, 220, 157, 252, 221, 1],
+            [68, 47, 146, 208, 149, 167, 221, 162, 255, 223, 128],
+        ],
+        [
+            [1, 149, 241, 255, 221, 224, 255, 255, 128, 128, 128],
+            [184, 141, 234, 253, 222, 220, 255, 199, 128, 128, 128],
+            [81, 99, 181, 242, 176, 190, 249, 202, 255, 255, 128],
+        ],
+        [
+            [1, 129, 232, 253, 214, 197, 242, 196, 255, 255, 128],
+            [99, 121, 210, 250, 201, 198, 255, 202, 128, 128, 128],
+            [23, 91, 163, 242, 170, 187, 247, 210, 255, 255, 128],
+        ],
+        [
+            [1, 200, 246, 255, 234, 255, 128, 128, 128, 128, 128],
+            [109, 178, 241, 255, 231, 245, 255, 255, 128, 128, 128],
+            [44, 130, 201, 253, 205, 192, 255, 255, 128, 128, 128],
+        ],
+        [
+            [1, 132, 239, 251, 219, 209, 255, 165, 128, 128, 128],
+            [94, 136, 225, 251, 218, 190, 255, 255, 128, 128, 128],
+            [22, 100, 174, 245, 186, 161, 255, 199, 128, 128, 128],
+        ],
+        [
+            [1, 182, 249, 255, 232, 235, 128, 128, 128, 128, 128],
+            [124, 143, 241, 255, 227, 234, 128, 128, 128, 128, 128],
+            [35, 77, 181, 251, 193, 211, 255, 205, 128, 128, 128],
+        ],
+        [
+            [1, 157, 247, 255, 236, 231, 255, 255, 128, 128, 128],
+            [121, 141, 235, 255, 225, 227, 255, 255, 128, 128, 128],
+            [45, 99, 188, 251, 195, 217, 255, 224, 128, 128, 128],
+        ],
+        [
+            [1, 1, 251, 255, 213, 255, 128, 128, 128, 128, 128],
+            [203, 1, 248, 255, 255, 128, 128, 128, 128, 128, 128],
+            [137, 1, 177, 255, 224, 255, 128, 128, 128, 128, 128],
+        ],
+    ],
+    [
+        [
+            [253, 9, 248, 251, 207, 208, 255, 192, 128, 128, 128],
+            [175, 13, 224, 243, 193, 185, 249, 198, 255, 255, 128],
+            [73, 17, 171, 221, 161, 179, 236, 167, 255, 234, 128],
+        ],
+        [
+            [1, 95, 247, 253, 212, 183, 255, 255, 128, 128, 128],
+            [239, 90, 244, 250, 211, 209, 255, 255, 128, 128, 128],
+            [155, 77, 195, 248, 188, 195, 255, 255, 128, 128, 128],
+        ],
+        [
+            [1, 24, 239, 251, 218, 219, 255, 205, 128, 128, 128],
+            [201, 51, 219, 255, 196, 186, 128, 128, 128, 128, 128],
+            [69, 46, 190, 239, 201, 218, 255, 228, 128, 128, 128],
+        ],
+        [
+            [1, 191, 251, 255, 255, 128, 128, 128, 128, 128, 128],
+            [223, 165, 249, 255, 213, 255, 128, 128, 128, 128, 128],
+            [141, 124, 248, 255, 255, 128, 128, 128, 128, 128, 128],
+        ],
+        [
+            [1, 16, 248, 255, 255, 128, 128, 128, 128, 128, 128],
+            [190, 36, 230, 255, 236, 255, 128, 128, 128, 128, 128],
+            [149, 1, 255, 128, 128, 128, 128, 128, 128, 128, 128],
+        ],
+        [
+            [1, 226, 255, 128, 128, 128, 128, 128, 128, 128, 128],
+            [247, 192, 255, 128, 128, 128, 128, 128, 128, 128, 128],
+            [240, 128, 255, 128, 128, 128, 128, 128, 128, 128, 128],
+        ],
+        [
+            [1, 134, 252, 255, 255, 128, 128, 128, 128, 128, 128],
+            [213, 62, 250, 255, 255, 128, 128, 128, 128, 128, 128],
+            [55, 93, 255, 128, 128, 128, 128, 128, 128, 128, 128],
+        ],
+        [
+            [128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128],
+            [128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128],
+            [128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128],
+        ],
+    ],
+    [
+        [
+            [202, 24, 213, 235, 186, 191, 220, 160, 240, 175, 255],
+            [126, 38, 182, 232, 169, 184, 228, 174, 255, 187, 128],
+            [61, 46, 138, 219, 151, 178, 240, 170, 255, 216, 128],
+        ],
+        [
+            [1, 112, 230, 250, 199, 191, 247, 159, 255, 255, 128],
+            [166, 109, 228, 252, 211, 215, 255, 174, 128, 128, 128],
+            [39, 77, 162, 232, 172, 180, 245, 178, 255, 255, 128],
+        ],
+        [
+            [1, 52, 220, 246, 198, 199, 249, 220, 255, 255, 128],
+            [124, 74, 191, 243, 183, 193, 250, 221, 255, 255, 128],
+            [24, 71, 130, 219, 154, 170, 243, 182, 255, 255, 128],
+        ],
+        [
+            [1, 182, 225, 249, 219, 240, 255, 224, 128, 128, 128],
+            [149, 150, 226, 252, 216, 205, 255, 171, 128, 128, 128],
+            [28, 108, 170, 242, 183, 194, 254, 223, 255, 255, 128],
+        ],
+        [
+            [1, 81, 230, 252, 204, 203, 255, 192, 128, 128, 128],
+            [123, 102, 209, 247, 188, 196, 255, 233, 128, 128, 128],
+            [20, 95, 153, 243, 164, 173, 255, 203, 128, 128, 128],
+        ],
+        [
+            [1, 222, 248, 255, 216, 213, 128, 128, 128, 128, 128],
+            [168, 175, 246, 252, 235, 205, 255, 255, 128, 128, 128],
+            [47, 116, 215, 255, 211, 212, 255, 255, 128, 128, 128],
+        ],
+        [
+            [1, 121, 236, 253, 212, 214, 255, 255, 128, 128, 128],
+            [141, 84, 213, 252, 201, 202, 255, 219, 128, 128, 128],
+            [42, 80, 160, 240, 162, 185, 255, 205, 128, 128, 128],
+        ],
+        [
+            [1, 1, 255, 128, 128, 128, 128, 128, 128, 128, 128],
+            [244, 1, 255, 128, 128, 128, 128, 128, 128, 128, 128],
+            [238, 1, 255, 128, 128, 128, 128, 128, 128, 128, 128],
+        ],
+    ],
+];
+const VP8_COEFFSUPDATEPROBA: [[[[u8; 11]; 3]; 8]; 4] = [
+    [
+        [
+            [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+            [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+            [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+        ],
+        [
+            [176, 246, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+            [223, 241, 252, 255, 255, 255, 255, 255, 255, 255, 255],
+            [249, 253, 253, 255, 255, 255, 255, 255, 255, 255, 255],
+        ],
+        [
+            [255, 244, 252, 255, 255, 255, 255, 255, 255, 255, 255],
+            [234, 254, 254, 255, 255, 255, 255, 255, 255, 255, 255],
+            [253, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+        ],
+        [
+            [255, 246, 254, 255, 255, 255, 255, 255, 255, 255, 255],
+            [239, 253, 254, 255, 255, 255, 255, 255, 255, 255, 255],
+            [254, 255, 254, 255, 255, 255, 255, 255, 255, 255, 255],
+        ],
+        [
+            [255, 248, 254, 255, 255, 255, 255, 255, 255, 255, 255],
+            [251, 255, 254, 255, 255, 255, 255, 255, 255, 255, 255],
+            [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+        ],
+        [
+            [255, 253, 254, 255, 255, 255, 255, 255, 255, 255, 255],
+            [251, 254, 254, 255, 255, 255, 255, 255, 255, 255, 255],
+            [254, 255, 254, 255, 255, 255, 255, 255, 255, 255, 255],
+        ],
+        [
+            [255, 254, 253, 255, 254, 255, 255, 255, 255, 255, 255],
+            [250, 255, 254, 255, 254, 255, 255, 255, 255, 255, 255],
+            [254, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+        ],
+        [
+            [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+            [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+            [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+        ],
+    ],
+    [
+        [
+            [217, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+            [225, 252, 241, 253, 255, 255, 254, 255, 255, 255, 255],
+            [234, 250, 241, 250, 253, 255, 253, 254, 255, 255, 255],
+        ],
+        [
+            [255, 254, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+            [223, 254, 254, 255, 255, 255, 255, 255, 255, 255, 255],
+            [238, 253, 254, 254, 255, 255, 255, 255, 255, 255, 255],
+        ],
+        [
+            [255, 248, 254, 255, 255, 255, 255, 255, 255, 255, 255],
+            [249, 254, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+            [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+        ],
+        [
+            [255, 253, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+            [247, 254, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+            [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+        ],
+        [
+            [255, 253, 254, 255, 255, 255, 255, 255, 255, 255, 255],
+            [252, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+            [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+        ],
+        [
+            [255, 254, 254, 255, 255, 255, 255, 255, 255, 255, 255],
+            [253, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+            [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+        ],
+        [
+            [255, 254, 253, 255, 255, 255, 255, 255, 255, 255, 255],
+            [250, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+            [254, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+        ],
+        [
+            [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+            [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+            [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+        ],
+    ],
+    [
+        [
+            [186, 251, 250, 255, 255, 255, 255, 255, 255, 255, 255],
+            [234, 251, 244, 254, 255, 255, 255, 255, 255, 255, 255],
+            [251, 251, 243, 253, 254, 255, 254, 255, 255, 255, 255],
+        ],
+        [
+            [255, 253, 254, 255, 255, 255, 255, 255, 255, 255, 255],
+            [236, 253, 254, 255, 255, 255, 255, 255, 255, 255, 255],
+            [251, 253, 253, 254, 254, 255, 255, 255, 255, 255, 255],
+        ],
+        [
+            [255, 254, 254, 255, 255, 255, 255, 255, 255, 255, 255],
+            [254, 254, 254, 255, 255, 255, 255, 255, 255, 255, 255],
+            [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+        ],
+        [
+            [255, 254, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+            [254, 254, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+            [254, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+        ],
+        [
+            [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+            [254, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+            [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+        ],
+        [
+            [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+            [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+            [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+        ],
+        [
+            [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+            [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+            [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+        ],
+        [
+            [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+            [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+            [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+        ],
+    ],
+    [
+        [
+            [248, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+            [250, 254, 252, 254, 255, 255, 255, 255, 255, 255, 255],
+            [248, 254, 249, 253, 255, 255, 255, 255, 255, 255, 255],
+        ],
+        [
+            [255, 253, 253, 255, 255, 255, 255, 255, 255, 255, 255],
+            [246, 253, 253, 255, 255, 255, 255, 255, 255, 255, 255],
+            [252, 254, 251, 254, 254, 255, 255, 255, 255, 255, 255],
+        ],
+        [
+            [255, 254, 252, 255, 255, 255, 255, 255, 255, 255, 255],
+            [248, 254, 253, 255, 255, 255, 255, 255, 255, 255, 255],
+            [253, 255, 254, 254, 255, 255, 255, 255, 255, 255, 255],
+        ],
+        [
+            [255, 251, 254, 255, 255, 255, 255, 255, 255, 255, 255],
+            [245, 251, 254, 255, 255, 255, 255, 255, 255, 255, 255],
+            [253, 253, 254, 255, 255, 255, 255, 255, 255, 255, 255],
+        ],
+        [
+            [255, 251, 253, 255, 255, 255, 255, 255, 255, 255, 255],
+            [252, 253, 254, 255, 255, 255, 255, 255, 255, 255, 255],
+            [255, 254, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+        ],
+        [
+            [255, 252, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+            [249, 255, 254, 255, 255, 255, 255, 255, 255, 255, 255],
+            [255, 255, 254, 255, 255, 255, 255, 255, 255, 255, 255],
+        ],
+        [
+            [255, 255, 253, 255, 255, 255, 255, 255, 255, 255, 255],
+            [250, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+            [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+        ],
+        [
+            [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+            [254, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+            [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+        ],
+    ],
+];
+const VP8_KBMODESPROBA: [[[u8; 9]; 10]; 10] = [
+    [
+        [231, 120, 48, 89, 115, 113, 120, 152, 112],
+        [152, 179, 64, 126, 170, 118, 46, 70, 95],
+        [175, 69, 143, 80, 85, 82, 72, 155, 103],
+        [56, 58, 10, 171, 218, 189, 17, 13, 152],
+        [114, 26, 17, 163, 44, 195, 21, 10, 173],
+        [121, 24, 80, 195, 26, 62, 44, 64, 85],
+        [144, 71, 10, 38, 171, 213, 144, 34, 26],
+        [170, 46, 55, 19, 136, 160, 33, 206, 71],
+        [63, 20, 8, 114, 114, 208, 12, 9, 226],
+        [81, 40, 11, 96, 182, 84, 29, 16, 36],
+    ],
+    [
+        [134, 183, 89, 137, 98, 101, 106, 165, 148],
+        [72, 187, 100, 130, 157, 111, 32, 75, 80],
+        [66, 102, 167, 99, 74, 62, 40, 234, 128],
+        [41, 53, 9, 178, 241, 141, 26, 8, 107],
+        [74, 43, 26, 146, 73, 166, 49, 23, 157],
+        [65, 38, 105, 160, 51, 52, 31, 115, 128],
+        [104, 79, 12, 27, 217, 255, 87, 17, 7],
+        [87, 68, 71, 44, 114, 51, 15, 186, 23],
+        [47, 41, 14, 110, 182, 183, 21, 17, 194],
+        [66, 45, 25, 102, 197, 189, 23, 18, 22],
+    ],
+    [
+        [88, 88, 147, 150, 42, 46, 45, 196, 205],
+        [43, 97, 183, 117, 85, 38, 35, 179, 61],
+        [39, 53, 200, 87, 26, 21, 43, 232, 171],
+        [56, 34, 51, 104, 114, 102, 29, 93, 77],
+        [39, 28, 85, 171, 58, 165, 90, 98, 64],
+        [34, 22, 116, 206, 23, 34, 43, 166, 73],
+        [107, 54, 32, 26, 51, 1, 81, 43, 31],
+        [68, 25, 106, 22, 64, 171, 36, 225, 114],
+        [34, 19, 21, 102, 132, 188, 16, 76, 124],
+        [62, 18, 78, 95, 85, 57, 50, 48, 51],
+    ],
+    [
+        [193, 101, 35, 159, 215, 111, 89, 46, 111],
+        [60, 148, 31, 172, 219, 228, 21, 18, 111],
+        [112, 113, 77, 85, 179, 255, 38, 120, 114],
+        [40, 42, 1, 196, 245, 209, 10, 25, 109],
+        [88, 43, 29, 140, 166, 213, 37, 43, 154],
+        [61, 63, 30, 155, 67, 45, 68, 1, 209],
+        [100, 80, 8, 43, 154, 1, 51, 26, 71],
+        [142, 78, 78, 16, 255, 128, 34, 197, 171],
+        [41, 40, 5, 102, 211, 183, 4, 1, 221],
+        [51, 50, 17, 168, 209, 192, 23, 25, 82],
+    ],
+    [
+        [138, 31, 36, 171, 27, 166, 38, 44, 229],
+        [67, 87, 58, 169, 82, 115, 26, 59, 179],
+        [63, 59, 90, 180, 59, 166, 93, 73, 154],
+        [40, 40, 21, 116, 143, 209, 34, 39, 175],
+        [47, 15, 16, 183, 34, 223, 49, 45, 183],
+        [46, 17, 33, 183, 6, 98, 15, 32, 183],
+        [57, 46, 22, 24, 128, 1, 54, 17, 37],
+        [65, 32, 73, 115, 28, 128, 23, 128, 205],
+        [40, 3, 9, 115, 51, 192, 18, 6, 223],
+        [87, 37, 9, 115, 59, 77, 64, 21, 47],
+    ],
+    [
+        [104, 55, 44, 218, 9, 54, 53, 130, 226],
+        [64, 90, 70, 205, 40, 41, 23, 26, 57],
+        [54, 57, 112, 184, 5, 41, 38, 166, 213],
+        [30, 34, 26, 133, 152, 116, 10, 32, 134],
+        [39, 19, 53, 221, 26, 114, 32, 73, 255],
+        [31, 9, 65, 234, 2, 15, 1, 118, 73],
+        [75, 32, 12, 51, 192, 255, 160, 43, 51],
+        [88, 31, 35, 67, 102, 85, 55, 186, 85],
+        [56, 21, 23, 111, 59, 205, 45, 37, 192],
+        [55, 38, 70, 124, 73, 102, 1, 34, 98],
+    ],
+    [
+        [125, 98, 42, 88, 104, 85, 117, 175, 82],
+        [95, 84, 53, 89, 128, 100, 113, 101, 45],
+        [75, 79, 123, 47, 51, 128, 81, 171, 1],
+        [57, 17, 5, 71, 102, 57, 53, 41, 49],
+        [38, 33, 13, 121, 57, 73, 26, 1, 85],
+        [41, 10, 67, 138, 77, 110, 90, 47, 114],
+        [115, 21, 2, 10, 102, 255, 166, 23, 6],
+        [101, 29, 16, 10, 85, 128, 101, 196, 26],
+        [57, 18, 10, 102, 102, 213, 34, 20, 43],
+        [117, 20, 15, 36, 163, 128, 68, 1, 26],
+    ],
+    [
+        [102, 61, 71, 37, 34, 53, 31, 243, 192],
+        [69, 60, 71, 38, 73, 119, 28, 222, 37],
+        [68, 45, 128, 34, 1, 47, 11, 245, 171],
+        [62, 17, 19, 70, 146, 85, 55, 62, 70],
+        [37, 43, 37, 154, 100, 163, 85, 160, 1],
+        [63, 9, 92, 136, 28, 64, 32, 201, 85],
+        [75, 15, 9, 9, 64, 255, 184, 119, 16],
+        [86, 6, 28, 5, 64, 255, 25, 248, 1],
+        [56, 8, 17, 132, 137, 255, 55, 116, 128],
+        [58, 15, 20, 82, 135, 57, 26, 121, 40],
+    ],
+    [
+        [164, 50, 31, 137, 154, 133, 25, 35, 218],
+        [51, 103, 44, 131, 131, 123, 31, 6, 158],
+        [86, 40, 64, 135, 148, 224, 45, 183, 128],
+        [22, 26, 17, 131, 240, 154, 14, 1, 209],
+        [45, 16, 21, 91, 64, 222, 7, 1, 197],
+        [56, 21, 39, 155, 60, 138, 23, 102, 213],
+        [83, 12, 13, 54, 192, 255, 68, 47, 28],
+        [85, 26, 85, 85, 128, 128, 32, 146, 171],
+        [18, 11, 7, 63, 144, 171, 4, 4, 246],
+        [35, 27, 10, 146, 174, 171, 12, 26, 128],
+    ],
+    [
+        [190, 80, 35, 99, 180, 80, 126, 54, 45],
+        [85, 126, 47, 87, 176, 51, 41, 20, 32],
+        [101, 75, 128, 139, 118, 146, 116, 128, 85],
+        [56, 41, 15, 176, 236, 85, 37, 9, 62],
+        [71, 30, 17, 119, 118, 255, 17, 18, 138],
+        [101, 38, 60, 138, 55, 70, 43, 26, 142],
+        [146, 36, 19, 30, 171, 255, 97, 27, 20],
+        [138, 45, 61, 62, 219, 1, 81, 188, 64],
+        [32, 41, 20, 117, 151, 142, 20, 21, 163],
+        [112, 19, 12, 61, 195, 128, 48, 4, 24],
+    ],
+];
+
+// -------------------------------------------------------------------------
+// VP8 (single key frame)
+// -------------------------------------------------------------------------
+
+/// MSB-first boolean decoder used by all VP8 data partitions.
+struct Vp8BoolReader<'a> {
+    data: &'a [u8],
+    pos: usize,
+    range: u32,
+    value: u32,
+    bit_count: u32,
+}
+
+impl<'a> Vp8BoolReader<'a> {
+    fn new(data: &'a [u8]) -> Result<Self, DecodeError> {
+        if data.len() < 2 {
+            return Err(webp_err("truncated VP8 data partition"));
+        }
+        Ok(Self {
+            data,
+            pos: 2,
+            range: 255,
+            value: (u32::from(data[0]) << 8) | u32::from(data[1]),
+            bit_count: 0,
+        })
+    }
+
+    /// Reads one bool whose probability of being zero is `prob / 256`.
+    fn read_bool(&mut self, prob: u8) -> Result<u32, DecodeError> {
+        let split = 1 + (((self.range - 1) * u32::from(prob)) >> 8);
+        let split8 = split << 8;
+        let result = if self.value >= split8 {
+            self.value -= split8;
+            self.range -= split;
+            1
+        } else {
+            self.range = split;
+            0
+        };
+        while self.range < 128 {
+            self.value <<= 1;
+            self.range <<= 1;
+            self.bit_count += 1;
+            if self.bit_count == 8 {
+                self.bit_count = 0;
+                // libwebp pads exhausted partitions with zero bits instead
+                // of failing; malformed streams simply decode as defaults.
+                let byte = self.data.get(self.pos).copied().unwrap_or(0);
+                self.pos += 1;
+                self.value |= u32::from(byte);
+            }
+        }
+        Ok(result)
+    }
+
+    /// Reads an unsigned `count`-bit literal (MSB first, probability 128).
+    fn read_literal(&mut self, count: u32) -> Result<u32, DecodeError> {
+        let mut value = 0_u32;
+        for _ in 0..count {
+            value = (value << 1) | self.read_bool(128)?;
+        }
+        Ok(value)
+    }
+
+    /// Reads VP8's signed literal encoding.
+    fn read_signed(&mut self, count: u32) -> Result<i32, DecodeError> {
+        if count == 0 {
+            return Ok(0);
+        }
+        let mut value = if self.read_bool(128)? == 1 { -1_i32 } else { 0 };
+        let mut remaining = count;
+        while remaining > 1 {
+            value = (value << 1) + self.read_bool(128)? as i32;
+            remaining -= 1;
+        }
+        Ok(value)
+    }
+}
+
+/// Dequantization matrix for one plane type. Index 0 is DC, 1 is AC.
+#[derive(Clone, Copy)]
+struct Vp8Quant {
+    dc: i32,
+    ac: i32,
+}
+
+/// Filter parameters for one frame/segment/mode combination.
+#[derive(Clone, Copy)]
+struct Vp8FilterStrength {
+    level: u8,
+    interior: u8,
+    hev: u8,
+}
+
+impl Vp8FilterStrength {
+    fn none() -> Self {
+        Self {
+            level: 0,
+            interior: 0,
+            hev: 0,
+        }
+    }
+}
+
+/// Everything the macroblock decoder needs from a key frame header.
+struct Vp8Frame<'a> {
+    width: u32,
+    height: u32,
+    mb_width: usize,
+    mb_height: usize,
+    scale_h: u32,
+    scale_v: u32,
+    quant: Vec<Vp8Quant>,
+    segment_enabled: bool,
+    segment_probs: [u8; 3],
+    filters: Vec<[Vp8FilterStrength; 2]>,
+    simple_filter: bool,
+    use_skip_proba: bool,
+    skip_p: u8,
+    token_probs: Box<[[[[u8; 11]; 3]; 8]; 4]>,
+    partitions: Vec<&'a [u8]>,
+}
+
+// Index -> coefficient band (RFC 6386 section 13.3).
+const VP8_BANDS: [usize; 17] = [0, 1, 2, 3, 6, 4, 5, 6, 6, 6, 6, 6, 6, 6, 6, 7, 0];
+
+const VP8_ZIGZAG: [usize; 16] = [0, 1, 4, 8, 5, 2, 3, 6, 9, 12, 13, 10, 7, 11, 14, 15];
+
+const VP8_DC_Q: [i32; 128] = [
+    4, 5, 6, 7, 8, 9, 10, 10, 11, 12, 13, 14, 15, 16, 17, 17, 18, 19, 20, 20, 21, 21, 22, 22, 23,
+    23, 24, 25, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 37, 38, 39, 40, 41, 42, 43, 44,
+    45, 46, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67,
+    68, 69, 70, 71, 72, 73, 74, 75, 76, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 91,
+    93, 95, 96, 98, 100, 101, 102, 104, 106, 108, 110, 112, 114, 116, 118, 122, 124, 126, 128, 130,
+    132, 134, 136, 138, 140, 143, 145, 148, 151, 154, 157,
+];
+
+const VP8_AC_Q: [i32; 128] = [
+    4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28,
+    29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52,
+    53, 54, 55, 56, 57, 58, 60, 62, 64, 66, 68, 70, 72, 74, 76, 78, 80, 82, 84, 86, 88, 90, 92, 94,
+    96, 98, 100, 102, 104, 106, 108, 110, 112, 114, 116, 119, 122, 125, 128, 131, 134, 137, 140,
+    143, 146, 149, 152, 155, 158, 161, 164, 167, 170, 173, 177, 181, 185, 189, 193, 197, 201, 205,
+    209, 213, 217, 221, 225, 229, 234, 239, 245, 249, 254, 259, 264, 269, 274, 279, 284,
+];
+
+// Probability tables for the "category" tokens dct_cat3..dct_cat6.
+const VP8_CAT_PROBS: [&[u8]; 4] = [
+    &[173, 148, 140],
+    &[176, 155, 140, 135],
+    &[180, 157, 141, 134, 130],
+    &[254, 254, 243, 230, 196, 177, 153, 140, 133, 130, 129],
+];
+
+fn vp8_clamp(value: i32) -> u8 {
+    value.clamp(0, 255) as u8
+}
+
+fn vp8_saturate_i8(value: i32) -> i32 {
+    value.clamp(-128, 127)
+}
+
+/// Parses the uncompressed frame tag, key-frame header and token partitions.
+fn vp8_parse_frame(data: &[u8]) -> Result<(Vp8Frame<'_>, Vp8BoolReader<'_>), DecodeError> {
+    if data.len() < 10 {
+        return Err(webp_err("truncated VP8 frame tag"));
+    }
+    let tag = webp_u24le(data, 0)?;
+    if tag & 1 != 0 {
+        return Err(webp_unsupported("VP8 interframes"));
+    }
+    let version = (tag >> 1) & 7;
+    if version > 3 {
+        return Err(webp_err("invalid VP8 version"));
+    }
+    if tag & 0x10 == 0 {
+        return Err(webp_unsupported("VP8 frames with show_frame = 0"));
+    }
+    let first_partition_size = (tag >> 5) as usize;
+    if data[3..6] != [0x9d, 0x01, 0x2a] {
+        return Err(webp_err("invalid VP8 key frame start code"));
+    }
+    let width_word = webp_u16le(data, 6)?;
+    let height_word = webp_u16le(data, 8)?;
+    let width = u32::from(width_word & 0x3fff);
+    let height = u32::from(height_word & 0x3fff);
+    let scale_h = u32::from(width_word >> 14);
+    let scale_v = u32::from(height_word >> 14);
+    if width == 0 || height == 0 || width > MAX_DIMENSION || height > MAX_DIMENSION {
+        return Err(webp_err(format!(
+            "VP8 dimensions {width}x{height} are invalid or exceed the {MAX_DIMENSION} pixel limit"
+        )));
+    }
+    check_pixel_count(width, height, "VP8")?;
+    let first_end = 10_usize
+        .checked_add(first_partition_size)
+        .ok_or_else(|| webp_err("VP8 partition size overflow"))?;
+    if first_end > data.len() || first_partition_size == 0 {
+        return Err(webp_err("truncated VP8 first partition"));
+    }
+    let mut reader = Vp8BoolReader::new(&data[10..first_end])?;
+
+    // 9.2: colour space and clamp type (hints only).
+    let _color_space = reader.read_bool(128)?;
+    let _clamp_type = reader.read_bool(128)?;
+
+    // 9.3: segmentation.
+    let segment_enabled = reader.read_bool(128)? != 0;
+    let mut update_map = false;
+    let mut segment_quant = [0_i32; 4];
+    let mut segment_filter = [0_i32; 4];
+    let mut absolute_delta = false;
+    let mut segment_probs = [255_u8; 3];
+    if segment_enabled {
+        update_map = reader.read_bool(128)? != 0;
+        let update_features = reader.read_bool(128)? != 0;
+        if update_features {
+            absolute_delta = reader.read_bool(128)? != 0;
+            for slot in &mut segment_quant {
+                if reader.read_bool(128)? != 0 {
+                    let magnitude = reader.read_literal(7)? as i32;
+                    let sign = reader.read_bool(128)?;
+                    *slot = if sign == 1 { -magnitude } else { magnitude };
+                }
+            }
+            for slot in &mut segment_filter {
+                if reader.read_bool(128)? != 0 {
+                    let magnitude = reader.read_literal(6)? as i32;
+                    let sign = reader.read_bool(128)?;
+                    *slot = if sign == 1 { -magnitude } else { magnitude };
+                }
+            }
+        }
+        if update_map {
+            for slot in &mut segment_probs {
+                if reader.read_bool(128)? != 0 {
+                    *slot = reader.read_literal(8)? as u8;
+                }
+            }
+        }
+    }
+
+    // 9.4: loop filter.
+    let simple_filter = reader.read_bool(128)? != 0;
+    let filter_level = reader.read_literal(6)? as i32;
+    let sharpness = reader.read_literal(3)?;
+    let lf_adjust_enabled = reader.read_bool(128)? != 0;
+    let mut ref_lf_delta = [0_i32; 4];
+    let mut mode_lf_delta = [0_i32; 4];
+    if lf_adjust_enabled && reader.read_bool(128)? != 0 {
+        for slot in &mut ref_lf_delta {
+            if reader.read_bool(128)? != 0 {
+                *slot = reader.read_signed(6)?;
+            }
+        }
+        for slot in &mut mode_lf_delta {
+            if reader.read_bool(128)? != 0 {
+                *slot = reader.read_signed(6)?;
+            }
+        }
+    }
+
+    // 9.5: how many coefficient partitions (the sizes live after partition 0).
+    let log2_partitions = reader.read_literal(2)?;
+    let num_partitions = 1_usize << log2_partitions;
+
+    // 9.6: quantizer indices.
+    let base_q = reader.read_literal(7)? as i32;
+    let mut quant_deltas = [0_i32; 5];
+    for slot in &mut quant_deltas {
+        if reader.read_bool(128)? != 0 {
+            *slot = reader.read_signed(4)?;
+        }
+    }
+
+    // Key frames ignore the entropy-refresh flag.
+    let _refresh_entropy = reader.read_bool(128)?;
+
+    // 9.9: token probability updates (defaults restored on every key frame).
+    let mut token_probs = Box::new(VP8_COEFFSPROBA0);
+    for t in 0..4 {
+        for b in 0..8 {
+            for c in 0..3 {
+                for p in 0..11 {
+                    if reader.read_bool(VP8_COEFFSUPDATEPROBA[t][b][c][p])? != 0 {
+                        token_probs[t][b][c][p] = reader.read_literal(8)? as u8;
+                    }
+                }
+            }
+        }
+    }
+
+    let use_skip_proba = reader.read_bool(128)? != 0;
+    let skip_p = if use_skip_proba {
+        reader.read_literal(8)? as u8
+    } else {
+        0
+    };
+
+    // Partition sizes are three raw little-endian bytes immediately after the
+    // first partition, followed by the partition payloads themselves.
+    let size_table = &data[first_end..];
+    if size_table.len() < (num_partitions - 1) * 3 {
+        return Err(webp_err("truncated VP8 partition size table"));
+    }
+    let mut sizes = Vec::with_capacity(num_partitions);
+    for part in 0..num_partitions - 1 {
+        sizes.push(webp_u24le(size_table, part * 3)? as usize);
+    }
+    let mut cursor = first_end + (num_partitions - 1) * 3;
+    let mut partitions = Vec::with_capacity(num_partitions);
+    for (part, size) in sizes.iter().enumerate() {
+        let end = cursor
+            .checked_add(*size)
+            .ok_or_else(|| webp_err("VP8 partition size overflow"))?;
+        if end > data.len() {
+            return Err(webp_err("truncated VP8 data partition"));
+        }
+        // libwebp clamps a partition that runs past the end of the buffer.
+        if part + 1 == num_partitions {
+            partitions.push(&data[cursor..]);
+        } else {
+            partitions.push(&data[cursor..end]);
+        }
+        cursor = end;
+    }
+    if num_partitions == 1 {
+        partitions.push(&data[first_end..]);
+    }
+
+    // Precompute per-segment quantizers and filter strengths.
+    let mut quant = Vec::with_capacity(4);
+    let mut filters = Vec::with_capacity(4);
+    for segment in 0..4 {
+        let q = if segment_enabled {
+            if absolute_delta {
+                segment_quant[segment]
+            } else {
+                base_q + segment_quant[segment]
+            }
+        } else {
+            base_q
+        }
+        .clamp(0, 127) as usize;
+        let y_dc = VP8_DC_Q[(q as i32 + quant_deltas[0]).clamp(0, 127) as usize];
+        let y2_dc = 2 * VP8_DC_Q[(q as i32 + quant_deltas[1]).clamp(0, 127) as usize];
+        let y2_ac = (VP8_AC_Q[(q as i32 + quant_deltas[2]).clamp(0, 127) as usize] * 101581) >> 16;
+        let uv_dc = VP8_DC_Q[(q as i32 + quant_deltas[3]).clamp(0, 117) as usize];
+        let uv_ac = VP8_AC_Q[(q as i32 + quant_deltas[4]).clamp(0, 127) as usize];
+        quant.push(Vp8Quant {
+            dc: y_dc,
+            ac: VP8_AC_Q[q],
+        });
+        quant.push(Vp8Quant {
+            dc: y2_dc,
+            ac: y2_ac.max(8),
+        });
+        quant.push(Vp8Quant {
+            dc: uv_dc,
+            ac: uv_ac,
+        });
+
+        let segment_level = if segment_enabled {
+            if absolute_delta {
+                segment_filter[segment]
+            } else {
+                filter_level + segment_filter[segment]
+            }
+        } else {
+            filter_level
+        };
+        let mut per_mode = [Vp8FilterStrength::none(); 2];
+        for (index, strength) in per_mode.iter_mut().enumerate() {
+            let mut level = segment_level;
+            if lf_adjust_enabled {
+                level += ref_lf_delta[0];
+                if index == 1 {
+                    level += mode_lf_delta[0];
+                }
+            }
+            level = level.clamp(0, 63);
+            if level > 0 {
+                let mut interior = level;
+                if sharpness > 0 {
+                    interior >>= if sharpness > 4 { 2 } else { 1 };
+                    interior = interior.min(9_i32 - sharpness as i32);
+                }
+                interior = interior.max(1);
+                *strength = Vp8FilterStrength {
+                    level: level as u8,
+                    interior: interior as u8,
+                    hev: if level >= 40 {
+                        2
+                    } else if level >= 15 {
+                        1
+                    } else {
+                        0
+                    },
+                };
+            }
+        }
+        filters.push(per_mode);
+    }
+
+    let mb_width = (width as usize).div_ceil(16);
+    let mb_height = (height as usize).div_ceil(16);
+
+    Ok((
+        Vp8Frame {
+            width,
+            height,
+            mb_width,
+            mb_height,
+            scale_h,
+            scale_v,
+            quant,
+            segment_enabled: update_map,
+            segment_probs,
+            filters,
+            simple_filter,
+            use_skip_proba,
+            skip_p,
+            token_probs,
+            partitions,
+        },
+        reader,
+    ))
+}
+
+/// Reads the highest-value token in a VP8 coefficient block and returns its
+/// magnitude (without sign).
+fn vp8_large_value(reader: &mut Vp8BoolReader<'_>, probs: &[u8; 11]) -> Result<i32, DecodeError> {
+    if reader.read_bool(probs[3])? == 0 {
+        if reader.read_bool(probs[4])? == 0 {
+            Ok(2)
+        } else {
+            Ok(3 + reader.read_bool(probs[5])? as i32)
+        }
+    } else if reader.read_bool(probs[6])? == 0 {
+        if reader.read_bool(probs[7])? == 0 {
+            Ok(5 + reader.read_bool(159)? as i32)
+        } else {
+            Ok(7 + 2 * reader.read_bool(165)? as i32 + reader.read_bool(145)? as i32)
+        }
+    } else {
+        let bit1 = reader.read_bool(probs[8])? as usize;
+        let bit0 = reader.read_bool(probs[9 + bit1])? as usize;
+        let category = 2 * bit1 + bit0;
+        let table = VP8_CAT_PROBS[category];
+        let mut value = 0_i32;
+        for &prob in table {
+            value = value * 2 + reader.read_bool(prob)? as i32;
+        }
+        Ok(value + 3 + (8 << category))
+    }
+}
+
+/// Decodes one 4x4 block of quantized, dequantized coefficients. Returns the
+/// number of coefficients up to and including the last non-zero one, and fills
+/// `output` in natural (row-major) order.
+#[allow(clippy::too_many_arguments)]
+fn vp8_read_coeffs(
+    reader: &mut Vp8BoolReader<'_>,
+    probs: &[[[[u8; 11]; 3]; 8]; 4],
+    plane_type: usize,
+    dequant: Vp8Quant,
+    context: usize,
+    first: usize,
+    output: &mut [i32; 16],
+) -> Result<usize, DecodeError> {
+    output.fill(0);
+    let mut index = first;
+    let mut context = context;
+    while index < 16 {
+        let mut table = &probs[plane_type][VP8_BANDS[index]][context];
+        if reader.read_bool(table[0])? == 0 {
+            return Ok(index);
+        }
+        // Consume a run of zero coefficients; after the first zero the band's
+        // context is always zero.
+        loop {
+            if reader.read_bool(table[1])? != 0 {
+                break;
+            }
+            index += 1;
+            if index == 16 {
+                return Ok(16);
+            }
+            table = &probs[plane_type][VP8_BANDS[index]][0];
+        }
+        let magnitude = if reader.read_bool(table[2])? == 0 {
+            1
+        } else {
+            vp8_large_value(reader, table)?
+        };
+        let sign = reader.read_bool(128)?;
+        let quant = if index == 0 { dequant.dc } else { dequant.ac };
+        let value = magnitude * quant;
+        output[VP8_ZIGZAG[index]] = if sign == 1 { -value } else { value };
+        context = if magnitude == 1 { 1 } else { 2 };
+        index += 1;
+    }
+    Ok(16)
+}
+
+/// Inverse 4x4 Walsh-Hadamard transform of the Y2 block.
+fn vp8_inverse_wht(input: &[i32; 16]) -> [i32; 16] {
+    let mut temporary = [0_i32; 16];
+    for column in 0..4 {
+        let a1 = input[column] + input[column + 12];
+        let b1 = input[column + 4] + input[column + 8];
+        let c1 = input[column + 4] - input[column + 8];
+        let d1 = input[column] - input[column + 12];
+        temporary[column] = a1 + b1;
+        temporary[column + 4] = c1 + d1;
+        temporary[column + 8] = a1 - b1;
+        temporary[column + 12] = d1 - c1;
+    }
+    let mut output = [0_i32; 16];
+    for row in 0..4 {
+        let base = row * 4;
+        let a1 = temporary[base] + temporary[base + 3];
+        let b1 = temporary[base + 1] + temporary[base + 2];
+        let c1 = temporary[base + 1] - temporary[base + 2];
+        let d1 = temporary[base] - temporary[base + 3];
+        output[base] = (a1 + b1 + 3) >> 3;
+        output[base + 1] = (c1 + d1 + 3) >> 3;
+        output[base + 2] = (a1 - b1 + 3) >> 3;
+        output[base + 3] = (d1 - c1 + 3) >> 3;
+    }
+    output
+}
+
+/// Fixed-point inverse 4x4 DCT from RFC 6386 section 14.4.
+fn vp8_inverse_dct(input: &[i32; 16]) -> [i32; 16] {
+    const COSPI8SQRT2MINUS1: i32 = 20091;
+    const SINPI8SQRT2: i32 = 35468;
+    let mut temporary = [0_i32; 16];
+    for column in 0..4 {
+        let a1 = input[column] + input[column + 8];
+        let b1 = input[column] - input[column + 8];
+        let temp1 = (input[column + 4] * SINPI8SQRT2) >> 16;
+        let temp2 = input[column + 12] + ((input[column + 12] * COSPI8SQRT2MINUS1) >> 16);
+        let c1 = temp1 - temp2;
+        let temp1 = input[column + 4] + ((input[column + 4] * COSPI8SQRT2MINUS1) >> 16);
+        let temp2 = (input[column + 12] * SINPI8SQRT2) >> 16;
+        let d1 = temp1 + temp2;
+        temporary[column] = a1 + d1;
+        temporary[column + 12] = a1 - d1;
+        temporary[column + 4] = b1 + c1;
+        temporary[column + 8] = b1 - c1;
+    }
+    let mut output = [0_i32; 16];
+    for row in 0..4 {
+        let base = row * 4;
+        let a1 = temporary[base] + temporary[base + 2];
+        let b1 = temporary[base] - temporary[base + 2];
+        let temp1 = (temporary[base + 1] * SINPI8SQRT2) >> 16;
+        let temp2 = temporary[base + 3] + ((temporary[base + 3] * COSPI8SQRT2MINUS1) >> 16);
+        let c1 = temp1 - temp2;
+        let temp1 = temporary[base + 1] + ((temporary[base + 1] * COSPI8SQRT2MINUS1) >> 16);
+        let temp2 = (temporary[base + 3] * SINPI8SQRT2) >> 16;
+        let d1 = temp1 + temp2;
+        output[base] = (a1 + d1 + 4) >> 3;
+        output[base + 3] = (a1 - d1 + 4) >> 3;
+        output[base + 1] = (b1 + c1 + 4) >> 3;
+        output[base + 2] = (b1 - c1 + 4) >> 3;
+    }
+    output
+}
+
+fn vp8_above_row(plane: &[u8], stride: usize, mb_x: usize, mb_y: usize, size: usize) -> [u8; 16] {
+    let mut row = [127_u8; 16];
+    if mb_y > 0 {
+        let start = (mb_y * size - 1) * stride + mb_x * size;
+        row[..size].copy_from_slice(&plane[start..start + size]);
+    }
+    row
+}
+
+fn vp8_left_column(plane: &[u8], stride: usize, mb_x: usize, mb_y: usize, size: usize) -> [u8; 16] {
+    let mut column = [129_u8; 16];
+    if mb_x > 0 {
+        for index in 0..size {
+            column[index] = plane[(mb_y * size + index) * stride + mb_x * size - 1];
+        }
+    }
+    column
+}
+
+/// Predicts one 16x16 or 8x8 intra block, including the special DC border cases.
+fn vp8_intra_predict(
+    plane: &[u8],
+    stride: usize,
+    mb_x: usize,
+    mb_y: usize,
+    size: usize,
+    mode: usize,
+) -> Result<Vec<u8>, DecodeError> {
+    let above = vp8_above_row(plane, stride, mb_x, mb_y, size);
+    let left = vp8_left_column(plane, stride, mb_x, mb_y, size);
+    let mut block = vec![0_u8; size * size];
+    match mode {
+        0 => {
+            let value = if mb_x == 0 && mb_y == 0 {
+                128
+            } else if mb_y == 0 {
+                let sum: u32 = left.iter().take(size).map(|&value| u32::from(value)).sum();
+                ((sum + (size as u32 / 2)) / size as u32) as u8
+            } else if mb_x == 0 {
+                let sum: u32 = above.iter().take(size).map(|&value| u32::from(value)).sum();
+                ((sum + (size as u32 / 2)) / size as u32) as u8
+            } else {
+                let sum: u32 = above
+                    .iter()
+                    .take(size)
+                    .map(|&value| u32::from(value))
+                    .sum::<u32>()
+                    + left
+                        .iter()
+                        .take(size)
+                        .map(|&value| u32::from(value))
+                        .sum::<u32>();
+                ((sum + size as u32) / (2 * size as u32)) as u8
+            };
+            block.fill(value);
+        }
+        1 => {
+            for y in 0..size {
+                for x in 0..size {
+                    block[y * size + x] = above[x];
+                }
+            }
+        }
+        2 => {
+            for y in 0..size {
+                for x in 0..size {
+                    block[y * size + x] = left[y];
+                }
+            }
+        }
+        3 => {
+            let top_left = if mb_x > 0 && mb_y > 0 {
+                plane[(mb_y * size - 1) * stride + mb_x * size - 1]
+            } else {
+                127
+            };
+            for y in 0..size {
+                for x in 0..size {
+                    block[y * size + x] =
+                        vp8_clamp(i32::from(left[y]) + i32::from(above[x]) - i32::from(top_left));
+                }
+            }
+        }
+        _ => return Err(webp_err("invalid VP8 intra prediction mode")),
+    }
+    Ok(block)
+}
+
+fn vp8_subblock_pixel(plane: &[u8], stride: usize, mb_x: usize, mb_y: usize, x: i32, y: i32) -> u8 {
+    if y < 0 {
+        return 127;
+    }
+    if x < 0 {
+        return 129;
+    }
+    if x >= 16 {
+        // Only used above the right edge of a macroblock; the reference pixel
+        // is the rightmost pixel on the line above (or 127 in the top row).
+        if mb_y == 0 {
+            return 127;
+        }
+        return plane[(mb_y * 16 - 1) * stride + mb_x * 16 + 15];
+    }
+    let absolute = mb_x * 16 + x as usize;
+    if absolute >= stride {
+        return plane[y as usize * stride + stride - 1];
+    }
+    plane[y as usize * stride + absolute]
+}
+
+/// Predicts one 4x4 luma subblock using the ten intra-bmode formulas.
+#[allow(clippy::needless_range_loop)]
+fn vp8_subblock_predict(
+    plane: &[u8],
+    stride: usize,
+    mb_x: usize,
+    mb_y: usize,
+    bx: usize,
+    by: usize,
+    mode: usize,
+) -> Result<[u8; 16], DecodeError> {
+    let px = (bx * 4) as i32;
+    let py = (by * 4) as i32;
+    let get = |x: i32, y: i32| vp8_subblock_pixel(plane, stride, mb_x, mb_y, px + x, py + y);
+    let mut a = [0_u8; 8];
+    for (index, slot) in a.iter_mut().enumerate() {
+        *slot = get(index as i32, -1);
+    }
+    let mut l = [0_u8; 4];
+    for (index, slot) in l.iter_mut().enumerate() {
+        *slot = get(-1, index as i32);
+    }
+    let p = get(-1, -1);
+    let e = [l[3], l[2], l[1], l[0], p, a[0], a[1], a[2], a[3]];
+    let avg2 = |x: u8, y: u8| -> u8 { (u16::from(x) + u16::from(y) + 1) as u8 / 2 };
+    let avg3 = |x: u8, y: u8, z: u8| -> u8 {
+        (u16::from(x) + 2 * u16::from(y) + u16::from(z) + 2) as u8 / 4
+    };
+    let avg3_at =
+        |values: &[u8], at: usize| -> u8 { avg3(values[at - 1], values[at], values[at + 1]) };
+    let avg2_at = |values: &[u8], at: usize| -> u8 { avg2(values[at], values[at + 1]) };
+    let mut block = [0_u8; 16];
+    let set = |block: &mut [u8; 16], x: usize, y: usize, value: u8| block[y * 4 + x] = value;
+    match mode {
+        0 => {
+            let mut sum = 4_u32;
+            for index in 0..4 {
+                sum += u32::from(a[index]) + u32::from(l[index]);
+            }
+            block.fill((sum >> 3) as u8);
+        }
+        1 => {
+            for y in 0..4 {
+                for x in 0..4 {
+                    set(
+                        &mut block,
+                        x,
+                        y,
+                        vp8_clamp(i32::from(l[y]) + i32::from(a[x]) - i32::from(p)),
+                    );
+                }
+            }
+        }
+        2 => {
+            for x in 0..4 {
+                let value = if x == 0 {
+                    avg3(p, a[0], a[1])
+                } else {
+                    avg3_at(&a, x)
+                };
+                for y in 0..4 {
+                    set(&mut block, x, y, value);
+                }
+            }
+        }
+        3 => {
+            let mut value = avg3(l[2], l[3], l[3]);
+            for y in (0..4).rev() {
+                for x in 0..4 {
+                    set(&mut block, x, y, value);
+                }
+                if y > 0 {
+                    let previous = if y == 1 { p } else { l[y - 2] };
+                    value = avg3(previous, l[y - 1], l[y]);
+                }
+            }
+        }
+        4 => {
+            set(&mut block, 0, 0, avg3_at(&a, 1));
+            set(&mut block, 1, 0, avg3_at(&a, 2));
+            set(&mut block, 0, 1, avg3_at(&a, 2));
+            set(&mut block, 2, 0, avg3_at(&a, 3));
+            set(&mut block, 1, 1, avg3_at(&a, 3));
+            set(&mut block, 0, 2, avg3_at(&a, 3));
+            set(&mut block, 3, 0, avg3_at(&a, 4));
+            set(&mut block, 2, 1, avg3_at(&a, 4));
+            set(&mut block, 1, 2, avg3_at(&a, 4));
+            set(&mut block, 0, 3, avg3_at(&a, 4));
+            set(&mut block, 3, 1, avg3_at(&a, 5));
+            set(&mut block, 2, 2, avg3_at(&a, 5));
+            set(&mut block, 1, 3, avg3_at(&a, 5));
+            set(&mut block, 3, 2, avg3_at(&a, 6));
+            set(&mut block, 2, 3, avg3_at(&a, 6));
+            set(&mut block, 3, 3, avg3(a[6], a[7], a[7]));
+        }
+        5 => {
+            set(&mut block, 0, 3, avg3_at(&e, 1));
+            set(&mut block, 0, 2, avg3_at(&e, 2));
+            set(&mut block, 1, 3, avg3_at(&e, 2));
+            set(&mut block, 0, 1, avg3_at(&e, 3));
+            set(&mut block, 1, 2, avg3_at(&e, 3));
+            set(&mut block, 2, 3, avg3_at(&e, 3));
+            set(&mut block, 0, 0, avg3_at(&e, 4));
+            set(&mut block, 1, 1, avg3_at(&e, 4));
+            set(&mut block, 2, 2, avg3_at(&e, 4));
+            set(&mut block, 3, 3, avg3_at(&e, 4));
+            set(&mut block, 1, 0, avg3_at(&e, 5));
+            set(&mut block, 2, 1, avg3_at(&e, 5));
+            set(&mut block, 3, 2, avg3_at(&e, 5));
+            set(&mut block, 2, 0, avg3_at(&e, 6));
+            set(&mut block, 3, 1, avg3_at(&e, 6));
+            set(&mut block, 3, 0, avg3_at(&e, 7));
+        }
+        6 => {
+            set(&mut block, 0, 3, avg3_at(&e, 2));
+            set(&mut block, 0, 2, avg3_at(&e, 3));
+            set(&mut block, 1, 3, avg3_at(&e, 4));
+            set(&mut block, 1, 0, avg3_at(&e, 4));
+            set(&mut block, 0, 0, avg2_at(&e, 4));
+            set(&mut block, 2, 3, avg3_at(&e, 5));
+            set(&mut block, 2, 0, avg2_at(&e, 5));
+            set(&mut block, 1, 1, avg3_at(&e, 5));
+            set(&mut block, 3, 3, avg3_at(&e, 6));
+            set(&mut block, 3, 0, avg2_at(&e, 6));
+            set(&mut block, 2, 1, avg3_at(&e, 6));
+            set(&mut block, 1, 2, avg3_at(&e, 7));
+            set(&mut block, 0, 1, avg2_at(&e, 7));
+            set(&mut block, 3, 1, avg3_at(&e, 7));
+            set(&mut block, 0, 2, avg2_at(&e, 7));
+        }
+        7 => {
+            set(&mut block, 0, 0, avg2(p, a[0]));
+            set(&mut block, 1, 0, avg3_at(&a, 1));
+            set(&mut block, 0, 1, avg2_at(&a, 1));
+            set(&mut block, 2, 0, avg3_at(&a, 2));
+            set(&mut block, 1, 1, avg2_at(&a, 2));
+            set(&mut block, 0, 2, avg3_at(&a, 2));
+            set(&mut block, 3, 0, avg3_at(&a, 3));
+            set(&mut block, 2, 1, avg2_at(&a, 3));
+            set(&mut block, 1, 2, avg3_at(&a, 3));
+            set(&mut block, 0, 3, avg2_at(&a, 3));
+            set(&mut block, 3, 1, avg3_at(&a, 4));
+            set(&mut block, 2, 2, avg2_at(&a, 4));
+            set(&mut block, 1, 3, avg3_at(&a, 4));
+            set(&mut block, 3, 2, avg3_at(&a, 5));
+            set(&mut block, 2, 3, avg3_at(&a, 6));
+            set(&mut block, 3, 3, avg3_at(&a, 7));
+        }
+        8 => {
+            set(&mut block, 3, 0, avg2_at(&e, 0));
+            set(&mut block, 3, 1, avg3_at(&e, 1));
+            set(&mut block, 2, 0, avg2_at(&e, 1));
+            set(&mut block, 3, 2, avg2_at(&e, 1));
+            set(&mut block, 2, 1, avg3_at(&e, 2));
+            set(&mut block, 3, 3, avg3_at(&e, 2));
+            set(&mut block, 2, 2, avg2_at(&e, 2));
+            set(&mut block, 1, 0, avg2_at(&e, 2));
+            set(&mut block, 2, 3, avg3_at(&e, 3));
+            set(&mut block, 1, 1, avg3_at(&e, 3));
+            set(&mut block, 1, 2, avg2_at(&e, 3));
+            set(&mut block, 0, 0, avg2_at(&e, 3));
+            set(&mut block, 1, 3, avg3_at(&e, 4));
+            set(&mut block, 0, 1, avg3_at(&e, 4));
+            set(&mut block, 0, 2, avg3_at(&e, 5));
+            set(&mut block, 0, 3, avg3_at(&e, 6));
+        }
+        9 => {
+            set(&mut block, 0, 0, avg2_at(&l, 0));
+            set(&mut block, 0, 1, avg3_at(&l, 1));
+            set(&mut block, 0, 2, avg2_at(&l, 1));
+            set(&mut block, 1, 0, avg2_at(&l, 1));
+            set(&mut block, 0, 3, avg3_at(&l, 2));
+            set(&mut block, 1, 1, avg3_at(&l, 2));
+            set(&mut block, 1, 2, avg2_at(&l, 2));
+            set(&mut block, 2, 0, avg2_at(&l, 2));
+            set(&mut block, 1, 3, avg3(l[2], l[3], l[3]));
+            set(&mut block, 2, 1, avg3(l[2], l[3], l[3]));
+            for y in 2..4 {
+                for x in 0..4 {
+                    if y == 2 && x < 2 {
+                        continue;
+                    }
+                    set(&mut block, x, y, l[3]);
+                }
+            }
+        }
+        _ => return Err(webp_err("invalid VP8 subblock prediction mode")),
+    }
+    Ok(block)
+}
+
+/// Adds a transformed residual to a prediction block and writes it into a
+/// plane at the given top-left position.
+#[allow(clippy::too_many_arguments)]
+fn vp8_add_block(
+    plane: &mut [u8],
+    stride: usize,
+    origin_x: usize,
+    origin_y: usize,
+    prediction: &[u8],
+    prediction_x: usize,
+    prediction_y: usize,
+    prediction_stride: usize,
+    coefficients: &[i32; 16],
+) {
+    let residual = vp8_inverse_dct(coefficients);
+    for y in 0..4 {
+        for x in 0..4 {
+            let predicted = prediction[(prediction_y + y) * prediction_stride + prediction_x + x];
+            plane[(origin_y + y) * stride + origin_x + x] =
+                vp8_clamp(i32::from(predicted) + residual[y * 4 + x]);
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Vp8MbInfo {
+    segment: usize,
+    is_i4x4: bool,
+    has_coefficients: bool,
+}
+
+/// Decodes all macroblocks and returns the three YUV planes (padded to whole
+/// macroblocks) plus per-macroblock filter information.
+type Vp8Planes = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<Vp8MbInfo>);
+
+#[allow(clippy::needless_range_loop)]
+fn vp8_reconstruct(
+    frame: &Vp8Frame<'_>,
+    mode_reader: &mut Vp8BoolReader<'_>,
+) -> Result<Vp8Planes, DecodeError> {
+    let mut readers = frame
+        .partitions
+        .iter()
+        .map(|partition| Vp8BoolReader::new(partition))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let y_stride = frame.mb_width * 16;
+    let uv_stride = frame.mb_width * 8;
+    let mut y_plane = vec![0_u8; y_stride * frame.mb_height * 16];
+    let mut u_plane = vec![0_u8; uv_stride * frame.mb_height * 8];
+    let mut v_plane = vec![0_u8; uv_stride * frame.mb_height * 8];
+    let mut mb_info = vec![
+        Vp8MbInfo {
+            segment: 0,
+            is_i4x4: false,
+            has_coefficients: false,
+        };
+        frame.mb_width * frame.mb_height
+    ];
+
+    let mut above_modes;
+    let mut left_edge_modes = [0_u8; 4];
+    let mut above_nz = vec![0_u16; frame.mb_width];
+    let mut above_nz_dc = vec![false; frame.mb_width];
+
+    for mb_y in 0..frame.mb_height {
+        let mut left_nz = 0_u16;
+        let mut left_nz_dc = false;
+        above_modes = [0; 4];
+        for mb_x in 0..frame.mb_width {
+            // Macroblock header (section 11).
+            let segment = if frame.segment_enabled {
+                if mode_reader.read_bool(frame.segment_probs[0])? == 0 {
+                    mode_reader.read_bool(frame.segment_probs[1])? as usize
+                } else {
+                    2 + mode_reader.read_bool(frame.segment_probs[2])? as usize
+                }
+            } else {
+                0
+            };
+            let skip = frame.use_skip_proba && mode_reader.read_bool(frame.skip_p)? != 0;
+            let is_i4x4 = mode_reader.read_bool(145)? == 0;
+            let mut y_mode = 0_usize;
+            let mut b_modes = [0_u8; 16];
+            if is_i4x4 {
+                for by in 0..4 {
+                    for bx in 0..4 {
+                        let above = if by == 0 {
+                            above_modes[bx]
+                        } else {
+                            b_modes[(by - 1) * 4 + bx]
+                        };
+                        let left = if bx == 0 {
+                            left_edge_modes[by]
+                        } else {
+                            b_modes[by * 4 + bx - 1]
+                        };
+                        let probs = &VP8_KBMODESPROBA[above as usize][left as usize];
+                        let mode = if mode_reader.read_bool(probs[0])? == 0 {
+                            0
+                        } else if mode_reader.read_bool(probs[1])? == 0 {
+                            1
+                        } else if mode_reader.read_bool(probs[2])? == 0 {
+                            2
+                        } else if mode_reader.read_bool(probs[3])? == 0 {
+                            if mode_reader.read_bool(probs[4])? == 0 {
+                                3
+                            } else if mode_reader.read_bool(probs[5])? == 0 {
+                                5
+                            } else {
+                                6
+                            }
+                        } else if mode_reader.read_bool(probs[6])? == 0 {
+                            4
+                        } else if mode_reader.read_bool(probs[7])? == 0 {
+                            7
+                        } else if mode_reader.read_bool(probs[8])? == 0 {
+                            8
+                        } else {
+                            9
+                        };
+                        b_modes[by * 4 + bx] = mode as u8;
+                    }
+                }
+            } else {
+                y_mode = if mode_reader.read_bool(156)? == 0 {
+                    if mode_reader.read_bool(163)? == 0 {
+                        0
+                    } else {
+                        1
+                    }
+                } else if mode_reader.read_bool(128)? == 0 {
+                    2
+                } else {
+                    3
+                };
+                b_modes.fill(match y_mode {
+                    0 => 0,
+                    1 => 2,
+                    2 => 3,
+                    _ => 1,
+                });
+            }
+            let uv_mode = if mode_reader.read_bool(142)? == 0 {
+                0
+            } else if mode_reader.read_bool(114)? == 0 {
+                1
+            } else if mode_reader.read_bool(183)? != 0 {
+                3
+            } else {
+                2
+            };
+
+            let quant = &frame.quant[segment * 3..segment * 3 + 3];
+            let partition_index = mb_y % readers.len();
+            let token_reader = &mut readers[partition_index];
+            let mut dc_values = [0_i32; 16];
+            let mut y_coeffs = [[0_i32; 16]; 16];
+            let mut uv_coeffs = [[0_i32; 16]; 8];
+            let mut nonzero_y = false;
+            let mut nonzero_uv = false;
+
+            if skip {
+                above_nz_dc[mb_x] = false;
+                left_nz_dc = false;
+                above_nz[mb_x] = 0;
+                left_nz = 0;
+            } else {
+                let mut new_above_nz = above_nz[mb_x];
+                let mut new_left_nz = 0_u16;
+                let first = if is_i4x4 { 0 } else { 1 };
+                if !is_i4x4 {
+                    let context = usize::from(above_nz_dc[mb_x]) + usize::from(left_nz_dc);
+                    let mut block = [0_i32; 16];
+                    let n = vp8_read_coeffs(
+                        token_reader,
+                        &frame.token_probs,
+                        1,
+                        quant[1],
+                        context,
+                        0,
+                        &mut block,
+                    )?;
+                    if n > 0 {
+                        above_nz_dc[mb_x] = true;
+                        left_nz_dc = true;
+                    }
+                    if n > 1 {
+                        dc_values = vp8_inverse_wht(&block);
+                    } else {
+                        dc_values.fill((block[0] + 3) >> 3);
+                    }
+                }
+                for by in 0..4 {
+                    let mut left_context = (left_nz >> (by * 4)) & 1;
+                    for bx in 0..4 {
+                        let subblock = by * 4 + bx;
+                        let context =
+                            left_context as usize + usize::from((above_nz[mb_x] >> subblock) & 1);
+                        let n = vp8_read_coeffs(
+                            token_reader,
+                            &frame.token_probs,
+                            if is_i4x4 { 3 } else { 0 },
+                            quant[0],
+                            context,
+                            first,
+                            &mut y_coeffs[subblock],
+                        )?;
+                        if !is_i4x4 {
+                            y_coeffs[subblock][0] = dc_values[subblock];
+                        }
+                        left_context = u16::from(n > first);
+                        let bit = left_context << subblock;
+                        new_above_nz = (new_above_nz & !(1_u16 << subblock)) | bit;
+                        new_left_nz |= bit;
+                        nonzero_y |= n > first;
+                    }
+                }
+                for plane_index in 0..2 {
+                    let high_bit = 4 + plane_index * 2;
+                    for by in 0..2 {
+                        let mut left_context = (left_nz >> (high_bit + by * 2)) & 1;
+                        for bx in 0..2 {
+                            let block_index = by * 2 + bx;
+                            let bit_position = high_bit + block_index;
+                            let context = left_context as usize
+                                + usize::from((above_nz[mb_x] >> bit_position) & 1);
+                            let n = vp8_read_coeffs(
+                                token_reader,
+                                &frame.token_probs,
+                                2,
+                                quant[2],
+                                context,
+                                0,
+                                &mut uv_coeffs[plane_index * 4 + block_index],
+                            )?;
+                            left_context = u16::from(n > 0);
+                            let bit = left_context << bit_position;
+                            new_above_nz = (new_above_nz & !(1_u16 << bit_position)) | bit;
+                            new_left_nz |= bit;
+                            nonzero_uv |= n > 0;
+                        }
+                    }
+                }
+                above_nz[mb_x] = new_above_nz;
+                left_nz = new_left_nz;
+            }
+
+            // Intra prediction and reconstruction.
+            let origin_x = mb_x * 16;
+            let origin_y = mb_y * 16;
+            if is_i4x4 {
+                for by in 0..4 {
+                    for bx in 0..4 {
+                        let subblock = by * 4 + bx;
+                        let prediction = vp8_subblock_predict(
+                            &y_plane,
+                            y_stride,
+                            mb_x,
+                            mb_y,
+                            bx,
+                            by,
+                            usize::from(b_modes[subblock]),
+                        )?;
+                        vp8_add_block(
+                            &mut y_plane,
+                            y_stride,
+                            origin_x + bx * 4,
+                            origin_y + by * 4,
+                            &prediction,
+                            0,
+                            0,
+                            4,
+                            &y_coeffs[subblock],
+                        );
+                    }
+                }
+            } else {
+                let prediction = vp8_intra_predict(&y_plane, y_stride, mb_x, mb_y, 16, y_mode)?;
+                for subblock in 0..16 {
+                    let bx = subblock % 4;
+                    let by = subblock / 4;
+                    vp8_add_block(
+                        &mut y_plane,
+                        y_stride,
+                        origin_x + bx * 4,
+                        origin_y + by * 4,
+                        &prediction,
+                        bx * 4,
+                        by * 4,
+                        16,
+                        &y_coeffs[subblock],
+                    );
+                }
+            }
+            for plane_index in 0..2 {
+                let (plane, coefficients) = if plane_index == 0 {
+                    (&mut u_plane, &uv_coeffs[0..4])
+                } else {
+                    (&mut v_plane, &uv_coeffs[4..8])
+                };
+                let prediction = vp8_intra_predict(plane, uv_stride, mb_x, mb_y, 8, uv_mode)?;
+                for block_index in 0..4 {
+                    let bx = block_index % 2;
+                    let by = block_index / 2;
+                    vp8_add_block(
+                        plane,
+                        uv_stride,
+                        mb_x * 8 + bx * 4,
+                        mb_y * 8 + by * 4,
+                        &prediction,
+                        bx * 4,
+                        by * 4,
+                        8,
+                        &coefficients[block_index],
+                    );
+                }
+            }
+
+            mb_info[mb_y * frame.mb_width + mb_x] = Vp8MbInfo {
+                segment,
+                is_i4x4,
+                has_coefficients: nonzero_y || nonzero_uv,
+            };
+            above_modes = if is_i4x4 {
+                [b_modes[12], b_modes[13], b_modes[14], b_modes[15]]
+            } else {
+                [b_modes[0], b_modes[0], b_modes[0], b_modes[0]]
+            };
+            left_edge_modes = if is_i4x4 {
+                [b_modes[3], b_modes[7], b_modes[11], b_modes[15]]
+            } else {
+                [b_modes[0], b_modes[0], b_modes[0], b_modes[0]]
+            };
+        }
+    }
+    Ok((y_plane, u_plane, v_plane, mb_info))
+}
+
+// -------------------------------------------------------------------------
+// Loop filter
+// -------------------------------------------------------------------------
+
+fn vp8_abs_difference(a: u8, b: u8) -> i32 {
+    (i32::from(a) - i32::from(b)).abs()
+}
+
+fn vp8_simple_threshold(
+    plane: &[u8],
+    position: usize,
+    stride: usize,
+    limit: u16,
+) -> Result<bool, DecodeError> {
+    let p1 = *plane
+        .get(
+            position
+                .checked_sub(2 * stride)
+                .ok_or_else(|| webp_err("loop filter out of bounds"))?,
+        )
+        .ok_or_else(|| webp_err("loop filter out of bounds"))?;
+    let p0 = plane[position - stride];
+    let q0 = plane[position];
+    let q1 = *plane
+        .get(position + stride)
+        .ok_or_else(|| webp_err("loop filter out of bounds"))?;
+    Ok(vp8_abs_difference(p0, q0) * 2 + vp8_abs_difference(p1, q1) / 2 <= i32::from(limit))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn vp8_normal_threshold(
+    plane: &[u8],
+    position: usize,
+    stride: usize,
+    edge: u16,
+    interior: u8,
+) -> Result<bool, DecodeError> {
+    let index = |offset: isize| -> Result<usize, DecodeError> {
+        let value = position as isize + offset * stride as isize;
+        if value < 0 {
+            return Err(webp_err("loop filter out of bounds"));
+        }
+        Ok(value as usize)
+    };
+    let p3 = plane[index(-4)?];
+    let p2 = plane[index(-3)?];
+    let p1 = plane[index(-2)?];
+    let p0 = plane[index(-1)?];
+    let q0 = plane[index(0)?];
+    let q1 = plane[index(1)?];
+    let q2 = plane[index(2)?];
+    let q3 = plane[index(3)?];
+    let interior = i32::from(interior);
+    let effective_edge = 2 * i32::from(edge) + interior;
+    Ok(
+        vp8_abs_difference(p0, q0) * 2 + vp8_abs_difference(p1, q1) / 2 <= effective_edge
+            && vp8_abs_difference(p3, p2) <= interior
+            && vp8_abs_difference(p2, p1) <= interior
+            && vp8_abs_difference(p1, p0) <= interior
+            && vp8_abs_difference(q3, q2) <= interior
+            && vp8_abs_difference(q2, q1) <= interior
+            && vp8_abs_difference(q1, q0) <= interior,
+    )
+}
+
+fn vp8_high_edge_variance(
+    plane: &[u8],
+    position: usize,
+    stride: usize,
+    threshold: u8,
+) -> Result<bool, DecodeError> {
+    let p0 = plane[position - stride];
+    let p1 = plane[position - 2 * stride];
+    let q0 = plane[position];
+    let q1 = plane[position + stride];
+    Ok(vp8_abs_difference(p1, p0) > i32::from(threshold)
+        || vp8_abs_difference(q1, q0) > i32::from(threshold))
+}
+
+fn vp8_filter_common(
+    plane: &mut [u8],
+    position: usize,
+    stride: usize,
+    use_outer_taps: bool,
+) -> Result<(), DecodeError> {
+    let p1 = plane[position - 2 * stride];
+    let p0 = plane[position - stride];
+    let q0 = plane[position];
+    let q1 = plane[position + stride];
+    let mut a = 3 * (i32::from(q0) - i32::from(p0));
+    if use_outer_taps {
+        a += vp8_saturate_i8(i32::from(p1) - i32::from(q1));
+    }
+    let a = vp8_saturate_i8(a);
+    let q_adjust = ((a + 4).min(127)) >> 3;
+    let p_adjust = ((a + 3).min(127)) >> 3;
+    plane[position - stride] = vp8_clamp(i32::from(p0) + p_adjust);
+    plane[position] = vp8_clamp(i32::from(q0) - q_adjust);
+    if !use_outer_taps {
+        let inner = (q_adjust + 1) >> 1;
+        plane[position - 2 * stride] = vp8_clamp(i32::from(p1) + inner);
+        plane[position + stride] = vp8_clamp(i32::from(q1) - inner);
+    }
+    Ok(())
+}
+
+fn vp8_filter_mb_edge(plane: &mut [u8], position: usize, stride: usize) {
+    let p1 = plane[position - 2 * stride];
+    let p0 = plane[position - stride];
+    let q0 = plane[position];
+    let q1 = plane[position + stride];
+    let p2 = plane[position - 3 * stride];
+    let q2 = plane[position + 2 * stride];
+    let w = vp8_saturate_i8(
+        vp8_saturate_i8(i32::from(p1) - i32::from(q1)) + 3 * (i32::from(q0) - i32::from(p0)),
+    );
+    for distance in 0..3 {
+        let numerator = match distance {
+            0 => 27,
+            1 => 18,
+            _ => 9,
+        };
+        let adjustment = (numerator * w + 63) >> 7;
+        match distance {
+            0 => {
+                plane[position - stride] = vp8_clamp(i32::from(p0) + adjustment);
+                plane[position] = vp8_clamp(i32::from(q0) - adjustment);
+            }
+            1 => {
+                plane[position - 2 * stride] = vp8_clamp(i32::from(p1) + adjustment);
+                plane[position + stride] = vp8_clamp(i32::from(q1) - adjustment);
+            }
+            _ => {
+                plane[position - 3 * stride] = vp8_clamp(i32::from(p2) + adjustment);
+                plane[position + 2 * stride] = vp8_clamp(i32::from(q2) - adjustment);
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn vp8_filter_segment(
+    plane: &mut [u8],
+    position: usize,
+    stride: usize,
+    strength: &Vp8FilterStrength,
+    mb_edge: bool,
+    simple: bool,
+) -> Result<(), DecodeError> {
+    if strength.level == 0 {
+        return Ok(());
+    }
+    let edge = u16::from(strength.level) + if mb_edge { 2 } else { 0 };
+    let limit = 2 * edge + u16::from(strength.interior);
+    if simple {
+        if vp8_simple_threshold(plane, position, stride, limit)? {
+            vp8_filter_common(plane, position, stride, true)?;
+        }
+    } else if vp8_normal_threshold(plane, position, stride, edge, strength.interior)? {
+        if vp8_high_edge_variance(plane, position, stride, strength.hev)? {
+            vp8_filter_common(plane, position, stride, true)?;
+        } else if mb_edge {
+            vp8_filter_mb_edge(plane, position, stride);
+        } else {
+            vp8_filter_common(plane, position, stride, false)?;
+        }
+    }
+    Ok(())
+}
+
+fn vp8_loop_filter(
+    frame: &Vp8Frame<'_>,
+    y: &mut [u8],
+    u: &mut [u8],
+    v: &mut [u8],
+    mb_info: &[Vp8MbInfo],
+    simple: bool,
+) -> Result<(), DecodeError> {
+    let y_stride = frame.mb_width * 16;
+    let uv_stride = frame.mb_width * 8;
+    for mb_y in 0..frame.mb_height {
+        for mb_x in 0..frame.mb_width {
+            let info = mb_info[mb_y * frame.mb_width + mb_x];
+            let strength = frame.filters[info.segment][usize::from(info.is_i4x4)];
+            if strength.level == 0 {
+                continue;
+            }
+            let filter_inner = info.is_i4x4 || info.has_coefficients;
+            let y_base = mb_y * 16 * y_stride + mb_x * 16;
+            let u_base = mb_y * 8 * uv_stride + mb_x * 8;
+            let v_base = u_base;
+            if mb_x > 0 {
+                for row in 0..16 {
+                    vp8_filter_segment(y, y_base + row * y_stride, 1, &strength, true, simple)?;
+                }
+                if !simple {
+                    for row in 0..8 {
+                        vp8_filter_segment(u, u_base + row * uv_stride, 1, &strength, true, false)?;
+                        vp8_filter_segment(v, v_base + row * uv_stride, 1, &strength, true, false)?;
+                    }
+                }
+            }
+            if filter_inner {
+                for offset in [4, 8, 12] {
+                    for row in 0..16 {
+                        vp8_filter_segment(
+                            y,
+                            y_base + row * y_stride + offset,
+                            1,
+                            &strength,
+                            false,
+                            simple,
+                        )?;
+                    }
+                }
+                if !simple {
+                    for row in 0..8 {
+                        vp8_filter_segment(
+                            u,
+                            u_base + row * uv_stride + 4,
+                            1,
+                            &strength,
+                            false,
+                            false,
+                        )?;
+                        vp8_filter_segment(
+                            v,
+                            v_base + row * uv_stride + 4,
+                            1,
+                            &strength,
+                            false,
+                            false,
+                        )?;
+                    }
+                }
+            }
+            if mb_y > 0 {
+                for column in 0..16 {
+                    vp8_filter_segment(y, y_base + column, y_stride, &strength, true, simple)?;
+                }
+                if !simple {
+                    for column in 0..8 {
+                        vp8_filter_segment(u, u_base + column, uv_stride, &strength, true, false)?;
+                        vp8_filter_segment(v, v_base + column, uv_stride, &strength, true, false)?;
+                    }
+                }
+            }
+            if filter_inner {
+                for offset in [4, 8, 12] {
+                    for column in 0..16 {
+                        vp8_filter_segment(
+                            y,
+                            y_base + offset * y_stride + column,
+                            y_stride,
+                            &strength,
+                            false,
+                            simple,
+                        )?;
+                    }
+                }
+                if !simple {
+                    for column in 0..8 {
+                        vp8_filter_segment(
+                            u,
+                            u_base + 4 * uv_stride + column,
+                            uv_stride,
+                            &strength,
+                            false,
+                            false,
+                        )?;
+                        vp8_filter_segment(
+                            v,
+                            v_base + 4 * uv_stride + column,
+                            uv_stride,
+                            &strength,
+                            false,
+                            false,
+                        )?;
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn vp8_scale_dimension(size: u32, scale: u32) -> u32 {
+    let (numerator, denominator) = match scale {
+        1 => (5_u64, 4_u64),
+        2 => (5, 3),
+        3 => (2, 1),
+        _ => return size,
+    };
+    (u64::from(size) * numerator).div_ceil(denominator) as u32
+}
+
+/// YCbCr to RGB using libwebp's bit-exact fixed-point BT.601 conversion.
+fn vp8_yuv_to_rgba(y: u8, u: u8, v: u8) -> [u8; 4] {
+    fn clip(value: i32) -> u8 {
+        if value & !((256 << 6) - 1) == 0 {
+            (value >> 6) as u8
+        } else if value < 0 {
+            0
+        } else {
+            255
+        }
+    }
+    let red = clip(((i32::from(y) * 19077) >> 8) + ((i32::from(v) * 26149) >> 8) - 14234);
+    let green = clip(
+        ((i32::from(y) * 19077) >> 8)
+            - ((i32::from(u) * 6419) >> 8)
+            - ((i32::from(v) * 13320) >> 8)
+            + 8708,
+    );
+    let blue = clip(((i32::from(y) * 19077) >> 8) + ((i32::from(u) * 33050) >> 8) - 17685);
+    [red, green, blue, 255]
+}
+
+/// Decodes a single VP8 key frame (the payload of a `VP8 ` chunk) into RGBA8.
+#[allow(unreachable_code, unused_variables)]
+fn decode_vp8_keyframe(data: &[u8]) -> Result<(u32, u32, Vec<u8>), DecodeError> {
+    // The VP8 key-frame pipeline below parses headers, modes, tokens and
+    // transforms but is not yet bit-exact with libwebp's reconstruction, so
+    // it is kept dormant rather than returning incorrect pixels.
+    return Err(webp_unsupported(
+        "VP8 lossy key frames (VP8L lossless is supported)",
+    ));
+    let (frame, mut mode_reader) = vp8_parse_frame(data)?;
+    let (mut y, mut u, mut v, mb_info) = vp8_reconstruct(&frame, &mut mode_reader)?;
+    // A zero loop-filter level disables filtering entirely (handled per
+    // segment inside the filter itself).
+    vp8_loop_filter(
+        &frame,
+        &mut y,
+        &mut u,
+        &mut v,
+        &mb_info,
+        frame.simple_filter,
+    )?;
+
+    let out_width = vp8_scale_dimension(frame.width, frame.scale_h);
+    let out_height = vp8_scale_dimension(frame.height, frame.scale_v);
+    check_pixel_count(out_width, out_height, "VP8")?;
+    let y_stride = frame.mb_width * 16;
+    let uv_stride = frame.mb_width * 8;
+    let mut pixels = Vec::with_capacity(out_width as usize * out_height as usize * 4);
+    for out_y in 0..out_height as usize {
+        let source_y = out_y * frame.height as usize / out_height as usize;
+        for out_x in 0..out_width as usize {
+            let source_x = out_x * frame.width as usize / out_width as usize;
+            let luma = y[source_y * y_stride + source_x];
+            let chroma = u[(source_y / 2) * uv_stride + source_x / 2];
+            let chroma_v = v[(source_y / 2) * uv_stride + source_x / 2];
+            pixels.extend_from_slice(&vp8_yuv_to_rgba(luma, chroma, chroma_v));
+        }
+    }
+    Ok((out_width, out_height, pixels))
+}
+
+// -------------------------------------------------------------------------
+// RIFF / WebP container
+// -------------------------------------------------------------------------
+
+struct WebpChunk<'a> {
+    fourcc: [u8; 4],
+    data: &'a [u8],
+}
+
+fn webp_chunks(bytes: &[u8]) -> Result<Vec<WebpChunk<'_>>, DecodeError> {
+    if bytes.len() < 12 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WEBP" {
+        return Err(webp_err("missing RIFF/WEBP header"));
+    }
+    let declared = webp_u32le(bytes, 4)? as usize;
+    let end = 8_usize
+        .checked_add(declared)
+        .map(|value| value.min(bytes.len()))
+        .ok_or_else(|| webp_err("RIFF size overflow"))?;
+    let mut chunks = Vec::new();
+    let mut position = 12_usize;
+    while position + 8 <= end {
+        let fourcc: [u8; 4] = bytes[position..position + 4]
+            .try_into()
+            .map_err(|_| webp_err("invalid RIFF chunk header"))?;
+        let size = webp_u32le(bytes, position + 4)? as usize;
+        let data_start = position + 8;
+        let data_end = data_start
+            .checked_add(size)
+            .ok_or_else(|| webp_err("RIFF chunk size overflow"))?;
+        if data_end > end {
+            return Err(webp_err("truncated RIFF chunk payload"));
+        }
+        chunks.push(WebpChunk {
+            fourcc,
+            data: &bytes[data_start..data_end],
+        });
+        position = data_end + (size & 1);
+    }
+    Ok(chunks)
+}
+
+fn webp_decode_alpha(alpha: &[u8], width: usize, height: usize) -> Result<Vec<u8>, DecodeError> {
+    let flags = *alpha.first().ok_or_else(|| webp_err("empty ALPH chunk"))?;
+    let compression = flags & 0x03;
+    let filter = (flags >> 2) & 0x03;
+    let payload = &alpha[1..];
+    let count = width
+        .checked_mul(height)
+        .ok_or_else(|| webp_err("WebP image size overflow"))?;
+    let mut values = match compression {
+        0 => {
+            if payload.len() < count {
+                return Err(webp_err("truncated raw ALPH data"));
+            }
+            payload[..count].to_vec()
+        }
+        1 => {
+            let mut reader = Vp8LReader::new(payload);
+            let argb = vp8l_decode_stream(&mut reader, width, height, false)?;
+            argb.iter().map(|pixel| pixel[2]).collect()
+        }
+        _ => return Err(webp_unsupported("ALPH compression mode")),
+    };
+    if filter > 3 {
+        return Err(webp_err("invalid ALPH filter method"));
+    }
+    let mut previous = vec![0_u8; width];
+    for y in 0..height {
+        for x in 0..width {
+            let position = y * width + x;
+            let predictor = match filter {
+                0 => 0_u8,
+                1 => {
+                    if x > 0 {
+                        values[position - 1]
+                    } else if y > 0 {
+                        previous[x]
+                    } else {
+                        0
+                    }
+                }
+                2 => {
+                    if y > 0 {
+                        previous[x]
+                    } else if x > 0 {
+                        values[position - 1]
+                    } else {
+                        0
+                    }
+                }
+                _ => {
+                    let left = if x > 0 { values[position - 1] } else { 0 };
+                    let above = if y > 0 { previous[x] } else { 0 };
+                    let above_left = if x > 0 && y > 0 { previous[x - 1] } else { 0 };
+                    (i32::from(left) + i32::from(above) - i32::from(above_left)).clamp(0, 255) as u8
+                }
+            };
+            values[position] = values[position].wrapping_add(predictor);
+        }
+        previous.copy_from_slice(&values[y * width..(y + 1) * width]);
+    }
+    Ok(values)
+}
+
+/// Decodes a WebP file into RGBA8, dispatching on the bitstream chunk.
+pub fn decode_webp(bytes: &[u8]) -> Result<ImageData, DecodeError> {
+    let chunks = webp_chunks(bytes)?;
+    let mut extended: Option<[u8; 10]> = None;
+    let mut alpha: Option<&[u8]> = None;
+    let mut bitstream: Option<(&[u8; 4], &[u8])> = None;
+    for chunk in &chunks {
+        match &chunk.fourcc {
+            b"VP8X" => {
+                let header: [u8; 10] = chunk
+                    .data
+                    .get(..10)
+                    .ok_or_else(|| webp_err("truncated VP8X chunk"))?
+                    .try_into()
+                    .map_err(|_| webp_err("invalid VP8X chunk"))?;
+                extended = Some(header);
+            }
+            b"ALPH" => alpha = Some(chunk.data),
+            b"VP8 " | b"VP8L" => {
+                if bitstream.is_some() {
+                    return Err(webp_err("multiple bitstream chunks"));
+                }
+                bitstream = Some((&chunk.fourcc, chunk.data));
+            }
+            b"ANIM" | b"ANMF" => return Err(webp_unsupported("animated WebP images")),
+            _ => {}
+        }
+    }
+    let (fourcc, payload) =
+        bitstream.ok_or_else(|| webp_err("WebP file has no VP8 or VP8L bitstream"))?;
+
+    let (mut width, mut height, mut pixels) = if fourcc == b"VP8L" {
+        decode_vp8l(payload)?
+    } else {
+        decode_vp8_keyframe(payload)?
+    };
+
+    if let Some(header) = extended {
+        if header[0] & 0x02 != 0 {
+            return Err(webp_unsupported("animated WebP images"));
+        }
+        let canvas_width = webp_u24le(&header, 4)? + 1;
+        let canvas_height = webp_u24le(&header, 7)? + 1;
+        if canvas_width > MAX_DIMENSION || canvas_height > MAX_DIMENSION {
+            return Err(webp_err("WebP canvas exceeds the dimension limit"));
+        }
+        check_pixel_count(canvas_width, canvas_height, "WebP")?;
+        if canvas_width != width || canvas_height != height {
+            return Err(webp_unsupported(
+                "WebP bitstream scaled to a different canvas",
+            ));
+        }
+        width = canvas_width;
+        height = canvas_height;
+    }
+
+    if let Some(alpha_data) = alpha {
+        if fourcc == b"VP8L" {
+            return Err(webp_err("VP8L images must not carry an ALPH chunk"));
+        }
+        let values = webp_decode_alpha(alpha_data, width as usize, height as usize)?;
+        for (pixel, value) in pixels.as_chunks_mut::<4>().0.iter_mut().zip(values) {
+            pixel[3] = value;
+        }
+    }
+
+    ImageData::from_rgba(width, height, pixels)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4706,6 +7711,89 @@ mod tests {
             let _ = decode(&file);
             let cut = (next() as usize) % file.len();
             let _ = decode(&file[..cut]);
+        }
+    }
+
+    fn webp_base64(text: &str) -> Vec<u8> {
+        fn digit(byte: u8) -> Option<u8> {
+            match byte {
+                b'A'..=b'Z' => Some(byte - b'A'),
+                b'a'..=b'z' => Some(byte - b'a' + 26),
+                b'0'..=b'9' => Some(byte - b'0' + 52),
+                b'+' => Some(62),
+                b'/' => Some(63),
+                b'=' => None,
+                _ => panic!("invalid base64 digit"),
+            }
+        }
+        let mut accumulator = 0_u32;
+        let mut bits = 0_u32;
+        let mut output = Vec::new();
+        for byte in text.bytes() {
+            if let Some(value) = digit(byte) {
+                accumulator = (accumulator << 6) | u32::from(value);
+                bits += 6;
+                if bits >= 8 {
+                    bits -= 8;
+                    output.push((accumulator >> bits) as u8);
+                }
+            }
+        }
+        output
+    }
+
+    /// 16x16 VP8L fixture produced by cwebp from an RGBA gradient.
+    const WEBP_VP8L: &str =
+        "UklGRiwAAABXRUJQVlA4TCAAAAAvD8ADALmM6H/sClGIgvc/ICQgTPD/sKgORMQEgNW7AA==";
+
+    /// 23x17 VP8 key-frame fixture produced by cwebp.
+    const WEBP_VP8: &str = "UklGRoAAAABXRUJQVlA4IHQAAABQBACdASoXABEAPoUwlUelIqIhN/qoAKAQiWgAnTKEePe6AGBRfc5xFcsAAP6+cvySZ+ADTahToYPV5Z+3TkcdOXfX/6Vz+Vi+/8nkljuhiHijC03vTe4+EleydX3L1W7b8Ws3zLXC0V0lG76MnUn0hyAAAA==";
+
+    #[test]
+    fn webp_detect_and_decode_vp8l() {
+        let bytes = webp_base64(WEBP_VP8L);
+        assert_eq!(detect_format(&bytes), Some(ImageFormat::Webp));
+        let image = decode(&bytes).expect("VP8L fixture decodes");
+        assert_eq!((image.width, image.height), (16, 16));
+        assert_eq!(image.pixels.len(), 16 * 16 * 4);
+        // Lossless decoding reproduces the source gradient exactly.
+        for y in 0..16_usize {
+            for x in 0..16_usize {
+                let offset = (y * 16 + x) * 4;
+                assert_eq!(
+                    &image.pixels[offset..offset + 4],
+                    &[(x * 16) as u8, (y * 16) as u8, ((x + y) * 8) as u8, 255,]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn webp_decode_vp8_keyframe() {
+        let bytes = webp_base64(WEBP_VP8);
+        let error = decode(&bytes).expect_err("VP8 lossy is not finished");
+        assert!(
+            error.message.contains("unsupported image data"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn webp_malformed_data_returns_error() {
+        let fixture = webp_base64(WEBP_VP8L);
+        assert!(decode(&[]).is_err());
+        assert!(decode(b"RIFF").is_err());
+        assert!(decode(&fixture[..fixture.len() - 1]).is_err());
+        // Truncated and randomly mutated WebP data must never panic.
+        let mut state = 0x1234_5678_u32;
+        for _ in 0..64 {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let mut mutated = fixture.clone();
+            let index = (state as usize) % mutated.len();
+            mutated[index] ^= (state >> 16) as u8;
+            let _ = decode(&mutated);
+            let cut = (state >> 8) as usize % mutated.len();
+            let _ = decode(&mutated[..cut]);
         }
     }
 }

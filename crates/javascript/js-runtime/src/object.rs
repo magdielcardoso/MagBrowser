@@ -13,6 +13,9 @@ use crate::value::{ObjectId, Value};
 /// properties separate from ordinary string-keyed ones.
 pub(crate) const SYMBOL_ITERATOR_KEY: &str = "\u{0}Symbol.iterator";
 
+/// Internal property key used for `Symbol.asyncIterator` methods.
+pub(crate) const SYMBOL_ASYNC_ITERATOR_KEY: &str = "\u{0}Symbol.asyncIterator";
+
 /// A builtin function implemented as a stateless function pointer.
 pub(crate) type BuiltinFn = fn(&mut crate::Runtime, Value, Vec<Value>) -> Result<Value, JsError>;
 
@@ -48,6 +51,40 @@ pub(crate) enum ObjectKind {
     Symbol(String),
     /// A suspended generator object.
     Generator(Rc<RefCell<GeneratorFrame>>),
+    /// A proxy that forwards internal operations through handler traps.
+    Proxy {
+        /// The object being wrapped.
+        target: Value,
+        /// The object supplying the traps.
+        handler: Value,
+    },
+    /// A weak reference to a heap object. The target id is deliberately not
+    /// traced by the collector, so holding a `WeakRef` never keeps its target
+    /// alive; the generation guards against id reuse.
+    WeakRef {
+        /// Heap slot of the referent.
+        target: ObjectId,
+        /// Generation of the slot when the reference was created.
+        generation: u64,
+    },
+    /// A finalization registry whose registrations are inspected by the collector.
+    FinalizationRegistry(Rc<RefCell<FinalizationRegistryState>>),
+}
+
+/// A single `FinalizationRegistry.register` entry. Only the target id is held
+/// weakly; the held value and token are ordinary strong values.
+#[derive(Clone)]
+pub(crate) struct FinalizationRegistration {
+    pub(crate) target: ObjectId,
+    pub(crate) generation: u64,
+    pub(crate) held: Value,
+    pub(crate) token: Option<Value>,
+}
+
+/// Shared state behind a finalization registry object.
+#[derive(Default)]
+pub(crate) struct FinalizationRegistryState {
+    pub(crate) registrations: Vec<FinalizationRegistration>,
 }
 
 /// A heap allocated object.
@@ -85,10 +122,14 @@ impl crate::Runtime {
             extensible: true,
         };
         let id = if let Some(index) = self.heap_free.pop() {
+            // Bump the generation so weak references to the previous occupant
+            // of this slot stop resolving to the new object.
+            self.heap_generations[index] += 1;
             self.heap[index] = Some(object);
             index
         } else {
             self.heap.push(Some(object));
+            self.heap_generations.push(1);
             self.heap.len() - 1
         };
         self.allocations_since_gc += 1;
@@ -127,6 +168,9 @@ impl crate::Runtime {
         self.define_data_property(id, "global", Value::Bool(regex_flags.global));
         self.define_data_property(id, "ignoreCase", Value::Bool(regex_flags.ignore_case));
         self.define_data_property(id, "multiline", Value::Bool(regex_flags.multiline));
+        self.define_data_property(id, "dotAll", Value::Bool(regex_flags.dot_all));
+        self.define_data_property(id, "sticky", Value::Bool(regex_flags.sticky));
+        self.define_data_property(id, "hasIndices", Value::Bool(regex_flags.has_indices));
         self.define_data_property(id, "lastIndex", Value::Number(0.0));
         Ok(Value::Object(id))
     }
@@ -257,7 +301,12 @@ impl crate::Runtime {
                 | ObjectKind::Promise(_)
                 | ObjectKind::RegExp(_)
                 | ObjectKind::Symbol(_)
-                | ObjectKind::Generator(_) => object.properties.iter().any(|(name, _)| name == key),
+                | ObjectKind::Generator(_)
+                | ObjectKind::Proxy { .. }
+                | ObjectKind::WeakRef { .. }
+                | ObjectKind::FinalizationRegistry(_) => {
+                    object.properties.iter().any(|(name, _)| name == key)
+                }
             },
             None => false,
         }
@@ -266,7 +315,7 @@ impl crate::Runtime {
     /// Look up an own property descriptor, resolving the built-in array and
     /// function data properties. Returns `None` when the object does not have
     /// the property as an own property.
-    fn own_property_descriptor(&self, id: ObjectId, key: &str) -> Option<PropertyData> {
+    pub(crate) fn own_property_descriptor(&self, id: ObjectId, key: &str) -> Option<PropertyData> {
         let object = self.object(id)?;
         match &object.kind {
             ObjectKind::Array(items) => {
@@ -294,7 +343,10 @@ impl crate::Runtime {
             | ObjectKind::Promise(_)
             | ObjectKind::RegExp(_)
             | ObjectKind::Symbol(_)
-            | ObjectKind::Generator(_) => {}
+            | ObjectKind::Generator(_)
+            | ObjectKind::Proxy { .. }
+            | ObjectKind::WeakRef { .. }
+            | ObjectKind::FinalizationRegistry(_) => {}
         }
         object
             .properties
@@ -349,6 +401,16 @@ impl crate::Runtime {
         value: &Value,
         key: &str,
     ) -> Result<Value, JsError> {
+        if let Some((target, handler)) = self.as_proxy(value) {
+            if let Some(trap) = self.proxy_trap(&handler, "get") {
+                return self.call_function(
+                    &trap,
+                    handler,
+                    vec![target, Value::String(key.to_owned()), value.clone()],
+                );
+            }
+            return self.get_property_checked(&target, key);
+        }
         match value {
             Value::Undefined | Value::Null => Err(JsError::type_error(format!(
                 "cannot read property '{key}' of {}",
@@ -394,6 +456,22 @@ impl crate::Runtime {
         key: &str,
         new_value: Value,
     ) -> Result<(), JsError> {
+        if let Some((target, handler)) = self.as_proxy(value) {
+            if let Some(trap) = self.proxy_trap(&handler, "set") {
+                let _ = self.call_function(
+                    &trap,
+                    handler,
+                    vec![
+                        target,
+                        Value::String(key.to_owned()),
+                        new_value,
+                        value.clone(),
+                    ],
+                )?;
+                return Ok(());
+            }
+            return self.set_property_checked(&target, key, new_value);
+        }
         let Value::Object(id) = value else {
             if matches!(value, Value::Undefined | Value::Null) {
                 return Err(JsError::type_error(format!(
@@ -485,6 +563,15 @@ impl crate::Runtime {
     /// attributes are not modelled); deleting an array index leaves a hole
     /// filled with `undefined` and deleting `length` fails.
     pub fn delete_property(&mut self, object: Value, key: &str) -> bool {
+        if let Some((target, handler)) = self.as_proxy(&object) {
+            if let Some(trap) = self.proxy_trap(&handler, "deleteProperty") {
+                return self
+                    .call_function(&trap, handler, vec![target, Value::String(key.to_owned())])
+                    .map(|value| value.is_truthy())
+                    .unwrap_or(false);
+            }
+            return self.delete_property(target, key);
+        }
         let Value::Object(id) = object else {
             return true;
         };
@@ -518,6 +605,29 @@ impl crate::Runtime {
     /// Accessor property names are included: attributes are not modelled, so
     /// every own property is treated as enumerable.
     pub fn object_keys(&mut self, object: &Value) -> Vec<String> {
+        if let Some((target, handler)) = self.as_proxy(object) {
+            if let Some(trap) = self.proxy_trap(&handler, "ownKeys") {
+                let result = self.call_function(&trap, handler, vec![target]);
+                if let Ok(result) = result
+                    && let Some(items) = self.object_array_items(&result)
+                {
+                    let mut keys = Vec::with_capacity(items.len());
+                    for item in items {
+                        if let Value::Object(symbol) = &item
+                            && let Some(Value::String(internal)) =
+                                self.get_own_property(*symbol, "\u{0}symbol_key")
+                        {
+                            keys.push(internal);
+                        } else {
+                            keys.push(self.to_string_rt(&item).unwrap_or_default());
+                        }
+                    }
+                    return keys;
+                }
+                return Vec::new();
+            }
+            return self.object_keys(&target);
+        }
         let Value::Object(id) = object else {
             return Vec::new();
         };
@@ -540,6 +650,15 @@ impl crate::Runtime {
 
     /// Whether a key exists on the object or its prototype chain.
     pub fn object_has(&mut self, object: &Value, key: &str) -> bool {
+        if let Some((target, handler)) = self.as_proxy(object) {
+            if let Some(trap) = self.proxy_trap(&handler, "has") {
+                return self
+                    .call_function(&trap, handler, vec![target, Value::String(key.to_owned())])
+                    .map(|value| value.is_truthy())
+                    .unwrap_or(false);
+            }
+            return self.object_has(&target, key);
+        }
         let Value::Object(id) = object else {
             return false;
         };
@@ -608,11 +727,36 @@ impl crate::Runtime {
         let id = self.alloc_object(ObjectKind::Symbol(description.to_owned()), Some(prototype));
         let key = if description == "Symbol.iterator" {
             SYMBOL_ITERATOR_KEY.to_owned()
+        } else if description == "Symbol.asyncIterator" {
+            SYMBOL_ASYNC_ITERATOR_KEY.to_owned()
         } else {
             format!("\u{0}Symbol({description})")
         };
         self.define_data_property(id, "\u{0}symbol_key", Value::String(key));
         Value::Object(id)
+    }
+
+    /// The target and handler of a proxy object, when `id` is one.
+    pub(crate) fn proxy_parts(&self, id: ObjectId) -> Option<(Value, Value)> {
+        match self.object(id).map(|object| &object.kind) {
+            Some(ObjectKind::Proxy { target, handler }) => Some((target.clone(), handler.clone())),
+            _ => None,
+        }
+    }
+
+    /// The target and handler of a proxy value, when it is one.
+    pub(crate) fn as_proxy(&self, value: &Value) -> Option<(Value, Value)> {
+        match value {
+            Value::Object(id) => self.proxy_parts(*id),
+            _ => None,
+        }
+    }
+
+    /// Look up a callable trap on a proxy handler. Missing or non-callable
+    /// properties mean the operation falls back to the target.
+    pub(crate) fn proxy_trap(&mut self, handler: &Value, name: &str) -> Option<Value> {
+        let trap = self.get_property(handler, name);
+        self.is_callable(&trap).then_some(trap)
     }
 
     /// The generator frame captured by a generator object, if any.
@@ -654,7 +798,17 @@ impl crate::Runtime {
         );
         let iterator = self.new_object();
         self.set_property(iterator.clone(), "next", next);
-        iterator
+        if let Value::Object(iterator_id) = iterator {
+            let self_iterator = self.new_builtin_value(
+                "[Symbol.iterator]",
+                0,
+                crate::builtins::generator_self_iterator,
+            );
+            self.define_data_property(iterator_id, SYMBOL_ITERATOR_KEY, self_iterator);
+            Value::Object(iterator_id)
+        } else {
+            iterator
+        }
     }
 }
 

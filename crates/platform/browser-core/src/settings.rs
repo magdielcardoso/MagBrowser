@@ -34,7 +34,7 @@ impl Default for Settings {
         Self {
             viewport_width: 1024.0,
             viewport_height: 768.0,
-            user_agent: format!("Mag/{}", env!("CARGO_PKG_VERSION")),
+            user_agent: browser_http::DEFAULT_USER_AGENT.to_string(),
             enable_scripting: false,
             enable_network: true,
             background: (255, 255, 255),

@@ -64,6 +64,72 @@ impl Method {
     }
 }
 
+/// Browser-emulation defaults applied to every outgoing request.
+///
+/// These values mirror the headers a current Chrome on macOS sends for a
+/// top-level navigation. `ClientConfig` owns one of these; the values are only
+/// written when the caller has not already supplied that header on the
+/// `Request`, so per-request overrides continue to work.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RequestConfig {
+    /// `Accept` header value.
+    pub accept: String,
+    /// `Accept-Language` header value.
+    pub accept_language: String,
+    /// `Accept-Encoding` header value. Only codings decoded in-process are
+    /// advertised by default (`gzip, deflate`).
+    pub accept_encoding: String,
+    /// `Sec-Fetch-Dest` value.
+    pub sec_fetch_dest: String,
+    /// `Sec-Fetch-Mode` value.
+    pub sec_fetch_mode: String,
+    /// `Sec-Fetch-Site` value.
+    pub sec_fetch_site: String,
+    /// `Sec-Fetch-User` is `?1` when true and `?0` when false.
+    pub sec_fetch_user: bool,
+    /// `Cache-Control` value sent with document requests; `None` omits it.
+    /// Chrome sends `max-age=0` on a normal top-level navigation.
+    pub cache_control: Option<String>,
+    /// Sends `Upgrade-Insecure-Requests: 1` when true.
+    pub upgrade_insecure_requests: bool,
+    /// `sec-ch-ua` client hint.
+    pub sec_ch_ua: String,
+    /// `sec-ch-ua-mobile` client hint (`?1` when true, `?0` when false).
+    pub sec_ch_ua_mobile: bool,
+    /// `sec-ch-ua-platform` client hint.
+    pub sec_ch_ua_platform: String,
+    /// Viewport width in CSS pixels, reported as `sec-ch-viewport-width`.
+    pub viewport_width: u32,
+    /// Device memory in gigabytes, reported as `sec-ch-device-memory`.
+    pub device_memory: u32,
+    /// Device pixel ratio, reported as `sec-ch-dpr`.
+    pub dpr: f32,
+}
+
+impl Default for RequestConfig {
+    fn default() -> Self {
+        Self {
+            accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
+                .to_string(),
+            accept_language: "pt-BR,pt;q=0.9,en;q=0.8".to_string(),
+            accept_encoding: "gzip, deflate".to_string(),
+            sec_fetch_dest: "document".to_string(),
+            sec_fetch_mode: "navigate".to_string(),
+            sec_fetch_site: "none".to_string(),
+            sec_fetch_user: true,
+            cache_control: Some("max-age=0".to_string()),
+            upgrade_insecure_requests: true,
+            sec_ch_ua: "\"Google Chrome\";v=\"131\", \"Chromium\";v=\"131\", \"Not_A Brand\";v=\"24\""
+                .to_string(),
+            sec_ch_ua_mobile: false,
+            sec_ch_ua_platform: "\"macOS\"".to_string(),
+            viewport_width: 1280,
+            device_memory: 8,
+            dpr: 1.0,
+        }
+    }
+}
+
 /// An HTTP request.
 #[derive(Debug, Clone)]
 pub struct Request {
@@ -149,5 +215,31 @@ mod tests {
         assert_eq!(Method::parse("weird"), Method::Get);
         assert!(Method::Get.is_safe());
         assert!(!Method::Put.is_safe());
+    }
+
+    #[test]
+    fn request_config_defaults_match_chrome_navigation() {
+        let config = RequestConfig::default();
+        assert_eq!(
+            config.accept,
+            "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
+        );
+        assert_eq!(config.accept_language, "pt-BR,pt;q=0.9,en;q=0.8");
+        assert_eq!(config.accept_encoding, "gzip, deflate");
+        assert_eq!(config.sec_fetch_dest, "document");
+        assert_eq!(config.sec_fetch_mode, "navigate");
+        assert_eq!(config.sec_fetch_site, "none");
+        assert!(config.sec_fetch_user);
+        assert_eq!(config.cache_control.as_deref(), Some("max-age=0"));
+        assert!(config.upgrade_insecure_requests);
+        assert_eq!(
+            config.sec_ch_ua,
+            "\"Google Chrome\";v=\"131\", \"Chromium\";v=\"131\", \"Not_A Brand\";v=\"24\""
+        );
+        assert!(!config.sec_ch_ua_mobile);
+        assert_eq!(config.sec_ch_ua_platform, "\"macOS\"");
+        assert_eq!(config.viewport_width, 1280);
+        assert_eq!(config.device_memory, 8);
+        assert_eq!(config.dpr, 1.0);
     }
 }

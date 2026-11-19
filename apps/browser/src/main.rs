@@ -6,6 +6,12 @@
 //! driven by the same engine core. `--window-selfcheck` renders the complete
 //! window composition (chrome + page) to a PNG in either build, so the design
 //! can be reviewed without a display.
+//!
+//! Window shortcuts: `Ctrl+F` find-in-page (Enter / Shift+Enter navigate,
+//! Esc closes), `Ctrl+Plus` / `Ctrl+Minus` / `Ctrl+0` zoom the page render
+//! scale, `F12` toggles DevTools, and right-clicking the page opens a context
+//! menu. Dragging a tab reorders its display slot (the engine's `TabSet` has
+//! no reorder API, so the order is kept in the window layer).
 
 mod address_bar;
 mod app;
@@ -15,6 +21,7 @@ mod devtools;
 mod selfcheck;
 mod tabs;
 mod target;
+mod ui_extra;
 mod window;
 #[cfg(feature = "window")]
 mod window_app;

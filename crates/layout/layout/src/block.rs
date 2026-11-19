@@ -10,7 +10,8 @@
 
 use browser_dom::{Document, NodeId};
 use browser_style::{
-    BorderStyle, BoxSizing, ComputedStyle, Dim, Display, Float, Property, Side, TextDecoration,
+    BorderStyle, BoxSizing, ComputedStyle, Dim, Display, Float, Overflow, Property, Side,
+    TextDecoration,
 };
 
 use crate::box_model::{Edges, Rect, collapse_margins};
@@ -19,6 +20,11 @@ use crate::grid;
 use crate::inline::{FloatBand, InlineItem, LineBreaker, collapse_whitespace, whitespace_mode};
 use crate::position::translate_subtree;
 use crate::tree::{BoxType, LayoutBox, LayoutTree};
+
+/// Width/height of a classical scrollbar gutter, in CSS pixels. Matching
+/// Chrome's scrollbars matters for pixel fidelity: the gutter is subtracted
+/// from the content box before children are laid out.
+pub const SCROLLBAR_SIZE: f32 = 15.0;
 
 /// Side a floated box is placed on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -189,6 +195,115 @@ impl FloatContext {
     }
 }
 
+/// Resolves the content height from a declared height, falling back to the
+/// measured content height for indefinite values.
+fn resolve_content_height(
+    height_dim: Dim,
+    border_box: bool,
+    vertical_extra: f32,
+    auto: f32,
+) -> f32 {
+    match height_dim {
+        Dim::Auto => auto,
+        Dim::Px(px) => {
+            if border_box {
+                (px - vertical_extra).max(0.0)
+            } else {
+                px.max(0.0)
+            }
+        }
+        // A percentage height has no definite base in this top-down layout;
+        // resolving it against the width would create a sizing feedback loop.
+        Dim::Percent(_) => auto,
+        Dim::Calc { percent, .. } if percent != 0.0 => auto,
+        Dim::Calc { px, .. } => px.max(0.0),
+    }
+}
+
+/// Lays out the children of `index`, returning the auto content height.
+///
+/// Factored out so a scroll container can be laid out twice: once at full width
+/// to measure overflow, then once more with a scrollbar gutter reserved.
+fn layout_children(
+    tree: &mut LayoutTree,
+    doc: &Document,
+    index: usize,
+    floats: &mut FloatContext,
+    content_y: f32,
+) -> f32 {
+    let box_type = tree.boxes[index].box_type;
+    let children = tree.boxes[index].children.clone();
+    if box_type == BoxType::Table {
+        crate::table::layout_table(tree, doc, index)
+    } else if box_type == BoxType::Flex {
+        flex::layout_flex(tree, doc, index)
+    } else if box_type == BoxType::Grid {
+        grid::layout_grid(tree, doc, index)
+    } else if children
+        .iter()
+        .any(|c| tree.boxes[*c].box_type.is_block_level())
+    {
+        let normal = layout_block_children(tree, doc, index, floats);
+        if floats.is_empty() {
+            normal
+        } else {
+            normal.max(floats.max_bottom() - content_y)
+        }
+    } else {
+        layout_inline_children(tree, doc, index, floats)
+    }
+}
+
+/// Intrinsic width of a box's *content* (excluding its own insets), used to
+/// detect horizontal overflow for `overflow-x: auto`.
+fn content_intrinsic_width(tree: &LayoutTree, index: usize, available: f32) -> f32 {
+    let box_ref = &tree.boxes[index];
+    let child_widths: Vec<f32> = box_ref
+        .children
+        .iter()
+        .map(|&child| max_content_width(tree, child, available))
+        .collect();
+    let has_inline = box_ref.children.iter().any(|&child| {
+        matches!(
+            tree.boxes[child].box_type,
+            BoxType::Text | BoxType::Inline | BoxType::InlineBlock | BoxType::Image
+        )
+    });
+    if has_inline {
+        child_widths.iter().sum()
+    } else {
+        child_widths.iter().copied().fold(0.0, f32::max)
+    }
+}
+
+/// True when `scrollbar-width: none` suppresses scrollbars (and therefore the
+/// gutter) for this box. The style crate does not know the property, so the
+/// authored inline `style` attribute is checked as well.
+fn scrollbar_suppressed(style: &ComputedStyle, doc: &Document, node: Option<NodeId>) -> bool {
+    if let Some(property) = Property::from_name("scrollbar-width")
+        && let Some(keyword) = style.get(property).and_then(|v| v.as_keyword())
+        && keyword == "none"
+    {
+        return true;
+    }
+    if let Some(node) = node
+        && let Some(css) = doc.attr(node, "style")
+        && css.split(';').any(|declaration| {
+            let mut pair = declaration.splitn(2, ':');
+            let is_width = pair
+                .next()
+                .is_some_and(|name| name.trim().eq_ignore_ascii_case("scrollbar-width"));
+            is_width
+                && pair
+                    .next()
+                    .is_some_and(|v| v.trim().eq_ignore_ascii_case("none"))
+        })
+    {
+        return true;
+    }
+    false
+}
+
 /// Lays out the whole tree inside a viewport of `viewport_width` × `viewport_height`.
 pub fn layout_document(
     tree: &mut LayoutTree,
@@ -348,6 +463,8 @@ pub fn layout_box_with(
         b.paddings = paddings;
         b.rect = rect;
         b.content = content;
+        b.scrollbar = None;
+        b.horizontal_scrollbar = None;
     }
 
     if box_type == BoxType::Image {
@@ -396,44 +513,52 @@ pub fn layout_box_with(
         inherited_floats
     };
 
-    let children = tree.boxes[index].children.clone();
-    let auto_content_height = if box_type == BoxType::Table {
-        crate::table::layout_table(tree, doc, index)
-    } else if box_type == BoxType::Flex {
-        flex::layout_flex(tree, doc, index)
-    } else if box_type == BoxType::Grid {
-        grid::layout_grid(tree, doc, index)
-    } else if children
-        .iter()
-        .any(|c| tree.boxes[*c].box_type.is_block_level())
-    {
-        let normal = layout_block_children(tree, doc, index, floats);
-        if floats.is_empty() {
-            normal
-        } else {
-            normal.max(floats.max_bottom() - content.y)
-        }
-    } else {
-        layout_inline_children(tree, doc, index, floats)
-    };
+    // First pass at the full content width. Scroll containers are re-laid out
+    // below at a narrower width when a scrollbar gutter is needed.
+    let mut auto_content_height = layout_children(tree, doc, index, floats, content.y);
+    let mut content_height =
+        resolve_content_height(height_dim, border_box, vertical_extra, auto_content_height);
 
-    let mut content_height = match height_dim {
-        Dim::Auto => auto_content_height,
-        Dim::Px(px) => {
-            if border_box {
-                (px - vertical_extra).max(0.0)
-            } else {
-                px.max(0.0)
-            }
+    // Classical scrollbars live inside the padding box, so a vertical scrollbar
+    // reduces the width available to children. Reserve a gutter only for a
+    // scrollable axis (`auto`/`scroll`) whose content actually overflows, and
+    // only when `scrollbar-width: none` has not suppressed it.
+    let suppressed = scrollbar_suppressed(&style, doc, tree.boxes[index].node);
+    let overflow_x = style.overflow_x();
+    let overflow_y = style.overflow_y();
+    let vertical_overflow = height_is_definite && auto_content_height > content_height + 0.5;
+    let horizontal_overflow = content_intrinsic_width(tree, index, cb_width) > content_width + 0.5;
+    let scrollable = |axis: Overflow| matches!(axis, Overflow::Scroll | Overflow::Auto);
+    let want_v = !suppressed && scrollable(overflow_y) && vertical_overflow;
+    let want_h = !suppressed && scrollable(overflow_x) && horizontal_overflow;
+
+    let hbar = if want_h { SCROLLBAR_SIZE } else { 0.0 };
+    if want_v || want_h {
+        let vbar = if want_v { SCROLLBAR_SIZE } else { 0.0 };
+        content_width = (content_width - vbar).max(0.0);
+        let containing_content_width =
+            (cb_width - margins.horizontal() - horizontal_extra).max(0.0);
+        content_width = content_width.min(containing_content_width);
+        rect.width = content_width + horizontal_extra;
+        content = Rect::new(
+            x + borders.left + paddings.left,
+            border_y + borders.top + paddings.top,
+            content_width,
+            (content_height - hbar).max(0.0),
+        );
+        {
+            let b = &mut tree.boxes[index];
+            b.rect = rect;
+            b.content = content;
         }
-        // A percentage height has no definite base in this top-down layout:
-        // we know the containing block's width, not its height. Resolving it
-        // against the width is a feedback loop for flex/grid tracks whose size
-        // is derived from their children. Treat such heights as indefinite.
-        Dim::Percent(_) => auto_content_height,
-        Dim::Calc { percent, .. } if percent != 0.0 => auto_content_height,
-        Dim::Calc { px, .. } => px.max(0.0),
-    };
+        // Re-flow at the reduced size. A scroll container establishes its own
+        // formatting context, so a fresh float context is correct here.
+        let mut gutter_floats = FloatContext::new();
+        auto_content_height = layout_children(tree, doc, index, &mut gutter_floats, content.y);
+        content_height =
+            resolve_content_height(height_dim, border_box, vertical_extra, auto_content_height);
+    }
+
     // Symmetrically, a definite width and an indefinite height derive the
     // height from the ratio instead of using the intrinsic/content height.
     if !height_is_definite
@@ -453,14 +578,36 @@ pub fn layout_box_with(
         cb_width,
     );
 
+    let scrollport_height = (content_height - hbar).max(0.0);
     let total_height = content_height + borders.vertical() + paddings.vertical();
     {
         let b = &mut tree.boxes[index];
+        b.rect.width = rect.width;
         b.rect.height = total_height;
-        b.content.height = content_height;
-        b.scroll_height = auto_content_height.max(content_height);
+        b.content = Rect::new(content.x, content.y, content.width, scrollport_height);
+        b.scroll_height = auto_content_height.max(scrollport_height);
         if crate::inline::is_scroll_container(&b.style) {
             b.clip = Some(b.rect);
+        }
+        if want_v {
+            // `b.content.width` has already had the gutter removed, so its
+            // right edge is where the vertical scrollbar begins.
+            b.scrollbar = Some(Rect::new(
+                b.content.right(),
+                b.content.y,
+                SCROLLBAR_SIZE,
+                scrollport_height.max(0.0),
+            ));
+        }
+        if want_h {
+            // Likewise the horizontal bar starts at the bottom of the reduced
+            // content area.
+            b.horizontal_scrollbar = Some(Rect::new(
+                b.content.x,
+                b.content.bottom(),
+                content_width.max(0.0),
+                SCROLLBAR_SIZE,
+            ));
         }
     }
     let bottom = tree.boxes[index].rect.bottom();
@@ -753,19 +900,25 @@ fn collect_inline_items(
                 for segment in split_segments(&collapsed, mode) {
                     match segment {
                         Segment::Word(word) => {
-                            let width = measure(&word, font_size);
-                            items.push(InlineItem::Text {
-                                node: tree.boxes[child].node.unwrap_or(NodeId(0)),
-                                text: word,
-                                width,
-                                font_size,
-                                color,
-                                underline: decoration == TextDecoration::Underline,
-                                line_through: decoration == TextDecoration::LineThrough,
-                                bold,
-                                italic,
-                                break_before: true,
-                            });
+                            // Split the word at UAX #14-style opportunities so
+                            // the breaker can wrap inside long hyphenated or
+                            // bracketed runs while keeping punctuation glued to
+                            // the word it belongs to.
+                            for unit in split_break_units(&word) {
+                                let width = measure(&unit, font_size);
+                                items.push(InlineItem::Text {
+                                    node: tree.boxes[child].node.unwrap_or(NodeId(0)),
+                                    text: unit,
+                                    width,
+                                    font_size,
+                                    color,
+                                    underline: decoration == TextDecoration::Underline,
+                                    line_through: decoration == TextDecoration::LineThrough,
+                                    bold,
+                                    italic,
+                                    break_before: true,
+                                });
+                            }
                         }
                         Segment::Space => {
                             let width = measure(" ", font_size);
@@ -853,6 +1006,42 @@ fn split_segments(text: &str, mode: browser_style::WhiteSpace) -> Vec<Segment> {
         segments.push(Segment::Word(word));
     }
     segments
+}
+
+/// Splits a whitespace-delimited word into line-break units, approximating the
+/// relevant UAX #14 rules:
+///
+/// * no break before closing punctuation (`, . ! ? ; : ) ] }`) — it stays in
+///   the current unit;
+/// * no break after opening punctuation (`( [ {`) — the opener starts a new
+///   unit, so a break is allowed *before* it but not after it;
+/// * a break is allowed after `-` and `/`, so those end a unit.
+///
+/// Each returned unit is a separate [`InlineItem::Text`] with `break_before`
+/// set, which is where the greedy line breaker introduces a wrap opportunity.
+fn split_break_units(word: &str) -> Vec<String> {
+    const OPENERS: [char; 3] = ['(', '[', '{'];
+    const BREAK_AFTER: [char; 2] = ['-', '/'];
+
+    let mut units = Vec::new();
+    let mut current = String::new();
+    for ch in word.chars() {
+        if OPENERS.contains(&ch) {
+            if !current.is_empty() {
+                units.push(std::mem::take(&mut current));
+            }
+            current.push(ch);
+        } else {
+            current.push(ch);
+            if BREAK_AFTER.contains(&ch) {
+                units.push(std::mem::take(&mut current));
+            }
+        }
+    }
+    if !current.is_empty() {
+        units.push(current);
+    }
+    units
 }
 
 fn measure(text: &str, font_size: f32) -> f32 {
@@ -1425,5 +1614,170 @@ mod tests {
             "{}",
             b.content.height
         );
+    }
+
+    /// Builds a `div#scroll` (with `scroller_css`) holding a single `div#child`
+    /// (with `child_css`), lays it out, and returns the tree plus both ids.
+    fn layout_scroller(
+        scroller_css: &str,
+        child_css: &str,
+        scroll_style_attr: &str,
+    ) -> (
+        Document,
+        browser_dom::NodeId,
+        browser_dom::NodeId,
+        crate::LayoutTree,
+    ) {
+        let mut doc = Document::new();
+        let html = doc.create_element("html");
+        let body = doc.create_element("body");
+        doc.append_child(doc.root(), html);
+        doc.append_child(html, body);
+        let scroll = doc.create_element("div");
+        doc.set_attr(scroll, "id", "scroll");
+        if !scroll_style_attr.is_empty() {
+            doc.set_attr(scroll, "style", scroll_style_attr);
+        }
+        doc.append_child(body, scroll);
+        let child = doc.create_element("div");
+        doc.set_attr(child, "id", "child");
+        doc.append_child(scroll, child);
+        let mut engine = StyleEngine::new(browser_style::Viewport {
+            width: 800.0,
+            height: 600.0,
+        });
+        engine.add_css(
+            &format!("body {{ margin: 0; }} #scroll {scroller_css} #child {child_css}"),
+            Origin::Author,
+        );
+        let styled = engine.compute(&doc);
+        let tree = crate::layout(
+            &doc,
+            &styled,
+            crate::Size {
+                width: 800.0,
+                height: 600.0,
+            },
+        );
+        (doc, scroll, child, tree)
+    }
+
+    #[test]
+    fn scroll_overflow_reserves_a_gutter_from_content_width() {
+        // The 300px child overflows the 100px scroller, so the 15px gutter must
+        // be removed from the content width before the child is laid out.
+        let (_doc, scroll, child, tree) = layout_scroller(
+            "{ width: 200px; height: 100px; overflow-y: scroll; }",
+            "{ height: 300px; }",
+            "",
+        );
+        let s = tree.find_node(scroll).unwrap();
+        let bar = s.scrollbar.expect("vertical scrollbar");
+        assert_eq!(bar.width, super::SCROLLBAR_SIZE);
+        assert_eq!(bar.height, 100.0);
+        assert!((bar.x - (200.0 - super::SCROLLBAR_SIZE)).abs() < 0.01);
+        assert_eq!(s.content.width, 200.0 - super::SCROLLBAR_SIZE);
+        let c = tree.find_node(child).unwrap();
+        assert_eq!(
+            c.content.width,
+            200.0 - super::SCROLLBAR_SIZE,
+            "child was laid out at the full width, not the scrollbar-reduced width"
+        );
+    }
+
+    #[test]
+    fn auto_overflow_reserves_a_gutter_only_when_content_overflows() {
+        // A 300px child in a 100px-tall scroller overflows → gutter reserved.
+        let (_doc, scroll, child, tree) = layout_scroller(
+            "{ width: 200px; height: 100px; overflow-y: auto; }",
+            "{ height: 300px; }",
+            "",
+        );
+        let s = tree.find_node(scroll).unwrap();
+        assert!(
+            s.scrollbar.is_some(),
+            "overflowing auto box needs a scrollbar"
+        );
+        assert_eq!(s.content.width, 200.0 - super::SCROLLBAR_SIZE);
+        let c = tree.find_node(child).unwrap();
+        assert_eq!(c.content.width, 200.0 - super::SCROLLBAR_SIZE);
+
+        // A 20px child fits → no scrollbar, full content width.
+        let (_doc, scroll, child, tree) = layout_scroller(
+            "{ width: 200px; height: 100px; overflow-y: auto; }",
+            "{ height: 20px; }",
+            "",
+        );
+        let s = tree.find_node(scroll).unwrap();
+        assert!(
+            s.scrollbar.is_none(),
+            "non-overflowing auto box has no scrollbar"
+        );
+        assert_eq!(s.content.width, 200.0);
+        let c = tree.find_node(child).unwrap();
+        assert_eq!(c.content.width, 200.0);
+    }
+
+    #[test]
+    fn scrollbar_width_none_suppresses_the_gutter() {
+        // The style crate drops `scrollbar-width` from stylesheets, so the
+        // authored inline `style` attribute carries it here.
+        let (_doc, scroll, child, tree) = layout_scroller(
+            "{ width: 200px; height: 100px; overflow: scroll; }",
+            "{ height: 20px; }",
+            "scrollbar-width: none",
+        );
+        let s = tree.find_node(scroll).unwrap();
+        assert!(
+            s.scrollbar.is_none(),
+            "scrollbar-width:none must hide the bar"
+        );
+        assert_eq!(s.content.width, 200.0);
+        let c = tree.find_node(child).unwrap();
+        assert_eq!(c.content.width, 200.0);
+    }
+
+    #[test]
+    fn break_units_respect_uax14_punctuation_rules() {
+        assert_eq!(super::split_break_units("hello,"), vec!["hello,"]);
+        assert_eq!(super::split_break_units("(hello"), vec!["(hello"]);
+        assert_eq!(super::split_break_units("a(b)c"), vec!["a", "(b)c"]);
+        assert_eq!(
+            super::split_break_units("foo-bar/baz"),
+            vec!["foo-", "bar/", "baz"]
+        );
+    }
+
+    #[test]
+    fn long_hyphenated_word_wraps_after_the_hyphen() {
+        let (_doc, tree, ids) = layout_with(
+            "body { margin: 0; font-size: 10px; } #p { width: 40px; }",
+            &[("p", "p", "aaaa-bbbb-cccc")],
+        );
+        let p = tree.find_node(ids[1]).unwrap();
+        assert!(
+            p.lines.len() > 1,
+            "a hyphenated word should wrap into multiple lines"
+        );
+    }
+
+    #[test]
+    fn closing_punctuation_does_not_begin_a_line() {
+        let (_doc, tree, ids) = layout_with(
+            "body { margin: 0; font-size: 10px; } #p { width: 45px; }",
+            &[("p", "p", "alpha beta, gamma, delta, epsilon,")],
+        );
+        let p = tree.find_node(ids[1]).unwrap();
+        for line in &p.lines {
+            for fragment in &line.fragments {
+                assert!(
+                    !fragment
+                        .text
+                        .starts_with([',', '.', '!', '?', ';', ':', ')', ']', '}']),
+                    "line began with punctuation: {:?}",
+                    fragment.text
+                );
+            }
+        }
     }
 }

@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use browser_dom::{Document, NodeId, escape_attr, escape_text};
-use browser_style::{ComputedStyle, Dim, Display, StyledTree};
+use browser_style::{ComputedStyle, ComputedValue, Dim, Display, Property, Side, StyledTree};
 
 use crate::box_model::{Edges, Rect};
 use crate::inline::LineBox;
@@ -95,6 +95,13 @@ pub struct LayoutBox {
     pub lines: Vec<LineBox>,
     /// Clip rectangle for scroll containers.
     pub clip: Option<Rect>,
+    /// Vertical scrollbar track/thumb rectangle for scroll containers whose
+    /// content overflows. `None` when no vertical scrollbar is present (or when
+    /// `scrollbar-width: none` suppresses it). Exposed for painting.
+    pub scrollbar: Option<Rect>,
+    /// Horizontal scrollbar rectangle, for the same containers as
+    /// [`Self::scrollbar`] when content also overflows horizontally.
+    pub horizontal_scrollbar: Option<Rect>,
     /// Current scroll offset (x, y).
     pub scroll_offset: (f32, f32),
     /// Total scrollable height.
@@ -126,6 +133,8 @@ impl LayoutBox {
             svg_source: None,
             lines: Vec::new(),
             clip: None,
+            scrollbar: None,
+            horizontal_scrollbar: None,
             scroll_offset: (0.0, 0.0),
             scroll_height: 0.0,
             z_index: 0,
@@ -352,6 +361,11 @@ impl<'a> TreeBuilder<'a> {
         }
         let dom_node = self.doc.node(node);
         let mut style = self.style_for(node, parent_style);
+        // CSS logical properties are not longhands in the style crate, so the
+        // cascade drops them. Map them onto physical properties here (in the
+        // tree builder, where both the style and the authored inline `style`
+        // attribute are available) before any box-model values are built.
+        apply_logical_properties(&mut style, self.doc, node);
         match &dom_node.data {
             browser_dom::NodeData::Text(text) => {
                 if !crate::budget::consume_inline_items(crate::budget::estimate_inline_items(
@@ -824,6 +838,351 @@ pub fn resolve_dim(dim: Dim, base: f32) -> f32 {
     dim.resolve(base).unwrap_or(0.0)
 }
 
+// ---------------------------------------------------------------------------
+// Logical properties
+//
+// The style crate only knows physical longhands (`margin-left`, `width`, ...):
+// `Property::from_name("margin-inline-start")` returns `None` and the cascade
+// drops such declarations.  We therefore read logical properties generically —
+// first through `style.get(Property::from_name(name))` (so this keeps working if
+// the style crate gains support later), then from the authored inline `style`
+// attribute — and map them to physical properties with `direction` /
+// `writing-mode`.  This runs once per node during tree building, so the rest of
+// layout keeps using the ordinary physical accessors.
+// ---------------------------------------------------------------------------
+
+/// The physical sides that the four logical edges map to.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LogicalAxes {
+    pub inline_start: Side,
+    pub inline_end: Side,
+    pub block_start: Side,
+    pub block_end: Side,
+    /// True in the usual horizontal writing modes (inline axis is horizontal).
+    pub inline_is_horizontal: bool,
+}
+
+impl LogicalAxes {
+    pub(crate) fn resolve(style: &ComputedStyle, doc: &Document, node: NodeId) -> Self {
+        let rtl = matches!(
+            style.get(Property::Direction).and_then(|v| v.as_keyword()),
+            Some("rtl")
+        );
+        let writing_mode = logical_keyword(style, doc, node, "writing-mode")
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let vertical = writing_mode.starts_with("vertical");
+        let right_to_left_column = writing_mode.contains("-rl");
+
+        if vertical {
+            // In vertical writing modes the inline axis runs top→bottom.
+            // `vertical-rl` stacks block columns right→left, `vertical-lr`
+            // left→right.
+            Self {
+                inline_start: Side::Top,
+                inline_end: Side::Bottom,
+                block_start: if right_to_left_column {
+                    Side::Right
+                } else {
+                    Side::Left
+                },
+                block_end: if right_to_left_column {
+                    Side::Left
+                } else {
+                    Side::Right
+                },
+                inline_is_horizontal: false,
+            }
+        } else if rtl {
+            Self {
+                inline_start: Side::Right,
+                inline_end: Side::Left,
+                block_start: Side::Top,
+                block_end: Side::Bottom,
+                inline_is_horizontal: true,
+            }
+        } else {
+            Self {
+                inline_start: Side::Left,
+                inline_end: Side::Right,
+                block_start: Side::Top,
+                block_end: Side::Bottom,
+                inline_is_horizontal: true,
+            }
+        }
+    }
+}
+
+/// Finds a declaration by property name in an inline `style` attribute.
+fn inline_declaration<'a>(css: &'a str, name: &str) -> Option<&'a str> {
+    for declaration in css.split(';') {
+        let mut pair = declaration.splitn(2, ':');
+        let key = pair.next()?.trim();
+        if key.eq_ignore_ascii_case(name) {
+            return pair.next().map(str::trim);
+        }
+    }
+    None
+}
+
+/// Reads a keyword-valued logical property generically.
+fn logical_keyword(
+    style: &ComputedStyle,
+    doc: &Document,
+    node: NodeId,
+    name: &str,
+) -> Option<String> {
+    if let Some(property) = Property::from_name(name)
+        && let Some(value) = style.get(property).and_then(ComputedValue::as_keyword)
+    {
+        return Some(value.to_ascii_lowercase());
+    }
+    doc.attr(node, "style")
+        .and_then(|css| inline_declaration(css, name))
+        .map(|raw| raw.trim().to_ascii_lowercase())
+}
+
+/// Parses a `<length>` / `<percentage>` / `auto` value.
+fn parse_length(text: &str) -> Option<Dim> {
+    let text = text.trim();
+    if text.eq_ignore_ascii_case("auto") {
+        return Some(Dim::Auto);
+    }
+    if let Some(rest) = text.strip_suffix('%') {
+        return rest.trim().parse::<f32>().ok().map(Dim::Percent);
+    }
+    if let Some(rest) = text.strip_suffix("px") {
+        return rest.trim().parse::<f32>().ok().map(Dim::Px);
+    }
+    text.parse::<f32>().ok().map(Dim::Px)
+}
+
+/// Reads a length-valued logical property generically.
+fn logical_dim(style: &ComputedStyle, doc: &Document, node: NodeId, name: &str) -> Option<Dim> {
+    if let Some(property) = Property::from_name(name)
+        && let Some(value) = style.get(property)
+    {
+        return match value {
+            ComputedValue::Dim(dim) => Some(*dim),
+            ComputedValue::Px(px) | ComputedValue::Number(px) => Some(Dim::Px(*px)),
+            // The initial value is `auto`; treating it as a real declaration
+            // would overwrite an authored physical `width`/`height`.
+            ComputedValue::Keyword(keyword) if keyword.as_ref() == "auto" => None,
+            ComputedValue::Str(raw) if raw.eq_ignore_ascii_case("auto") => None,
+            ComputedValue::Str(raw) => parse_length(raw),
+            _ => None,
+        };
+    }
+    doc.attr(node, "style")
+        .and_then(|css| inline_declaration(css, name))
+        .and_then(parse_length)
+}
+
+/// Applies a pair of logical edge values (with a two-value shorthand) to the
+/// corresponding physical properties.
+#[allow(clippy::too_many_arguments)]
+fn apply_logical_pair(
+    updates: &mut Vec<(Property, ComputedValue)>,
+    style: &ComputedStyle,
+    doc: &Document,
+    node: NodeId,
+    start_name: &str,
+    end_name: &str,
+    shorthand: &str,
+    start_side: Side,
+    end_side: Side,
+    to_property: fn(Side) -> Property,
+) {
+    let start = logical_dim(style, doc, node, start_name);
+    let end = logical_dim(style, doc, node, end_name);
+    let parts = logical_keyword(style, doc, node, shorthand)
+        .map(|raw| {
+            raw.split_whitespace()
+                .filter_map(parse_length)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let shorthand_start = parts.first().copied();
+    let shorthand_end = parts.get(1).copied().or(shorthand_start);
+
+    if let Some(dim) = start.or(shorthand_start) {
+        updates.push((to_property(start_side), ComputedValue::Dim(dim)));
+    }
+    if let Some(dim) = end.or(shorthand_end) {
+        updates.push((to_property(end_side), ComputedValue::Dim(dim)));
+    }
+}
+
+fn inset_property(side: Side) -> Property {
+    match side {
+        Side::Top => Property::Top,
+        Side::Right => Property::Right,
+        Side::Bottom => Property::Bottom,
+        Side::Left => Property::Left,
+    }
+}
+
+/// Maps every supported logical property on `node` onto its physical
+/// counterpart in `style`. Missing properties are left untouched.
+pub(crate) fn apply_logical_properties(style: &mut ComputedStyle, doc: &Document, node: NodeId) {
+    let axes = LogicalAxes::resolve(style, doc, node);
+    let mut updates: Vec<(Property, ComputedValue)> = Vec::new();
+
+    apply_logical_pair(
+        &mut updates,
+        style,
+        doc,
+        node,
+        "margin-inline-start",
+        "margin-inline-end",
+        "margin-inline",
+        axes.inline_start,
+        axes.inline_end,
+        browser_style::margin_property,
+    );
+    apply_logical_pair(
+        &mut updates,
+        style,
+        doc,
+        node,
+        "margin-block-start",
+        "margin-block-end",
+        "margin-block",
+        axes.block_start,
+        axes.block_end,
+        browser_style::margin_property,
+    );
+    apply_logical_pair(
+        &mut updates,
+        style,
+        doc,
+        node,
+        "padding-inline-start",
+        "padding-inline-end",
+        "padding-inline",
+        axes.inline_start,
+        axes.inline_end,
+        browser_style::padding_property,
+    );
+    apply_logical_pair(
+        &mut updates,
+        style,
+        doc,
+        node,
+        "padding-block-start",
+        "padding-block-end",
+        "padding-block",
+        axes.block_start,
+        axes.block_end,
+        browser_style::padding_property,
+    );
+    apply_logical_pair(
+        &mut updates,
+        style,
+        doc,
+        node,
+        "inset-inline-start",
+        "inset-inline-end",
+        "inset-inline",
+        axes.inline_start,
+        axes.inline_end,
+        inset_property,
+    );
+    apply_logical_pair(
+        &mut updates,
+        style,
+        doc,
+        node,
+        "inset-block-start",
+        "inset-block-end",
+        "inset-block",
+        axes.block_start,
+        axes.block_end,
+        inset_property,
+    );
+
+    // `inline-size` / `block-size` follow the writing mode's logical axes.
+    if let Some(dim) = logical_dim(style, doc, node, "inline-size") {
+        let property = if axes.inline_is_horizontal {
+            Property::Width
+        } else {
+            Property::Height
+        };
+        updates.push((property, ComputedValue::Dim(dim)));
+    }
+    if let Some(dim) = logical_dim(style, doc, node, "block-size") {
+        let property = if axes.inline_is_horizontal {
+            Property::Height
+        } else {
+            Property::Width
+        };
+        updates.push((property, ComputedValue::Dim(dim)));
+    }
+
+    // Border widths: prefer the explicit `-width` longhand, then the logical
+    // shorthand (`border-inline-start: 2px solid ...`).
+    for (longhand, shorthand, side) in [
+        (
+            "border-inline-start-width",
+            "border-inline-start",
+            axes.inline_start,
+        ),
+        (
+            "border-inline-end-width",
+            "border-inline-end",
+            axes.inline_end,
+        ),
+        (
+            "border-block-start-width",
+            "border-block-start",
+            axes.block_start,
+        ),
+        ("border-block-end-width", "border-block-end", axes.block_end),
+    ] {
+        let width = logical_dim(style, doc, node, longhand)
+            .or_else(|| {
+                let raw = logical_keyword(style, doc, node, shorthand)?;
+                let first = raw.split_whitespace().next()?;
+                match first {
+                    "thin" => Some(Dim::Px(1.0)),
+                    "medium" => Some(Dim::Px(3.0)),
+                    "thick" => Some(Dim::Px(5.0)),
+                    _ => parse_length(first),
+                }
+            })
+            .and_then(|dim| match dim {
+                Dim::Px(px) => Some(px),
+                _ => None,
+            });
+        if let Some(px) = width {
+            updates.push((
+                browser_style::border_width_property(side),
+                ComputedValue::Px(px),
+            ));
+        }
+        // A border shorthand also carries a style keyword; without it the
+        // width alone would not paint (the style crate hides invisible borders).
+        if let Some(raw) = logical_keyword(style, doc, node, shorthand) {
+            for token in raw.split_whitespace() {
+                let keyword = match token {
+                    "solid" | "dashed" | "dotted" | "double" | "groove" | "ridge" | "inset"
+                    | "outset" | "hidden" | "none" => token,
+                    _ => continue,
+                };
+                if let Some(property) =
+                    Property::from_name(&format!("border-{}-style", side.suffix()))
+                {
+                    updates.push((property, ComputedValue::keyword(keyword)));
+                }
+            }
+        }
+    }
+
+    for (property, value) in updates {
+        style.set(property, value);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1254,5 +1613,64 @@ mod tests {
         let b = tree.find_node(svg).unwrap();
         assert_eq!(b.rect.width, 40.0);
         assert_eq!(b.rect.height, 20.0);
+    }
+
+    #[test]
+    fn logical_margin_inline_start_maps_to_left_in_ltr() {
+        // The style crate drops `margin-inline-start`, so the tree builder must
+        // read it from the authored style and map inline-start → left in LTR.
+        let mut doc = Document::new();
+        let html = doc.create_element("html");
+        let body = doc.create_element("body");
+        doc.append_child(doc.root(), html);
+        doc.append_child(html, body);
+        let div = doc.create_element("div");
+        doc.set_attr(
+            div,
+            "style",
+            "margin-inline-start: 24px; width: 10px; height: 10px",
+        );
+        doc.append_child(body, div);
+        let mut engine = StyleEngine::new(Viewport {
+            width: 800.0,
+            height: 600.0,
+        });
+        engine.add_css("body { margin: 0; }", Origin::Author);
+        let styled = engine.compute(&doc);
+
+        let tree = TreeBuilder::new(&doc, &styled).build();
+        let b = tree.find_node(div).unwrap();
+        assert_eq!(b.style.margin(Side::Left), Dim::Px(24.0));
+        assert_eq!(b.style.margin(Side::Right), Dim::Px(0.0));
+
+        let tree = crate::layout(
+            &doc,
+            &styled,
+            crate::Size {
+                width: 800.0,
+                height: 600.0,
+            },
+        );
+        let b = tree.find_node(div).unwrap();
+        assert_eq!(b.margins.left, 24.0, "inline-start did not map to left");
+        assert_eq!(b.rect.x, 24.0);
+    }
+
+    #[test]
+    fn logical_inline_size_maps_to_width_in_horizontal_writing_mode() {
+        let mut doc = Document::new();
+        let html = doc.create_element("html");
+        let body = doc.create_element("body");
+        doc.append_child(doc.root(), html);
+        doc.append_child(html, body);
+        let div = doc.create_element("div");
+        doc.set_attr(div, "style", "inline-size: 120px; block-size: 40px");
+        doc.append_child(body, div);
+        let engine = StyleEngine::new(Viewport::default());
+        let styled = engine.compute(&doc);
+        let tree = TreeBuilder::new(&doc, &styled).build();
+        let b = tree.find_node(div).unwrap();
+        assert_eq!(b.style.width(), Dim::Px(120.0));
+        assert_eq!(b.style.height(), Dim::Px(40.0));
     }
 }

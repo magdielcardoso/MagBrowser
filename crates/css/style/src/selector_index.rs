@@ -19,13 +19,16 @@
 
 use std::collections::HashMap;
 
-use browser_css::{Declaration, Origin, Rule, Stylesheet};
+use browser_css::{ContainerQuery, Declaration, Origin, Rule, Stylesheet};
 use browser_dom::{Document, NodeId};
 use browser_selectors::{
     ElementState, PseudoElement, Selector, SimpleSelector, matches_pseudo_element_host_with_state,
     parse_selector,
 };
 
+use crate::conditions::{
+    ContainerContext, LayerOrder, ScopeMatcher, container_query_matches, supports_condition_matches,
+};
 use crate::media_queries::{MediaContext, media_matches};
 
 /// Which family of rules to look up for an element.
@@ -52,6 +55,13 @@ pub(crate) struct CompiledRule {
     pub(crate) seq: usize,
     /// Media query lists along the path to this rule; all must match.
     media: Vec<String>,
+    /// `@container` queries along the path; all must match the element's
+    /// container context. Each entry is `(optional name, query)`.
+    containers: Vec<(Option<String>, ContainerQuery)>,
+    /// `@layer` rank assigned from source order (`UNLAYERED` when unlayered).
+    pub(crate) layer: u32,
+    /// Innermost `@scope` root/limit matcher, if any.
+    pub(crate) scope: Option<ScopeMatcher>,
 }
 
 /// Index buckets for one rule family. Each vector is kept in ascending `seq`.
@@ -138,6 +148,10 @@ impl SelectorIndex {
         author: &[Stylesheet],
     ) -> Self {
         let mut index = Self::default();
+        let mut sheet_rules: Vec<&[Rule]> = vec![user_agent.rules.as_slice()];
+        sheet_rules.extend(user.iter().map(|sheet| sheet.rules.as_slice()));
+        sheet_rules.extend(author.iter().map(|sheet| sheet.rules.as_slice()));
+        let layer_order = LayerOrder::from_rules(sheet_rules);
         let mut seq = 0_usize;
         for (origin, sheets) in [
             (Origin::UserAgent, std::slice::from_ref(user_agent)),
@@ -146,20 +160,37 @@ impl SelectorIndex {
         ] {
             for sheet in sheets {
                 let mut media = Vec::new();
-                index.add_rules(&sheet.rules, origin, &mut media, &mut seq);
+                let mut anonymous = 0usize;
+                index.add_rules(
+                    &sheet.rules,
+                    origin,
+                    &mut media,
+                    &mut seq,
+                    &layer_order,
+                    "",
+                    &mut anonymous,
+                    &[],
+                    None,
+                );
             }
         }
         index
     }
 
-    /// Adds the style rules in `rules`, remembering the enclosing media
-    /// queries so they can be evaluated once per stylesheet computation.
+    /// Adds style rules to a bucket, carrying the enclosing conditional
+    /// context (media, supports, container, layer and scope) with them.
+    #[allow(clippy::too_many_arguments)]
     fn add_rules(
         &mut self,
         rules: &[Rule],
         origin: Origin,
         media: &mut Vec<String>,
         seq: &mut usize,
+        layer_order: &LayerOrder,
+        layer_path: &str,
+        anonymous: &mut usize,
+        containers: &[(Option<String>, ContainerQuery)],
+        scope: Option<&ScopeMatcher>,
     ) {
         for rule in rules {
             match rule {
@@ -190,6 +221,9 @@ impl SelectorIndex {
                             origin,
                             seq: *seq,
                             media: media.clone(),
+                            containers: containers.to_vec(),
+                            layer: layer_order.rank(layer_path),
+                            scope: scope.cloned(),
                         };
                         *seq += 1;
                         let index = self.rules.len();
@@ -204,11 +238,93 @@ impl SelectorIndex {
                 }
                 Rule::Media(media_rule) => {
                     media.push(media_rule.query.clone());
-                    self.add_rules(&media_rule.rules, origin, media, seq);
+                    self.add_rules(
+                        &media_rule.rules,
+                        origin,
+                        media,
+                        seq,
+                        layer_order,
+                        layer_path,
+                        anonymous,
+                        containers,
+                        scope,
+                    );
                     media.pop();
                 }
-                // Imports are fetched by the browser core; all other at-rules
-                // are ignored by the cascade (and diagnosed separately).
+                Rule::Supports(supports_rule) => {
+                    // Support is static for an engine, so decide once here.
+                    if !supports_condition_matches(&supports_rule.condition) {
+                        continue;
+                    }
+                    self.add_rules(
+                        &supports_rule.rules,
+                        origin,
+                        media,
+                        seq,
+                        layer_order,
+                        layer_path,
+                        anonymous,
+                        containers,
+                        scope,
+                    );
+                }
+                Rule::Container(container_rule) => {
+                    let mut nested = containers.to_vec();
+                    nested.push((container_rule.name.clone(), container_rule.query.clone()));
+                    self.add_rules(
+                        &container_rule.rules,
+                        origin,
+                        media,
+                        seq,
+                        layer_order,
+                        layer_path,
+                        anonymous,
+                        &nested,
+                        scope,
+                    );
+                }
+                Rule::LayerBlock(layer_block) => {
+                    *anonymous += 1;
+                    let own = layer_block
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| format!("\0anon{anonymous}"));
+                    let full = if layer_path.is_empty() {
+                        own
+                    } else {
+                        format!("{layer_path}.{own}")
+                    };
+                    self.add_rules(
+                        &layer_block.rules,
+                        origin,
+                        media,
+                        seq,
+                        layer_order,
+                        &full,
+                        anonymous,
+                        containers,
+                        scope,
+                    );
+                }
+                Rule::Scope(scope_rule) => {
+                    let matcher =
+                        ScopeMatcher::new(scope_rule.root.as_deref(), scope_rule.limit.as_deref());
+                    self.add_rules(
+                        &scope_rule.rules,
+                        origin,
+                        media,
+                        seq,
+                        layer_order,
+                        layer_path,
+                        anonymous,
+                        containers,
+                        Some(&matcher),
+                    );
+                }
+                // `@starting-style` supplies transition start values, which
+                // are not part of the normal computed style. `@layer`
+                // statements only define order (handled above), and imports
+                // are fetched by the browser core.
                 _ => {}
             }
         }
@@ -226,11 +342,14 @@ impl SelectorIndex {
     /// Lists the rules of `kind` that could match `keys`, in source order.
     ///
     /// `out` is cleared and reused across elements to avoid reallocating.
+    /// Rules whose `@container` conditions do not match `containers` are
+    /// filtered out here, alongside the media queries.
     pub(crate) fn lookup(
         &self,
         kind: RuleKind,
         keys: &NodeKeys<'_>,
         media_ok: &[bool],
+        containers: &ContainerContext,
         out: &mut Vec<usize>,
     ) {
         out.clear();
@@ -239,20 +358,20 @@ impl SelectorIndex {
             RuleKind::Before => &self.before,
             RuleKind::After => &self.after,
         };
-        Self::push_matching(&buckets.universal, media_ok, out);
+        Self::push_matching(&buckets.universal, self, media_ok, containers, out);
         if let Some(tag) = &keys.tag
             && let Some(list) = buckets.by_tag.get(tag)
         {
-            Self::push_matching(list, media_ok, out);
+            Self::push_matching(list, self, media_ok, containers, out);
         }
         if let Some(id) = keys.id
             && let Some(list) = buckets.by_id.get(id)
         {
-            Self::push_matching(list, media_ok, out);
+            Self::push_matching(list, self, media_ok, containers, out);
         }
         for class in &keys.classes {
             if let Some(list) = buckets.by_class.get(*class) {
-                Self::push_matching(list, media_ok, out);
+                Self::push_matching(list, self, media_ok, containers, out);
             }
         }
         // A rule lives in exactly one bucket, so there are no duplicates;
@@ -260,10 +379,24 @@ impl SelectorIndex {
         out.sort_unstable_by_key(|&index| self.rules[index].seq);
     }
 
-    fn push_matching(list: &[usize], media_ok: &[bool], out: &mut Vec<usize>) {
-        for &index in list {
-            if media_ok[index] {
-                out.push(index);
+    fn push_matching(
+        list: &[usize],
+        index: &Self,
+        media_ok: &[bool],
+        containers: &ContainerContext,
+        out: &mut Vec<usize>,
+    ) {
+        for &pos in list {
+            if !media_ok[pos] {
+                continue;
+            }
+            let rule = &index.rules[pos];
+            if rule
+                .containers
+                .iter()
+                .all(|(name, query)| container_query_matches(query, name.as_deref(), containers))
+            {
+                out.push(pos);
             }
         }
     }
@@ -286,10 +419,11 @@ impl SelectorIndex {
         node: NodeId,
         keys: &NodeKeys<'_>,
         media_ok: &[bool],
+        containers: &ContainerContext,
         state: &ElementState,
         out: &mut Vec<usize>,
     ) -> Option<PseudoElement> {
-        self.lookup(kind, keys, media_ok, out);
+        self.lookup(kind, keys, media_ok, containers, out);
         let mut declarations = Vec::new();
         for &index in out.iter() {
             let rule = &self.rules[index];

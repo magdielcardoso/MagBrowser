@@ -12,7 +12,7 @@ use crate::cache::HttpCache;
 use crate::cookies::CookieJar;
 use crate::headers::Headers;
 use crate::redirect::{RedirectOutcome, RedirectPolicy};
-use crate::request::{Method, Request};
+use crate::request::{Method, Request, RequestConfig};
 use crate::response::Response;
 
 /// Upper bound on how long a single socket read or write may block before the
@@ -82,11 +82,18 @@ impl From<browser_url::UrlError> for HttpError {
     }
 }
 
+/// Chrome's `User-Agent` on macOS, used as the default so servers serve the
+/// same HTML, CSS and assets they serve to a real browser.
+pub const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+
 /// Client configuration.
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
     /// `User-Agent` header value.
     pub user_agent: String,
+    /// Browser-emulation defaults for the other request headers (Accept,
+    /// Sec-Fetch, client hints, viewport width and DPR).
+    pub request: RequestConfig,
     /// Deadline for a single request (DNS + connect + headers + body).
     pub timeout: Duration,
     /// Overall deadline for an entire redirect chain.
@@ -104,7 +111,8 @@ pub struct ClientConfig {
 impl Default for ClientConfig {
     fn default() -> Self {
         Self {
-            user_agent: format!("Mag/{} (+engine)", env!("CARGO_PKG_VERSION")),
+            user_agent: DEFAULT_USER_AGENT.to_string(),
+            request: RequestConfig::default(),
             timeout: Duration::from_secs(8),
             redirect_chain_timeout: Duration::from_secs(24),
             max_redirects: 10,
@@ -257,17 +265,81 @@ impl Client {
     }
 
     fn prepare(&self, req: &mut Request) {
+        let browser = &self.config.request;
         if let Some(host) = req.url.host_header() {
             req.headers.insert("Host", &host);
         }
         req.headers.insert("User-Agent", &self.config.user_agent);
-        if !req.headers.contains("Accept") {
-            req.headers
-                .insert("Accept", "text/html,application/xhtml+xml,*/*;q=0.8");
-        }
+        // Browser defaults fill in gaps: a caller (for example fetch/XHR) can
+        // still set its own Accept or Sec-Fetch-* values on the Request.
+        insert_if_absent(&mut req.headers, "Accept", &browser.accept);
+        insert_if_absent(
+            &mut req.headers,
+            "Accept-Language",
+            &browser.accept_language,
+        );
         // Only codings we can actually decode in-process (no brotli crate).
-        req.headers.insert("Accept-Encoding", "gzip, deflate");
+        req.headers
+            .insert("Accept-Encoding", &browser.accept_encoding);
         req.headers.insert("Connection", "close");
+        insert_if_absent(&mut req.headers, "Sec-Fetch-Dest", &browser.sec_fetch_dest);
+        insert_if_absent(&mut req.headers, "Sec-Fetch-Mode", &browser.sec_fetch_mode);
+        insert_if_absent(&mut req.headers, "Sec-Fetch-Site", &browser.sec_fetch_site);
+        insert_if_absent(
+            &mut req.headers,
+            "Sec-Fetch-User",
+            query_flag(browser.sec_fetch_user),
+        );
+        if browser.upgrade_insecure_requests {
+            insert_if_absent(&mut req.headers, "Upgrade-Insecure-Requests", "1");
+        } else {
+            req.headers.remove("Upgrade-Insecure-Requests");
+        }
+
+        // Chrome sends Cache-Control on navigations, not on subresource loads.
+        // Honour a caller-supplied value, otherwise derive it from the effective
+        // destination (which may have been overridden on the Request).
+        let is_document = req
+            .headers
+            .get("Sec-Fetch-Dest")
+            .is_some_and(|value| value.eq_ignore_ascii_case("document"));
+        if is_document {
+            if let Some(value) = &browser.cache_control {
+                insert_if_absent(&mut req.headers, "Cache-Control", value);
+            } else {
+                req.headers.remove("Cache-Control");
+            }
+        } else {
+            req.headers.remove("Cache-Control");
+        }
+
+        insert_if_absent(&mut req.headers, "sec-ch-ua", &browser.sec_ch_ua);
+        insert_if_absent(
+            &mut req.headers,
+            "sec-ch-ua-mobile",
+            query_flag(browser.sec_ch_ua_mobile),
+        );
+        insert_if_absent(
+            &mut req.headers,
+            "sec-ch-ua-platform",
+            &browser.sec_ch_ua_platform,
+        );
+        insert_if_absent(
+            &mut req.headers,
+            "sec-ch-viewport-width",
+            &browser.viewport_width.to_string(),
+        );
+        insert_if_absent(
+            &mut req.headers,
+            "sec-ch-device-memory",
+            &browser.device_memory.to_string(),
+        );
+        insert_if_absent(
+            &mut req.headers,
+            "sec-ch-dpr",
+            &dpr_header_value(browser.dpr),
+        );
+
         if !req.body.is_empty() {
             req.headers
                 .insert("Content-Length", &req.body.len().to_string());
@@ -340,6 +412,36 @@ impl Client {
         let cfg = std::sync::Arc::new(cfg);
         self.tls = Some(cfg.clone());
         Ok(cfg)
+    }
+}
+
+/// Sets `name` only when the request does not already carry that header.
+fn insert_if_absent(headers: &mut Headers, name: &str, value: &str) {
+    if !headers.contains(name) {
+        headers.insert(name, value);
+    }
+}
+
+/// Query-style structured header flag used by `Sec-Fetch-User` and
+/// `sec-ch-ua-mobile`.
+fn query_flag(enabled: bool) -> &'static str {
+    if enabled { "?1" } else { "?0" }
+}
+
+/// Formats a device pixel ratio the way Chrome does: whole numbers have no
+/// decimal part, fractional values keep at most two decimals.
+fn dpr_header_value(dpr: f32) -> String {
+    if !dpr.is_finite() || dpr <= 0.0 {
+        return "1".to_string();
+    }
+    let whole = dpr.round();
+    if (dpr - whole).abs() < 0.001 {
+        format!("{}", whole.clamp(1.0, u32::MAX as f32) as u32)
+    } else {
+        format!("{dpr:.2}")
+            .trim_end_matches('0')
+            .trim_end_matches('.')
+            .to_string()
     }
 }
 
@@ -975,11 +1077,179 @@ mod tests {
         assert!(matches!(err, HttpError::UnsupportedContentEncoding(_)));
     }
 
+    fn prepared(config: ClientConfig) -> Request {
+        let client = Client::new(config);
+        let mut req = Request::get_str("http://a.test/index.html").unwrap();
+        client.prepare(&mut req);
+        req
+    }
+
     #[test]
     fn prepare_advertises_supported_encodings() {
         let client = Client::new(ClientConfig::default());
         let mut req = Request::get_str("http://a.test/").unwrap();
         client.prepare(&mut req);
         assert_eq!(req.headers.get("Accept-Encoding"), Some("gzip, deflate"));
+    }
+
+    #[test]
+    fn default_user_agent_is_current_chrome_on_macos() {
+        assert_eq!(
+            ClientConfig::default().user_agent,
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+        );
+        assert_eq!(ClientConfig::default().user_agent, DEFAULT_USER_AGENT);
+    }
+
+    #[test]
+    fn prepare_sends_chrome_navigation_headers() {
+        let req = prepared(ClientConfig::default());
+        let expected = [
+            ("User-Agent", DEFAULT_USER_AGENT),
+            (
+                "Accept",
+                "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            ),
+            ("Accept-Language", "pt-BR,pt;q=0.9,en;q=0.8"),
+            ("Accept-Encoding", "gzip, deflate"),
+            ("Sec-Fetch-Dest", "document"),
+            ("Sec-Fetch-Mode", "navigate"),
+            ("Sec-Fetch-Site", "none"),
+            ("Sec-Fetch-User", "?1"),
+            ("Upgrade-Insecure-Requests", "1"),
+            ("Cache-Control", "max-age=0"),
+            (
+                "sec-ch-ua",
+                "\"Google Chrome\";v=\"131\", \"Chromium\";v=\"131\", \"Not_A Brand\";v=\"24\"",
+            ),
+            ("sec-ch-ua-mobile", "?0"),
+            ("sec-ch-ua-platform", "\"macOS\""),
+            ("sec-ch-viewport-width", "1280"),
+            ("sec-ch-device-memory", "8"),
+            ("sec-ch-dpr", "1"),
+        ];
+        for (name, value) in expected {
+            assert_eq!(req.headers.get(name), Some(value), "header {name}");
+        }
+    }
+
+    #[test]
+    fn wire_uses_exact_browser_header_names() {
+        let wire = prepared(ClientConfig::default()).to_wire();
+        for line in [
+            "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8\r\n",
+            "Accept-Language: pt-BR,pt;q=0.9,en;q=0.8\r\n",
+            "Accept-Encoding: gzip, deflate\r\n",
+            "Sec-Fetch-Dest: document\r\n",
+            "Sec-Fetch-Mode: navigate\r\n",
+            "Sec-Fetch-Site: none\r\n",
+            "Sec-Fetch-User: ?1\r\n",
+            "Upgrade-Insecure-Requests: 1\r\n",
+            "Cache-Control: max-age=0\r\n",
+            "sec-ch-ua: \"Google Chrome\";v=\"131\", \"Chromium\";v=\"131\", \"Not_A Brand\";v=\"24\"\r\n",
+            "sec-ch-ua-mobile: ?0\r\n",
+            "sec-ch-ua-platform: \"macOS\"\r\n",
+            "sec-ch-viewport-width: 1280\r\n",
+            "sec-ch-device-memory: 8\r\n",
+            "sec-ch-dpr: 1\r\n",
+        ] {
+            assert!(wire.contains(line), "missing wire line: {line:?}\n{wire}");
+        }
+    }
+
+    #[test]
+    fn browser_headers_are_configurable() {
+        let config = ClientConfig {
+            user_agent: "Custom/1.0".to_string(),
+            request: RequestConfig {
+                accept: "application/json".to_string(),
+                accept_language: "en-US,en;q=0.9".to_string(),
+                accept_encoding: "gzip".to_string(),
+                sec_fetch_dest: "empty".to_string(),
+                sec_fetch_mode: "cors".to_string(),
+                sec_fetch_site: "same-origin".to_string(),
+                sec_fetch_user: false,
+                cache_control: Some("no-cache".to_string()),
+                upgrade_insecure_requests: false,
+                sec_ch_ua: "\"Test\";v=\"1\"".to_string(),
+                sec_ch_ua_mobile: true,
+                sec_ch_ua_platform: "\"Linux\"".to_string(),
+                viewport_width: 390,
+                device_memory: 4,
+                dpr: 3.0,
+            },
+            ..ClientConfig::default()
+        };
+        let req = prepared(config);
+        assert_eq!(req.headers.get("User-Agent"), Some("Custom/1.0"));
+        assert_eq!(req.headers.get("Accept"), Some("application/json"));
+        assert_eq!(req.headers.get("Accept-Language"), Some("en-US,en;q=0.9"));
+        assert_eq!(req.headers.get("Accept-Encoding"), Some("gzip"));
+        assert_eq!(req.headers.get("Sec-Fetch-Dest"), Some("empty"));
+        assert_eq!(req.headers.get("Sec-Fetch-Mode"), Some("cors"));
+        assert_eq!(req.headers.get("Sec-Fetch-Site"), Some("same-origin"));
+        assert_eq!(req.headers.get("Sec-Fetch-User"), Some("?0"));
+        assert!(!req.headers.contains("Upgrade-Insecure-Requests"));
+        assert_eq!(req.headers.get("sec-ch-ua"), Some("\"Test\";v=\"1\""));
+        assert_eq!(req.headers.get("sec-ch-ua-mobile"), Some("?1"));
+        assert_eq!(req.headers.get("sec-ch-ua-platform"), Some("\"Linux\""));
+        assert_eq!(req.headers.get("sec-ch-viewport-width"), Some("390"));
+        assert_eq!(req.headers.get("sec-ch-device-memory"), Some("4"));
+        assert_eq!(req.headers.get("sec-ch-dpr"), Some("3"));
+        // Cache-Control is a navigation header; the configured destination is
+        // `empty`, so it must not be sent on this request.
+        assert!(!req.headers.contains("Cache-Control"));
+    }
+
+    #[test]
+    fn cache_control_is_configurable_for_navigations() {
+        let custom = ClientConfig {
+            request: RequestConfig {
+                cache_control: Some("no-cache".to_string()),
+                ..RequestConfig::default()
+            },
+            ..ClientConfig::default()
+        };
+        assert_eq!(
+            prepared(custom).headers.get("Cache-Control"),
+            Some("no-cache")
+        );
+
+        let disabled = ClientConfig {
+            request: RequestConfig {
+                cache_control: None,
+                ..RequestConfig::default()
+            },
+            ..ClientConfig::default()
+        };
+        assert!(!prepared(disabled).headers.contains("Cache-Control"));
+    }
+
+    #[test]
+    fn caller_headers_override_browser_defaults() {
+        let client = Client::new(ClientConfig::default());
+        let mut req = Request::get_str("http://a.test/")
+            .unwrap()
+            .header("Accept", "application/json")
+            .header("Accept-Language", "en")
+            .header("Sec-Fetch-Dest", "empty")
+            .header("sec-ch-ua-platform", "\"Android\"");
+        client.prepare(&mut req);
+        assert_eq!(req.headers.get("Accept"), Some("application/json"));
+        assert_eq!(req.headers.get("Accept-Language"), Some("en"));
+        assert_eq!(req.headers.get("Sec-Fetch-Dest"), Some("empty"));
+        assert_eq!(req.headers.get("sec-ch-ua-platform"), Some("\"Android\""));
+        assert!(!req.headers.contains("Cache-Control"));
+    }
+
+    #[test]
+    fn dpr_header_value_formats_like_chrome() {
+        assert_eq!(dpr_header_value(1.0), "1");
+        assert_eq!(dpr_header_value(2.0), "2");
+        assert_eq!(dpr_header_value(1.5), "1.5");
+        assert_eq!(dpr_header_value(1.25), "1.25");
+        assert_eq!(dpr_header_value(1.333), "1.33");
+        assert_eq!(dpr_header_value(0.0), "1");
+        assert_eq!(dpr_header_value(f32::NAN), "1");
     }
 }

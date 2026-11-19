@@ -30,14 +30,23 @@ pub mod borders;
 pub mod commands;
 pub mod decode;
 pub mod display_list;
+pub mod effects;
 pub mod images;
 pub mod png;
 pub mod raster;
 pub mod svg;
 
-pub use commands::{build, build_with_images, content_bounds, render, render_with_background};
+pub use commands::{
+    build, build_with_effects, build_with_images, content_bounds, render, render_with_background,
+};
 pub use decode::{DecodeError, ImageFormat, decode, decode_png, detect_format};
 pub use display_list::{DisplayCommand, DisplayList, MAX_COMMANDS};
+pub use effects::{
+    BackdropFilters, BlendMode, BorderImageData, ClipPath, ConicGradient, CoverageMask,
+    EffectsList, ExtendedCommand, GradientStop, ImageRendering, MaskData, OutlineData,
+    RadialGradient, RawEffects, build_effects, build_effects_with, rasterize_clip_path,
+    sample_conic, sample_radial,
+};
 pub use images::{ImageData, MAX_IMAGE_DIMENSION};
 pub use raster::{ImageBuffer, Rasterizer};
 pub use svg::{rasterize, rasterize_bytes};

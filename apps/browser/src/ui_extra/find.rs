@@ -6,6 +6,9 @@
 //! [`FindBar`] wraps those matches with navigation state (next / previous /
 //! currently highlighted match).
 
+// A framework-agnostic model: not every accessor is used by the window shell.
+#![allow(dead_code)]
+
 /// A half-open byte range `[start, end)` into some text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct TextRange {

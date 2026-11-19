@@ -35,7 +35,12 @@
 //! `:required`, `:optional`, `:placeholder-shown`, `:read-only`, `:read-write`,
 //! `:autofill`, `:user-invalid`.
 //!
-//! Other: `:lang()`, `:dir(ltr|rtl)`, `:defined`, `:host`, `:modal`.
+//! Other: `:lang()`, `:dir(ltr|rtl)`, `:defined`, `:host`,
+//! `:host-context()`, `:modal`.
+//!
+//! Shadow DOM: `::slotted()` is matched with [`matches_slotted`] against
+//! light-DOM children assigned to a slot; host selectors use [`ElementState`]
+//! together with [`browser_dom::Document`]'s shadow helpers.
 //!
 //! Stateful pseudo-classes consult [`ElementState`]; the remainder are derived
 //! from the document tree and attributes.
@@ -49,8 +54,9 @@ mod pseudo;
 use std::fmt;
 
 pub use matcher::{
-    matches, matches_pseudo_element_host, matches_pseudo_element_host_with_state,
-    matches_with_state, query_selector, query_selector_all, specificity,
+    matches, matches_pseudo_element_host, matches_pseudo_element_host_with_state, matches_slotted,
+    matches_slotted_with_state, matches_with_state, query_selector, query_selector_all,
+    specificity,
 };
 pub use parser::{parse_selector, parse_selectors};
 pub use pseudo::{
@@ -214,6 +220,9 @@ pub enum PseudoClass {
     Dir(Direction),
     /// `:host`.
     Host,
+    /// `:host-context(<selector-list>)`: the host or one of its light-tree
+    /// ancestors matches the argument.
+    HostContext(Vec<Selector>),
     /// `:defined`.
     Defined,
     /// `:modal`.
@@ -277,6 +286,11 @@ pub struct Selector {
     /// ordinary [`matches`] function, because a pseudo-element is not a real
     /// DOM node.
     pub pseudo_element: Option<String>,
+    /// Raw argument of a functional pseudo-element such as `::slotted(div)`.
+    ///
+    /// `None` for non-functional pseudo-elements and for selectors without a
+    /// pseudo-element. The matcher parses this with [`parse_selectors`].
+    pub pseudo_element_argument: Option<String>,
 }
 
 /// Dynamic state used when matching interactive pseudo-classes.

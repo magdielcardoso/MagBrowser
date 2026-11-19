@@ -19,6 +19,10 @@ pub struct RegexFlags {
     pub multiline: bool,
     /// `s`: `.` also matches line terminators.
     pub dot_all: bool,
+    /// `y`: match only at `lastIndex` (sticky matching).
+    pub sticky: bool,
+    /// `d`: produce the start/end indices of each captured group.
+    pub has_indices: bool,
 }
 
 impl RegexFlags {
@@ -31,6 +35,8 @@ impl RegexFlags {
                 'i' => &mut parsed.ignore_case,
                 'm' => &mut parsed.multiline,
                 's' => &mut parsed.dot_all,
+                'y' => &mut parsed.sticky,
+                'd' => &mut parsed.has_indices,
                 other => {
                     return Err(RegexError::new(format!(
                         "invalid regular expression flag `{other}`"
@@ -61,6 +67,12 @@ impl RegexFlags {
         }
         if self.dot_all {
             text.push('s');
+        }
+        if self.sticky {
+            text.push('y');
+        }
+        if self.has_indices {
+            text.push('d');
         }
         text
     }
@@ -99,6 +111,9 @@ pub struct RegexMatch {
     pub end: usize,
     /// Captured groups. Index zero is the whole match; missing groups are `None`.
     pub groups: Vec<Option<String>>,
+    /// Character offset ranges `(start, end)` for each captured group. Filled
+    /// when the `d` flag is set; otherwise each range is `None`.
+    pub ranges: Vec<Option<(usize, usize)>>,
 }
 
 /// A compiled regular expression.
@@ -108,6 +123,9 @@ pub struct Regex {
     flags: RegexFlags,
     program: Vec<Inst>,
     capture_count: usize,
+    /// Name of each capturing group, indexed by group number (group 0 is the
+    /// whole match and is always `None`).
+    group_names: Vec<Option<String>>,
 }
 
 #[derive(Clone, Debug)]
@@ -206,7 +224,7 @@ impl Regex {
     pub fn new(source: &str, flags: &str) -> Result<Self, RegexError> {
         let flags = RegexFlags::parse(flags)?;
         let mut parser = RegexParser::new(source);
-        let (node, capture_count) = parser.parse()?;
+        let (node, capture_count, group_names) = parser.parse()?;
         let mut program = Vec::new();
         program.push(Inst::Save(0));
         compile_node(&node, &mut program);
@@ -217,6 +235,7 @@ impl Regex {
             flags,
             program,
             capture_count,
+            group_names,
         })
     }
 
@@ -235,16 +254,24 @@ impl Regex {
         self.capture_count
     }
 
+    /// Names of the capturing groups, indexed by group number. Index zero is
+    /// the whole match and is always `None`.
+    pub fn group_names(&self) -> &[Option<String>] {
+        &self.group_names
+    }
+
     /// Whether the expression matches anywhere in `text`.
     pub fn is_match(&self, text: &str) -> bool {
         let chars: Vec<char> = text.chars().collect();
         self.find_from(&chars, 0).is_some()
     }
 
-    /// Find the leftmost match starting at or after `from`.
+    /// Find the leftmost match starting at or after `from`. With the `y`
+    /// (sticky) flag the match is attempted only at `from` itself.
     pub fn find_from(&self, text: &[char], from: usize) -> Option<RegexMatch> {
         let start = from.min(text.len());
-        for position in start..=text.len() {
+        let last = if self.flags.sticky { start } else { text.len() };
+        for position in start..=last {
             if let Some(found) = self.match_at(text, position) {
                 return Some(found);
             }
@@ -393,7 +420,24 @@ impl Regex {
                                 _ => None,
                             });
                         }
-                        return Some(RegexMatch { start, end, groups });
+                        let ranges = (0..=group_count)
+                            .map(|group| {
+                                let from = captures.get(group * 2).copied().flatten();
+                                let to = captures.get(group * 2 + 1).copied().flatten();
+                                match (from, to) {
+                                    (Some(from), Some(to)) if from <= to && to <= text.len() => {
+                                        Some((from, to))
+                                    }
+                                    _ => None,
+                                }
+                            })
+                            .collect();
+                        return Some(RegexMatch {
+                            start,
+                            end,
+                            groups,
+                            ranges,
+                        });
                     }
                 }
             }
@@ -428,6 +472,7 @@ struct RegexParser {
     pos: usize,
     capture_count: usize,
     depth: usize,
+    group_names: Vec<Option<String>>,
 }
 
 impl RegexParser {
@@ -437,10 +482,12 @@ impl RegexParser {
             pos: 0,
             capture_count: 0,
             depth: 0,
+            // Index zero reserves the whole match, which is never named.
+            group_names: vec![None],
         }
     }
 
-    fn parse(&mut self) -> Result<(Node, usize), RegexError> {
+    fn parse(&mut self) -> Result<(Node, usize, Vec<Option<String>>), RegexError> {
         let node = self.parse_alternation()?;
         if self.pos < self.chars.len() {
             return Err(RegexError::new(format!(
@@ -448,7 +495,11 @@ impl RegexParser {
                 self.chars[self.pos]
             )));
         }
-        Ok((node, self.capture_count))
+        Ok((
+            node,
+            self.capture_count,
+            std::mem::take(&mut self.group_names),
+        ))
     }
 
     fn peek(&self) -> Option<char> {
@@ -634,6 +685,22 @@ impl RegexParser {
                             index: None,
                             node: Box::new(node),
                         }
+                    } else if self.peek() == Some('<')
+                        && !matches!(self.peek_at(1), Some('=') | Some('!'))
+                    {
+                        let name = self.parse_group_name()?;
+                        self.capture_count += 1;
+                        let index = self.capture_count;
+                        if self.group_names.len() <= index {
+                            self.group_names.push(None);
+                        }
+                        self.group_names[index] = Some(name);
+                        let node = self.parse_alternation()?;
+                        self.expect_close_group()?;
+                        Node::Group {
+                            index: Some(index),
+                            node: Box::new(node),
+                        }
                     } else {
                         return Err(RegexError::new(
                             "unsupported group modifier in regular expression",
@@ -642,6 +709,7 @@ impl RegexParser {
                 } else {
                     self.capture_count += 1;
                     let index = self.capture_count;
+                    self.group_names.push(None);
                     let node = self.parse_alternation()?;
                     self.expect_close_group()?;
                     Node::Group {
@@ -665,6 +733,28 @@ impl RegexParser {
         } else {
             Err(RegexError::new("unterminated group in regular expression"))
         }
+    }
+
+    /// Parse the name of a `(?<name>...)` group. The leading `?<` is still
+    /// current; on return the closing `>` has been consumed.
+    fn parse_group_name(&mut self) -> Result<String, RegexError> {
+        self.pos += 1; // `<`
+        let start = self.pos;
+        while let Some(ch) = self.peek() {
+            if ch == '>' {
+                break;
+            }
+            if !(ch.is_alphanumeric() || ch == '_' || ch == '$') {
+                return Err(RegexError::new("invalid character in named capture group"));
+            }
+            self.pos += 1;
+        }
+        if self.pos == start || self.peek() != Some('>') {
+            return Err(RegexError::new("unterminated named capture group"));
+        }
+        let name: String = self.chars[start..self.pos].iter().collect();
+        self.pos += 1; // `>`
+        Ok(name)
     }
 
     fn parse_escape(&mut self) -> Result<Node, RegexError> {
@@ -1055,5 +1145,48 @@ mod tests {
         let found = matched(r"(?:ab)+c", "", "ababc");
         assert_eq!(found.groups.len(), 1);
         assert_eq!(found.groups[0].as_deref(), Some("ababc"));
+    }
+
+    #[test]
+    fn sticky_flag_only_matches_at_last_index() {
+        let regex = Regex::new("ab", "y").expect("compile");
+        let chars: Vec<char> = "xxab".chars().collect();
+        assert!(regex.find_from(&chars, 2).is_some());
+        assert!(regex.find_from(&chars, 0).is_none());
+        assert!(regex.find_from(&chars, 1).is_none());
+        assert_eq!(Regex::new("ab", "y").unwrap().flags().as_string(), "y");
+    }
+
+    #[test]
+    fn named_capture_groups_record_their_names() {
+        let regex = Regex::new(r"(?<year>\d{4})-(?<month>\d{2})", "").expect("compile");
+        assert_eq!(
+            regex.group_names(),
+            &[None, Some("year".to_owned()), Some("month".to_owned())]
+        );
+        let chars: Vec<char> = "date 2024-07".chars().collect();
+        let found = regex.find_from(&chars, 0).expect("match");
+        assert_eq!(found.groups[1].as_deref(), Some("2024"));
+        assert_eq!(found.groups[2].as_deref(), Some("07"));
+    }
+
+    #[test]
+    fn indices_flag_reports_group_ranges() {
+        let regex = Regex::new(r"(\d+)-(\d+)", "d").expect("compile");
+        let chars: Vec<char> = "xx12-34yy".chars().collect();
+        let found = regex.find_from(&chars, 0).expect("match");
+        assert_eq!(found.start, 2);
+        assert_eq!(found.end, 7);
+        assert_eq!(found.ranges[0], Some((2, 7)));
+        assert_eq!(found.ranges[1], Some((2, 4)));
+        assert_eq!(found.ranges[2], Some((5, 7)));
+        assert_eq!(Regex::new("a", "dg").unwrap().flags().as_string(), "gd");
+    }
+
+    #[test]
+    fn rejects_bad_named_groups_and_lookbehind() {
+        assert!(Regex::new("(?<a", "").is_err());
+        assert!(Regex::new("(?<a-b>x)", "").is_err());
+        assert!(Regex::new("(?<=a)b", "").is_err());
     }
 }

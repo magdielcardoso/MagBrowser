@@ -9,6 +9,47 @@ use crate::computed::{
 };
 use crate::properties::Property;
 
+/// Priority assigned to declarations outside any `@layer`.
+///
+/// Unlayered normal declarations outrank every layer; unlayered `!important`
+/// declarations lose to every layer (the order reverses for importance).
+pub const UNLAYERED: u32 = u16::MAX as u32;
+
+/// Scope-priority value used when a rule is not inside an `@scope` block.
+pub const NO_SCOPE: u32 = 0;
+
+// The extra cascade dimensions (layer order and scope proximity) are packed
+// into the high bits of `Candidate::order`. Keeping them there means the public
+// `Candidate` struct keeps its exact shape, so callers that build candidates
+// directly still compile and behave identically. See [`pack_order`].
+#[cfg(target_pointer_width = "64")]
+const ORDER_SOURCE_BITS: u32 = 32;
+#[cfg(target_pointer_width = "64")]
+const ORDER_LAYER_SHIFT: u32 = 32;
+#[cfg(target_pointer_width = "64")]
+const ORDER_SCOPE_SHIFT: u32 = 48;
+#[cfg(target_pointer_width = "32")]
+const ORDER_SOURCE_BITS: u32 = 24;
+#[cfg(target_pointer_width = "32")]
+const ORDER_LAYER_SHIFT: u32 = 24;
+#[cfg(target_pointer_width = "32")]
+const ORDER_SCOPE_SHIFT: u32 = 28;
+
+const ORDER_SOURCE_MASK: usize = (1usize << ORDER_SOURCE_BITS) - 1;
+const ORDER_FIELD_MASK: usize = u16::MAX as usize;
+
+/// Packs source order, layer priority and scope proximity into the `order`
+/// field of a [`Candidate`].
+///
+/// `layer` is a rank where larger wins (`[`UNLAYERED`]` is the largest);
+/// `scope` is a proximity where larger means a closer scope root.
+#[must_use]
+pub fn pack_order(source_order: usize, layer: u32, scope: u32) -> usize {
+    let layer = (layer as usize & ORDER_FIELD_MASK) << ORDER_LAYER_SHIFT;
+    let scope = (scope as usize & ORDER_FIELD_MASK) << ORDER_SCOPE_SHIFT;
+    (source_order & ORDER_SOURCE_MASK) | layer | scope
+}
+
 /// A declaration that matched an element, with its cascade weight inputs.
 #[derive(Debug, Clone)]
 pub struct Candidate {
@@ -25,12 +66,34 @@ pub struct Candidate {
     /// True for `style=""` declarations.
     pub inline: bool,
     /// Document order of the declaration.
+    ///
+    /// The high bits additionally carry the `@layer` rank and `@scope`
+    /// proximity (see [`pack_order`]); [`Self::weight`] unpacks them.
     pub order: usize,
 }
 
 impl Candidate {
+    /// Layer rank packed into [`Self::order`], inverted for `!important`.
+    fn layer_priority(&self) -> u32 {
+        let rank = ((self.order >> ORDER_LAYER_SHIFT) & ORDER_FIELD_MASK) as u32;
+        if self.important {
+            (!rank) & u16::MAX as u32
+        } else {
+            rank
+        }
+    }
+
+    /// Scope proximity packed into [`Self::order`].
+    fn scope_priority(&self) -> u32 {
+        ((self.order >> ORDER_SCOPE_SHIFT) & ORDER_FIELD_MASK) as u32
+    }
+
     /// The sort key; larger keys win.
-    pub fn weight(&self) -> (u8, u8, u8, u32, u32, u32, usize) {
+    ///
+    /// Dimensions, from strongest to weakest: importance, origin, inline flag,
+    /// `@layer` order (reversed for `!important`), specificity, `@scope`
+    /// proximity, then source order.
+    pub fn weight(&self) -> (u8, u8, u8, u32, u32, u32, u32, u32, usize) {
         let important = u8::from(self.important);
         let origin = match (self.important, self.origin) {
             (false, Origin::UserAgent) | (true, Origin::Author) => 0,
@@ -41,10 +104,12 @@ impl Candidate {
             important,
             origin,
             u8::from(self.inline),
+            self.layer_priority(),
             self.specificity.a,
             self.specificity.b,
             self.specificity.c,
-            self.order,
+            self.scope_priority(),
+            self.order & ORDER_SOURCE_MASK,
         )
     }
 }

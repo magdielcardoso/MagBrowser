@@ -29,13 +29,26 @@ pub enum TextureFormat {
 }
 
 /// Blending modes available to pipelines.
+///
+/// The first two variants predate the layer compositor; `Normal` is the name
+/// used by the compositor and behaves identically to `AlphaBlend`. The maths
+/// for all modes lives in [`crate::layer::BlendMode::blend`] and is mirrored by
+/// the WGSL `blend_layer` function.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum BlendMode {
-    /// Source-over alpha blending.
+    /// Source-over alpha blending (legacy name, identical to [`Self::Normal`]).
     #[default]
     AlphaBlend,
     /// Replace the destination.
     Replace,
+    /// Source-over alpha blending.
+    Normal,
+    /// Multiply the source and backdrop colours.
+    Multiply,
+    /// Screen the source and backdrop colours.
+    Screen,
+    /// Overlay the source over the backdrop.
+    Overlay,
 }
 
 /// A static description of a render pipeline.
@@ -125,6 +138,8 @@ impl std::error::Error for GpuError {}
 pub const RECT_SHADER: &str = include_str!("shaders/rect.wgsl");
 /// Image shader.
 pub const IMAGE_SHADER: &str = include_str!("shaders/image.wgsl");
+/// Multi-layer compositor shader (opacity, transform and blend modes).
+pub const LAYER_SHADER: &str = include_str!("shaders/layer.wgsl");
 
 /// Byte alignment that `wgpu` requires for texture row copies.
 ///
@@ -721,7 +736,9 @@ mod tests {
     fn shaders_are_embedded_and_non_empty() {
         assert!(RECT_SHADER.contains("fn vs_main"));
         assert!(IMAGE_SHADER.contains("fn vs_main"));
+        assert!(LAYER_SHADER.contains("fn blend_layer"));
         assert_eq!(RECT_SHADER, include_str!("shaders/rect.wgsl"));
+        assert_eq!(LAYER_SHADER, include_str!("shaders/layer.wgsl"));
     }
 
     #[test]

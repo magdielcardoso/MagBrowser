@@ -723,6 +723,15 @@ impl Parser {
 
     fn parse_for(&mut self) -> Result<Stmt, ParseError> {
         self.expect_keyword(Keyword::For)?;
+
+        // `for await (... of ...)` differs from a plain `for (...)` only by the
+        // `await` token between `for` and the opening parenthesis. `await` is an
+        // identifier token in this grammar, so detect it here.
+        let is_await = matches!(self.kind(), TokenKind::Identifier(name) if name == "await")
+            && matches!(self.peek_kind(1), TokenKind::Punct(Punct::LParen));
+        if is_await {
+            self.advance();
+        }
         self.expect_punct(Punct::LParen)?;
 
         if self.eat_punct(Punct::Semi) {
@@ -740,11 +749,11 @@ impl Parser {
             let decl = self.parse_var_decl()?;
             if self.eat_keyword(Keyword::In) {
                 let right = self.parse_expression()?;
-                return self.finish_for_in(decl, right, false);
+                return self.finish_for_in(decl, right, false, is_await);
             }
             if self.eat_keyword(Keyword::Of) {
                 let right = self.parse_assignment()?;
-                return self.finish_for_in(decl, right, true);
+                return self.finish_for_in(decl, right, true, is_await);
             }
             self.expect_punct(Punct::Semi)?;
             return self.parse_for_tail(Some(ForInit::Var(decl)));
@@ -757,11 +766,11 @@ impl Parser {
 
         if self.eat_keyword(Keyword::In) {
             let right = self.parse_expression()?;
-            return self.finish_for_in_expr(expr, right, false);
+            return self.finish_for_in_expr(expr, right, false, is_await);
         }
         if self.eat_keyword(Keyword::Of) {
             let right = self.parse_assignment()?;
-            return self.finish_for_in_expr(expr, right, true);
+            return self.finish_for_in_expr(expr, right, true, is_await);
         }
         self.expect_punct(Punct::Semi)?;
         self.parse_for_tail(Some(ForInit::Expr(expr)))
@@ -772,6 +781,7 @@ impl Parser {
         decl: VarDecl,
         right: Expr,
         is_of: bool,
+        is_await: bool,
     ) -> Result<Stmt, ParseError> {
         if decl.declarations.len() != 1 {
             return self.error("for-in/of declarations must bind exactly one variable");
@@ -798,6 +808,7 @@ impl Parser {
             right,
             body,
             is_of,
+            is_await,
         })
     }
 
@@ -806,6 +817,7 @@ impl Parser {
         left: Expr,
         right: Expr,
         is_of: bool,
+        is_await: bool,
     ) -> Result<Stmt, ParseError> {
         self.expect_punct(Punct::RParen)?;
         let body = Box::new(self.parse_statement()?);
@@ -814,6 +826,7 @@ impl Parser {
             right,
             body,
             is_of,
+            is_await,
         })
     }
 

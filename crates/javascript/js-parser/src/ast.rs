@@ -710,6 +710,8 @@ pub enum Stmt {
         body: Box<Stmt>,
         /// Whether this is a `for...of` loop.
         is_of: bool,
+        /// Whether this is a `for await...of` loop (only valid in async contexts).
+        is_await: bool,
     },
     /// Block statement.
     Block(Vec<Stmt>),

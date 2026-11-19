@@ -20,9 +20,13 @@
 //! `@scope`, `@starting-style` and `@property`. Conditional at-rules keep
 //! parsed condition trees so a style engine can evaluate them without
 //! re-parsing source text.
+//!
+//! The `animation` and `transition` shorthands are parsed into the typed
+//! [`Animation`] and [`Transition`] descriptions in the [`animations`] module.
 
 #![forbid(unsafe_code)]
 
+pub mod animations;
 mod ast;
 mod at_rules;
 mod declarations;
@@ -32,6 +36,11 @@ mod parser;
 pub mod tokenizer;
 mod values;
 
+pub use animations::{
+    Animation, AnimationDirection, FillMode, IterationCount, PlayState, StepPosition,
+    TimingFunction, Transition, parse_animation, parse_time, parse_timing_function,
+    parse_transition,
+};
 pub use ast::{
     ContainerQuery, ContainerRule, ContainerSizeFeature, Declaration, FontFaceRule, ImportRule,
     Keyframe, KeyframesRule, LayerBlockRule, LayerStatementRule, MediaRule, Origin, PropertyRule,

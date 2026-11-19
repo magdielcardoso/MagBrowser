@@ -35,6 +35,14 @@ pub const ADDRESS_ICON_GAP: f32 = 6.0;
 pub const TAB_CLOSE_SIZE: f32 = 14.0;
 /// Gap between the close button and the tab title.
 const TAB_CLOSE_GAP: f32 = 6.0;
+/// Preferred width of the find bar overlay.
+pub const FIND_BAR_WIDTH: f32 = 420.0;
+/// Minimum width of the find bar overlay.
+pub const FIND_BAR_MIN_WIDTH: f32 = 180.0;
+/// Height of the find bar overlay.
+pub const FIND_BAR_HEIGHT: f32 = 40.0;
+/// Inset of the find bar from the top/right of the page.
+pub const FIND_BAR_MARGIN: f32 = 8.0;
 
 /// A region of the window chrome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,6 +65,14 @@ pub enum ChromePart {
     Page,
     /// Status pill.
     Status,
+    /// Find bar text field.
+    FindInput,
+    /// Find bar close button.
+    FindClose,
+    /// Find bar "previous match" button.
+    FindPrev,
+    /// Find bar "next match" button.
+    FindNext,
 }
 
 /// Computed rectangles for one window size.
@@ -92,6 +108,16 @@ pub struct ChromeLayout {
     pub page: Rect,
     /// Status pill at the bottom right of the content.
     pub status: Rect,
+    /// Find bar card, overlaid on the top-right of the page when open.
+    pub find_bar: Rect,
+    /// Find query field inside [`Self::find_bar`].
+    pub find_input: Rect,
+    /// Find bar close button.
+    pub find_close: Rect,
+    /// Find bar previous-match button.
+    pub find_prev: Rect,
+    /// Find bar next-match button.
+    pub find_next: Rect,
 }
 
 impl ChromeLayout {
@@ -159,6 +185,46 @@ impl ChromeLayout {
             STATUS_HEIGHT,
         );
 
+        // The find bar is an overlay, not a viewport change: it never resizes
+        // the page (and therefore never disturbs coordinates shared with the
+        // engine). The window layer hides it until Ctrl+F opens it.
+        let find_width = FIND_BAR_WIDTH
+            .min(page.width - 2.0 * FIND_BAR_MARGIN)
+            .max(FIND_BAR_MIN_WIDTH)
+            .min(page.width.max(1.0));
+        let find_bar = Rect::new(
+            (page.right() - FIND_BAR_MARGIN - find_width).max(page.x),
+            page.y + FIND_BAR_MARGIN,
+            find_width,
+            FIND_BAR_HEIGHT.min(page.height.max(1.0)),
+        );
+        let find_button = (FIND_BAR_HEIGHT - 12.0).max(8.0);
+        let find_button_y = find_bar.y + (find_bar.height - find_button) / 2.0;
+        let find_close = Rect::new(
+            find_bar.right() - 6.0 - find_button,
+            find_button_y,
+            find_button,
+            find_button,
+        );
+        let find_next = Rect::new(
+            find_close.x - 4.0 - find_button,
+            find_button_y,
+            find_button,
+            find_button,
+        );
+        let find_prev = Rect::new(
+            find_next.x - 4.0 - find_button,
+            find_button_y,
+            find_button,
+            find_button,
+        );
+        let find_input = Rect::new(
+            find_bar.x + 6.0,
+            find_button_y,
+            (find_prev.x - find_bar.x - 10.0).max(1.0),
+            find_button,
+        );
+
         Self {
             width,
             height,
@@ -175,6 +241,11 @@ impl ChromeLayout {
             content,
             page,
             status,
+            find_bar,
+            find_input,
+            find_close,
+            find_prev,
+            find_next,
         }
     }
 
@@ -224,6 +295,18 @@ impl ChromeLayout {
         }
         if contains(self.status, x, y) {
             return Some(ChromePart::Status);
+        }
+        if contains(self.find_input, x, y) {
+            return Some(ChromePart::FindInput);
+        }
+        if contains(self.find_prev, x, y) {
+            return Some(ChromePart::FindPrev);
+        }
+        if contains(self.find_next, x, y) {
+            return Some(ChromePart::FindNext);
+        }
+        if contains(self.find_close, x, y) {
+            return Some(ChromePart::FindClose);
         }
         if contains(self.page, x, y) {
             return Some(ChromePart::Page);
@@ -371,6 +454,39 @@ mod tests {
         let cy = chrome.new_tab.y + chrome.new_tab.height / 2.0;
         assert_eq!(chrome.hit(cx, cy), Some(ChromePart::NewTab));
         assert!(chrome.new_tab.x >= chrome.tabs.last().unwrap().right());
+    }
+
+    #[test]
+    fn find_bar_overlays_the_page_with_stable_hit_regions() {
+        let chrome = layout(1000.0, 700.0, 1);
+        assert!(chrome.find_bar.x > chrome.page.x);
+        assert!(chrome.find_bar.right() <= chrome.page.right());
+        assert!(chrome.find_bar.y > chrome.page.y);
+        assert!(chrome.find_bar.bottom() < chrome.page.bottom());
+        assert!(
+            chrome.find_input.right() <= chrome.find_prev.x,
+            "query field must not run under the navigation buttons"
+        );
+        assert!(chrome.find_prev.right() <= chrome.find_next.x);
+        assert!(chrome.find_next.right() <= chrome.find_close.x);
+        assert_eq!(
+            chrome.hit(chrome.find_input.x + 2.0, chrome.find_input.y + 2.0),
+            Some(ChromePart::FindInput)
+        );
+        assert_eq!(
+            chrome.hit(chrome.find_prev.x + 2.0, chrome.find_prev.y + 2.0),
+            Some(ChromePart::FindPrev)
+        );
+        assert_eq!(
+            chrome.hit(chrome.find_next.x + 2.0, chrome.find_next.y + 2.0),
+            Some(ChromePart::FindNext)
+        );
+        assert_eq!(
+            chrome.hit(chrome.find_close.x + 2.0, chrome.find_close.y + 2.0),
+            Some(ChromePart::FindClose)
+        );
+        // The overlay does not change the page viewport.
+        assert_eq!(chrome.page_size().width, 998.0);
     }
 
     #[test]

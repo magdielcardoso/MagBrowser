@@ -23,10 +23,10 @@ pub mod request;
 pub mod response;
 
 pub use cache::HttpCache;
-pub use client::{Client, ClientConfig, HttpError};
+pub use client::{Client, ClientConfig, DEFAULT_USER_AGENT, HttpError};
 pub use cookies::{Cookie, CookieJar};
 pub use encoding::ContentEncoding;
 pub use headers::Headers;
 pub use redirect::{RedirectOutcome, RedirectPolicy};
-pub use request::{Method, Request};
+pub use request::{Method, Request, RequestConfig};
 pub use response::{Charset, Response};

@@ -1,12 +1,16 @@
-//! Flexbox layout with single-line and wrapping rows, `row`, `row-reverse`,
-//! `column` and `column-reverse`.
+//! Flexbox layout with single-line and wrapping rows and columns, including
+//! `row`, `row-reverse`, `column` and `column-reverse`.
 //!
-//! Rows implement intrinsic (min/max-content) sizing, `flex-grow` /
-//! `flex-shrink` with `flex-basis` and `min-width: auto` clamping, `align-items`
-//! (including the `stretch` default), `align-content` on wrapped lines and
-//! main-axis `margin: auto` absorption. Wrapping packs items greedily into
-//! lines and applies `justify-content` per line. `order` and baseline
-//! alignment are not implemented yet.
+//! The algorithm is written once against an abstract *main* axis (the flex
+//! direction) and *cross* axis (perpendicular to it). Rows and columns differ
+//! only in which physical axis each logical axis maps to, so intrinsic
+//! (min/max-content) sizing, `flex-grow` / `flex-shrink` with `flex-basis` and
+//! `min/max` main-size clamping, `align-items` (including `stretch` and an
+//! approximate `baseline`) on the cross axis, `justify-content` on the main
+//! axis, `align-content` across wrapped lines, main-axis `margin: auto`
+//! absorption, and `wrap-reverse` line-order reversal all behave alike.
+//! Wrapping packs items greedily into lines along the cross axis. `order` is
+//! not implemented yet.
 
 use browser_dom::Document;
 use browser_style::{
@@ -15,10 +19,30 @@ use browser_style::{
 };
 
 use crate::block::{layout_box, resolve};
+use crate::position::translate_subtree;
 use crate::tree::{BoxType, LayoutTree};
 
+/// A physical axis. The flex *main* axis is horizontal for rows and vertical
+/// for columns; the cross axis is the other one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Axis {
+    Horizontal,
+    Vertical,
+}
+
+impl Axis {
+    fn other(self) -> Self {
+        match self {
+            Axis::Horizontal => Axis::Vertical,
+            Axis::Vertical => Axis::Horizontal,
+        }
+    }
+}
+
 /// Per-item data gathered during the measurement pass and used while the
-/// flexible lengths of a line are resolved.
+/// flexible lengths of a line are resolved. All sizes are border-box main
+/// sizes; `before`/`after` are main-axis margins and `cross_before` /
+/// `cross_after` are cross-axis margins.
 #[derive(Debug, Clone, Copy)]
 struct FlexItem {
     child: usize,
@@ -32,14 +56,15 @@ struct FlexItem {
     min: f32,
     /// Specified maximum main size, border box.
     max: Option<f32>,
-    /// Resolved main-axis margins (auto margins receive free space later).
-    ml: f32,
-    mr: f32,
-    ml_auto: bool,
-    mr_auto: bool,
-    /// Resolved cross-axis margins.
-    mt: f32,
-    mb: f32,
+    /// Main-axis margin at the start edge (`left` for rows, `top` for columns).
+    before: f32,
+    /// Main-axis margin at the end edge (`right` for rows, `bottom` for columns).
+    after: f32,
+    before_auto: bool,
+    after_auto: bool,
+    /// Cross-axis margins.
+    cross_before: f32,
+    cross_after: f32,
     /// Border + padding on the main axis (used when re-laying out the item).
     insets_main: f32,
     /// True when the box is laid out with `box-sizing: border-box`.
@@ -54,14 +79,19 @@ struct FlexItem {
 /// that `align-content` can distribute the free cross space between lines.
 #[derive(Debug)]
 struct PreparedLine {
-    /// Item indices in visual order (reversed for `row-reverse`).
+    /// Item indices in visual order (reversed for `*-reverse` directions).
     order: Vec<usize>,
     /// Final border-box main sizes, indexed by item index.
     sizes: Vec<f32>,
     /// Final outer cross sizes (border box + margins), indexed by item index.
     cross: Vec<f32>,
-    /// Largest outer cross size on the line.
+    /// Downward cross shift that aligns a baseline item's text baseline with
+    /// the line baseline (zero for non-baseline items).
+    baseline_shift: Vec<f32>,
+    /// Largest outer cross size on the line (including baseline shifts).
     line_cross: f32,
+    /// Total used main size of the line (for a column's content height).
+    main_used: f32,
     /// `justify-content` start offset.
     start: f32,
     /// `justify-content` space between items.
@@ -110,15 +140,17 @@ fn item_align_of(style: &ComputedStyle, default: AlignItems) -> AlignItems {
         .as_str()
     {
         "" | "auto" => default,
-        "flex-start" | "start" | "baseline" => AlignItems::FlexStart,
+        "flex-start" | "start" => AlignItems::FlexStart,
         "flex-end" | "end" => AlignItems::FlexEnd,
         "center" => AlignItems::Center,
         "stretch" => AlignItems::Stretch,
+        "baseline" => AlignItems::Baseline,
         _ => default,
     }
 }
 
-/// Lays out a flex container's children and returns the content height.
+/// Lays out a flex container's children and returns the content size along the
+/// physical vertical axis (the container's content height).
 pub fn layout_flex(tree: &mut LayoutTree, doc: &Document, index: usize) -> f32 {
     let style = tree.boxes[index].style.clone();
     let content = tree.boxes[index].content;
@@ -137,102 +169,149 @@ pub fn layout_flex(tree: &mut LayoutTree, doc: &Document, index: usize) -> f32 {
         return 0.0;
     }
 
-    match direction {
-        FlexDirection::Row | FlexDirection::RowReverse => layout_flex_row(
-            tree,
-            doc,
-            &style,
-            content,
-            direction == FlexDirection::RowReverse,
-            &children,
-            justify,
-            align,
-            column_gap,
-            row_gap,
-        ),
-        FlexDirection::Column | FlexDirection::ColumnReverse => {
-            let gap = row_gap;
-            let available = content.width;
-            let mut cursor = content.y;
-            let mut order: Vec<usize> = (0..children.len()).collect();
-            if direction == FlexDirection::ColumnReverse {
-                order.reverse();
-            }
-            for child in &order {
-                if !crate::budget::try_step() {
-                    break;
-                }
-                let child = children[*child];
-                let mt = resolve(tree.boxes[child].style.margin(Side::Top), available);
-                let mb = resolve(tree.boxes[child].style.margin(Side::Bottom), available);
-                let bottom = layout_box(tree, doc, child, content.x, cursor + mt, available);
-                cursor = bottom + mb + gap;
-            }
-            (cursor - content.y - gap).max(0.0)
-        }
-    }
+    let (main_axis, main_reverse) = match direction {
+        FlexDirection::Row => (Axis::Horizontal, false),
+        FlexDirection::RowReverse => (Axis::Horizontal, true),
+        FlexDirection::Column => (Axis::Vertical, false),
+        FlexDirection::ColumnReverse => (Axis::Vertical, true),
+    };
+    let (main_gap, cross_gap) = match main_axis {
+        Axis::Horizontal => (column_gap, row_gap),
+        Axis::Vertical => (row_gap, column_gap),
+    };
+    // `wrap-reverse` reverses the order of cross-axis lines (the main-axis
+    // order is unchanged, unlike `column-reverse`).
+    let cross_reverse = style.flex_wrap() == FlexWrap::WrapReverse;
+
+    layout_flex_generic(
+        tree,
+        doc,
+        &style,
+        content,
+        main_axis,
+        main_reverse,
+        cross_reverse,
+        &children,
+        justify,
+        align,
+        main_gap,
+        cross_gap,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
-fn layout_flex_row(
+fn layout_flex_generic(
     tree: &mut LayoutTree,
     doc: &Document,
     style: &ComputedStyle,
     content: crate::Rect,
-    reverse: bool,
+    main_axis: Axis,
+    main_reverse: bool,
+    cross_reverse: bool,
     children: &[usize],
     justify: JustifyContent,
     align: AlignItems,
-    gap: f32,
-    line_gap: f32,
+    main_gap: f32,
+    cross_gap: f32,
 ) -> f32 {
-    let available = content.width.max(0.0);
-    let count = children.len();
+    let cross_axis = main_axis.other();
     let border_box = style.box_sizing() == BoxSizing::BorderBox;
+    // Width is always definite in this top-down layout; percentages on any
+    // axis resolve against it (height percentages are deliberately treated as
+    // indefinite, mirroring block layout).
+    let inline_available = content.width.max(0.0);
 
-    // The container's own vertical insets, needed to turn a definite height
-    // into a definite *content* height for `align-content`.
-    let container_insets_v = style.border_width(Side::Top)
-        + style.border_width(Side::Bottom)
-        + resolve(style.padding(Side::Top), available)
-        + resolve(style.padding(Side::Bottom), available);
+    let main_insets = insets_for_axis(style, main_axis, inline_available);
+    let main_available = match main_axis {
+        Axis::Horizontal => Some(content.width.max(0.0)),
+        Axis::Vertical => definite_main_size(style, inline_available, main_insets),
+    };
+    let available = main_available.unwrap_or(0.0);
+    // A column with `height: auto` has no definite main size: there is no free
+    // space to grow or shrink into, so items keep their base sizes.
+    let indefinite_main = main_available.is_none();
+    let container_cross = match main_axis {
+        Axis::Horizontal => definite_container_cross(
+            style,
+            inline_available,
+            insets_for_axis(style, Axis::Vertical, inline_available),
+        ),
+        Axis::Vertical => content.width.max(0.0),
+    };
+    // Percentage main sizes resolve against the container's main size. For
+    // rows that is the (always definite) content width; for columns it is the
+    // definite height, or zero when indefinite. Percentages of margins and
+    // padding still resolve against the containing-block width below.
+    let main_percent_base = match main_axis {
+        Axis::Horizontal => inline_available,
+        Axis::Vertical => available,
+    };
 
     // --- Measurement pass: flex base sizes and intrinsic minima -------------
-    let mut items: Vec<FlexItem> = Vec::with_capacity(count);
+    let mut items: Vec<FlexItem> = Vec::with_capacity(children.len());
     for &child in children {
         if !crate::budget::try_step() {
             break;
         }
         let cs = tree.boxes[child].style.clone();
-        let insets_main = style_insets_main(&cs, available);
-        let extra = insets_main;
-        let (min_content, max_content) = content_widths(tree, child, available);
+        let insets_main = insets_for_axis(&cs, main_axis, inline_available);
+        let (min_content, max_content) = match main_axis {
+            Axis::Horizontal => content_widths(tree, child, inline_available),
+            Axis::Vertical => content_heights(tree, child, inline_available),
+        };
+        let (basis_dim, size_dim, min_prop, max_prop) = match main_axis {
+            Axis::Horizontal => (
+                cs.flex_basis(),
+                cs.width(),
+                Property::MinWidth,
+                Property::MaxWidth,
+            ),
+            Axis::Vertical => (
+                cs.flex_basis(),
+                cs.height(),
+                Property::MinHeight,
+                Property::MaxHeight,
+            ),
+        };
 
-        let basis = cs.flex_basis();
-        let width = cs.width();
-        let base = if !basis.is_auto() {
-            definite_border_size(resolve(basis, available), border_box, extra)
-        } else if !width.is_auto() {
-            definite_border_size(resolve(width, available), border_box, extra)
+        let base = if !basis_dim.is_auto() {
+            definite_border_size(
+                resolve(basis_dim, main_percent_base),
+                border_box,
+                insets_main,
+            )
+        } else if !size_dim.is_auto() {
+            definite_border_size(
+                resolve(size_dim, main_percent_base),
+                border_box,
+                insets_main,
+            )
         } else {
             max_content
         };
 
-        let min_main = match cs.dim(Property::MinWidth) {
-            // `min-width: auto` on a flex item is its content-based minimum:
-            // the min-content width, i.e. the longest unbreakable word. Cap it
-            // at the container's available main size so a nested flex child
-            // can never demand (and geometrically inflate to) more than the
-            // container itself.
-            Dim::Auto => min_content.min(available).max(0.0),
-            dim => definite_border_size(resolve(dim, available), border_box, extra),
+        let min_main = match cs.dim(min_prop) {
+            // `min-*: auto` on a flex item is its content-based minimum: the
+            // min-content size, i.e. the longest unbreakable word on the main
+            // axis. Cap it at the container's available main size so a nested
+            // child can never demand (and geometrically inflate to) more than
+            // the container itself. With an indefinite main size there is no
+            // cap to apply.
+            Dim::Auto => {
+                if indefinite_main {
+                    min_content.max(0.0)
+                } else {
+                    min_content.min(available).max(0.0)
+                }
+            }
+            dim => definite_border_size(resolve(dim, main_percent_base), border_box, insets_main),
         };
-        let max_main = match cs.dim(Property::MaxWidth) {
+        let max_main = match cs.dim(max_prop) {
             Dim::Auto => None,
             dim => Some(definite_border_size(
-                resolve(dim, available),
+                resolve(dim, main_percent_base),
                 border_box,
-                extra,
+                insets_main,
             )),
         };
         let base = base
@@ -240,34 +319,50 @@ fn layout_flex_row(
             .min(max_main.unwrap_or(f32::INFINITY))
             .max(0.0);
 
-        let ml_dim = cs.margin(Side::Left);
-        let mr_dim = cs.margin(Side::Right);
-        let item = FlexItem {
+        let (before_dim, after_dim, cross_before_dim, cross_after_dim) = match main_axis {
+            Axis::Horizontal => (
+                cs.margin(Side::Left),
+                cs.margin(Side::Right),
+                cs.margin(Side::Top),
+                cs.margin(Side::Bottom),
+            ),
+            Axis::Vertical => (
+                cs.margin(Side::Top),
+                cs.margin(Side::Bottom),
+                cs.margin(Side::Left),
+                cs.margin(Side::Right),
+            ),
+        };
+        let cross_auto = match cross_axis {
+            Axis::Horizontal => cs.width().is_auto(),
+            Axis::Vertical => cs.height().is_auto(),
+        };
+        items.push(FlexItem {
             child,
             grow: cs.flex_grow().max(0.0),
             shrink: cs.flex_shrink().max(0.0),
             base,
             min: min_main.min(base).max(0.0),
             max: max_main,
-            ml: resolve(ml_dim, available),
-            mr: resolve(mr_dim, available),
-            ml_auto: ml_dim.is_auto(),
-            mr_auto: mr_dim.is_auto(),
-            mt: resolve(cs.margin(Side::Top), available),
-            mb: resolve(cs.margin(Side::Bottom), available),
+            before: resolve(before_dim, inline_available),
+            after: resolve(after_dim, inline_available),
+            before_auto: before_dim.is_auto(),
+            after_auto: after_dim.is_auto(),
+            cross_before: resolve(cross_before_dim, inline_available),
+            cross_after: resolve(cross_after_dim, inline_available),
             insets_main,
             border_box,
-            cross_auto: cs.height().is_auto(),
+            cross_auto,
             align: item_align_of(&cs, align),
-        };
-        items.push(item);
+        });
     }
-    // If the budget was exhausted mid-measurement, lay out what we have.
     let count = items.len();
     if count == 0 {
         return 0.0;
     }
 
+    // Lay out every item at its hypothetical main size first so cross-axis
+    // measurement sees real geometry.
     for &it in &items {
         if !crate::budget::try_step() {
             break;
@@ -276,20 +371,28 @@ fn layout_flex_row(
             tree,
             doc,
             it.child,
-            available,
+            inline_available,
             it.insets_main,
             it.border_box,
             it.base,
+            main_axis,
         );
     }
 
-    let wraps = matches!(style.flex_wrap(), FlexWrap::Wrap | FlexWrap::WrapReverse);
-    let outers: Vec<f32> = items.iter().map(|it| it.base + it.ml + it.mr).collect();
-    let lines: Vec<Vec<usize>> = if wraps {
-        greedy_lines(&outers, gap, available)
+    let wraps =
+        matches!(style.flex_wrap(), FlexWrap::Wrap | FlexWrap::WrapReverse) && !indefinite_main;
+    let outers: Vec<f32> = items
+        .iter()
+        .map(|it| it.base + it.before + it.after)
+        .collect();
+    let mut lines: Vec<Vec<usize>> = if wraps {
+        greedy_lines(&outers, main_gap, available)
     } else {
         vec![(0..count).collect()]
     };
+    if cross_reverse {
+        lines.reverse();
+    }
 
     // --- Phase 1: resolve each line's flexible lengths and cross sizes ------
     let mut prepared: Vec<PreparedLine> = Vec::with_capacity(lines.len());
@@ -298,23 +401,28 @@ fn layout_flex_row(
             break;
         }
         let line_used: f32 = line.iter().map(|&i| outers[i]).sum::<f32>()
-            + gap * line.len().saturating_sub(1) as f32;
-        let mut free = available - line_used;
+            + main_gap * line.len().saturating_sub(1) as f32;
+        // With an indefinite main size there is no free space to distribute.
+        let mut free = if indefinite_main {
+            0.0
+        } else {
+            available - line_used
+        };
 
         // `margin: auto` on the main axis absorbs positive free space before
         // flex-grow and justify-content are considered.
         let auto_margins: usize = line
             .iter()
-            .map(|&i| usize::from(items[i].ml_auto) + usize::from(items[i].mr_auto))
+            .map(|&i| usize::from(items[i].before_auto) + usize::from(items[i].after_auto))
             .sum();
         if free > 0.0 && auto_margins > 0 {
             let each = free / auto_margins as f32;
             for &i in line {
-                if items[i].ml_auto {
-                    items[i].ml += each;
+                if items[i].before_auto {
+                    items[i].before += each;
                 }
-                if items[i].mr_auto {
-                    items[i].mr += each;
+                if items[i].after_auto {
+                    items[i].after += each;
                 }
             }
             free = 0.0;
@@ -333,9 +441,15 @@ fn layout_flex_row(
         for (k, &i) in line.iter().enumerate() {
             sizes[i] = resolved[k];
         }
+        let main_used: f32 = resolved.iter().sum::<f32>()
+            + line
+                .iter()
+                .map(|&i| items[i].before + items[i].after)
+                .sum::<f32>()
+            + main_gap * line.len().saturating_sub(1) as f32;
 
         // Re-layout items whose main size changed so text wraps at the final
-        // width instead of overflowing at its hypothetical size.
+        // size instead of overflowing at its hypothetical size.
         for &i in line {
             if !crate::budget::try_step() {
                 break;
@@ -345,10 +459,11 @@ fn layout_flex_row(
                     tree,
                     doc,
                     items[i].child,
-                    available,
+                    inline_available,
                     items[i].insets_main,
                     items[i].border_box,
                     sizes[i],
+                    main_axis,
                 );
             }
         }
@@ -356,10 +471,8 @@ fn layout_flex_row(
         // An item with a preferred aspect ratio takes its cross size from its
         // FINAL main size (after shrink/grow), not from an inflated intrinsic
         // min-content measurement. `layout_box` already derives this from the
-        // pinned width, but re-assert it here so a nested percentage expansion
-        // cannot leak a larger min-content back into the cross axis (for
-        // example a `.phone` with `aspect-ratio: 9/19.4` growing tall because a
-        // descendant reported a 750px min-content width).
+        // pinned main size, but re-assert it here so a nested percentage
+        // expansion cannot leak a larger min-content back into the cross axis.
         for &i in line {
             let child = items[i].child;
             let it = &items[i];
@@ -370,53 +483,116 @@ fn layout_flex_row(
             let Some(ratio) = crate::block::preferred_aspect_ratio(&cs) else {
                 continue;
             };
-            let b = &tree.boxes[child];
-            let insets_cross = (b.rect.height - b.content.height).max(0.0);
-            // Match `layout_box`: under border-box sizing the ratio applies to
-            // the border-box main size; under content-box sizing it applies to
-            // the content box.
-            let mut content_cross = if it.border_box {
-                (sizes[i] / ratio - insets_cross).max(0.0)
-            } else {
-                ((sizes[i] - it.insets_main) / ratio).max(0.0)
+            let (insets_cross, mut content_cross) = {
+                let b = &tree.boxes[child];
+                let insets = match cross_axis {
+                    Axis::Horizontal => (b.rect.width - b.content.width).max(0.0),
+                    Axis::Vertical => (b.rect.height - b.content.height).max(0.0),
+                };
+                let value = if it.border_box {
+                    match cross_axis {
+                        // cross = height = width / ratio (rows)
+                        Axis::Vertical => (sizes[i] / ratio - insets).max(0.0),
+                        // cross = width = height * ratio (columns)
+                        Axis::Horizontal => (sizes[i] * ratio - insets).max(0.0),
+                    }
+                } else {
+                    match cross_axis {
+                        Axis::Vertical => ((sizes[i] - it.insets_main) / ratio).max(0.0),
+                        Axis::Horizontal => ((sizes[i] - it.insets_main) * ratio).max(0.0),
+                    }
+                };
+                (insets, value)
             };
-            if let Some(min) = cs.dim(Property::MinHeight).resolve(available) {
+            let (min_prop, max_prop) = match cross_axis {
+                Axis::Horizontal => (Property::MinWidth, Property::MaxWidth),
+                Axis::Vertical => (Property::MinHeight, Property::MaxHeight),
+            };
+            if let Some(min) = cs.dim(min_prop).resolve(inline_available) {
                 content_cross = content_cross.max(min);
             }
-            if let Some(max) = cs.dim(Property::MaxHeight).resolve(available) {
+            if let Some(max) = cs.dim(max_prop).resolve(inline_available) {
                 content_cross = content_cross.min(max);
             }
             let b = &mut tree.boxes[child];
-            b.content.height = content_cross;
-            b.rect.height = content_cross + insets_cross;
+            match cross_axis {
+                Axis::Horizontal => {
+                    b.content.width = content_cross;
+                    b.rect.width = content_cross + insets_cross;
+                }
+                Axis::Vertical => {
+                    b.content.height = content_cross;
+                    b.rect.height = content_cross + insets_cross;
+                }
+            }
         }
 
         let mut cross = vec![0.0_f32; count];
+        let mut baseline_shift = vec![0.0_f32; count];
         let mut line_cross = 0.0_f32;
         for &i in line {
             let b = &tree.boxes[items[i].child];
-            cross[i] = b.rect.height + items[i].mt + items[i].mb;
+            let size = match cross_axis {
+                Axis::Horizontal => b.rect.width,
+                Axis::Vertical => b.rect.height,
+            };
+            cross[i] = size + items[i].cross_before + items[i].cross_after;
             line_cross = line_cross.max(cross[i]);
+        }
+
+        // Baseline alignment is meaningful when the cross axis is vertical
+        // (rows). Use the first text fragment's absolute baseline and line up
+        // all baseline items on the largest distance-from-cross-start.
+        if main_axis == Axis::Horizontal {
+            let mut baselines = vec![None; count];
+            for &i in line {
+                if items[i].align != AlignItems::Baseline {
+                    continue;
+                }
+                let child = items[i].child;
+                if let Some(baseline) = first_text_baseline(tree, child) {
+                    let top = tree.boxes[child].rect.y;
+                    baselines[i] = Some(baseline - top);
+                }
+            }
+            let line_baseline = line
+                .iter()
+                .filter(|&&i| baselines[i].is_some())
+                .map(|&i| baselines[i].unwrap() + items[i].cross_before)
+                .fold(0.0, f32::max);
+            for &i in line {
+                if let Some(dist) = baselines[i] {
+                    let shift = (line_baseline - (dist + items[i].cross_before)).max(0.0);
+                    baseline_shift[i] = shift;
+                    line_cross = line_cross.max(cross[i] + shift);
+                }
+            }
         }
 
         // Justify only the space left after flexible lengths and auto margins
         // have been resolved; this is zero when items grew to fill the line.
         let used_after: f32 = line
             .iter()
-            .map(|&i| sizes[i] + items[i].ml + items[i].mr)
+            .map(|&i| sizes[i] + items[i].before + items[i].after)
             .sum::<f32>()
-            + gap * line.len().saturating_sub(1) as f32;
-        let remaining = (available - used_after).max(0.0);
+            + main_gap * line.len().saturating_sub(1) as f32;
+        let remaining = if indefinite_main {
+            0.0
+        } else {
+            (available - used_after).max(0.0)
+        };
         let (start, between) = justify_offsets(justify, line.len(), remaining);
         let mut order = line.clone();
-        if reverse {
+        if main_reverse {
             order.reverse();
         }
         prepared.push(PreparedLine {
             order,
             sizes,
             cross,
+            baseline_shift,
             line_cross,
+            main_used,
             start,
             between,
         });
@@ -428,8 +604,7 @@ fn layout_flex_row(
     // --- Phase 2: align-content, cross positioning and stretch --------------
     let line_count = prepared.len();
     let used_cross: f32 = prepared.iter().map(|l| l.line_cross).sum::<f32>()
-        + line_gap * line_count.saturating_sub(1) as f32;
-    let container_cross = definite_container_cross(style, available, container_insets_v);
+        + cross_gap * line_count.saturating_sub(1) as f32;
     let free_cross = (container_cross - used_cross).max(0.0);
     let (cross_start, cross_between, cross_extra) = match align_content_of(style) {
         AlignContent::Start => (0.0, 0.0, 0.0),
@@ -451,14 +626,23 @@ fn layout_flex_row(
         }
     };
 
-    let mut line_y = content.y + cross_start;
+    let cross_origin = match main_axis {
+        Axis::Horizontal => content.y,
+        Axis::Vertical => content.x,
+    };
+    let main_origin = match main_axis {
+        Axis::Horizontal => content.x,
+        Axis::Vertical => content.y,
+    };
+    let mut line_cross_pos = cross_origin + cross_start;
     let mut total_cross = 0.0_f32;
+    let mut total_main = 0.0_f32;
     for (line_index, line) in prepared.iter().enumerate() {
         if !crate::budget::try_step() {
             break;
         }
         let effective_cross = line.line_cross + cross_extra;
-        let mut cursor = content.x + line.start;
+        let mut cursor = main_origin + line.start;
         for &i in &line.order {
             if !crate::budget::try_step() {
                 break;
@@ -469,48 +653,85 @@ fn layout_flex_row(
             let cross_offset = match it.align {
                 AlignItems::Center => (effective_cross - line.cross[i]).max(0.0) / 2.0,
                 AlignItems::FlexEnd => (effective_cross - line.cross[i]).max(0.0),
-                AlignItems::FlexStart | AlignItems::Baseline | AlignItems::Stretch => 0.0,
+                // For columns the baseline is not meaningful; treat it as the
+                // cross-start edge, like `flex-start`.
+                AlignItems::Baseline => {
+                    if main_axis == Axis::Horizontal {
+                        line.baseline_shift[i]
+                    } else {
+                        0.0
+                    }
+                }
+                AlignItems::FlexStart | AlignItems::Stretch => 0.0,
             };
-            let y = line_y + cross_offset + it.mt;
+            let cross_pos = line_cross_pos + cross_offset + it.cross_before;
+            let main_pos = cursor + it.before;
+            let (x, y) = match main_axis {
+                Axis::Horizontal => (main_pos, cross_pos),
+                Axis::Vertical => (cross_pos, main_pos),
+            };
             {
                 let b = &mut tree.boxes[child];
                 // `layout_box` resolves `auto` margins to zero; publish the
                 // final (possibly auto-absorbed) margins used by hit testing.
-                b.margins.left = it.ml;
-                b.margins.right = it.mr;
-                b.margins.top = it.mt;
-                b.margins.bottom = it.mb;
+                match main_axis {
+                    Axis::Horizontal => {
+                        b.margins.left = it.before;
+                        b.margins.right = it.after;
+                        b.margins.top = it.cross_before;
+                        b.margins.bottom = it.cross_after;
+                    }
+                    Axis::Vertical => {
+                        b.margins.top = it.before;
+                        b.margins.bottom = it.after;
+                        b.margins.left = it.cross_before;
+                        b.margins.right = it.cross_after;
+                    }
+                }
             }
-            crate::position::translate_subtree(
-                tree,
-                child,
-                cursor + it.ml - current.x,
-                y - current.y,
-            );
+            translate_subtree(tree, child, x - current.x, y - current.y);
 
             // `align-items: stretch` (the default) fills the line's cross size
             // for items whose cross size is auto.
             if it.align == AlignItems::Stretch && it.cross_auto {
                 let b = &mut tree.boxes[child];
-                let insets_v = b.borders.vertical() + b.paddings.vertical();
-                let inner = (effective_cross - it.mt - it.mb - insets_v).max(0.0);
-                b.content.height = inner;
-                b.rect.height = inner + insets_v;
+                let insets_cross = match cross_axis {
+                    Axis::Horizontal => b.borders.horizontal() + b.paddings.horizontal(),
+                    Axis::Vertical => b.borders.vertical() + b.paddings.vertical(),
+                };
+                let inner =
+                    (effective_cross - it.cross_before - it.cross_after - insets_cross).max(0.0);
+                match cross_axis {
+                    Axis::Horizontal => {
+                        b.content.width = inner;
+                        b.rect.width = inner + insets_cross;
+                    }
+                    Axis::Vertical => {
+                        b.content.height = inner;
+                        b.rect.height = inner + insets_cross;
+                    }
+                }
             }
 
-            cursor += line.sizes[i] + it.ml + it.mr + gap + line.between;
+            cursor += line.sizes[i] + it.before + it.after + main_gap + line.between;
         }
         total_cross += effective_cross;
+        total_main = total_main.max(line.main_used);
         if line_index + 1 < line_count {
-            total_cross += line_gap + cross_between;
-            line_y += effective_cross + line_gap + cross_between;
+            total_cross += cross_gap + cross_between;
+            line_cross_pos += effective_cross + cross_gap + cross_between;
         }
     }
-    total_cross.max(style.line_height_px())
+
+    match main_axis {
+        Axis::Horizontal => total_cross.max(style.line_height_px()),
+        Axis::Vertical => total_main.max(style.line_height_px()),
+    }
 }
 
-/// Turns a resolved `width`/`flex-basis` (content box under `content-box`
-/// sizing, border box under `border-box` sizing) into a border-box main size.
+/// Turns a resolved `width`/`flex-basis`/`height` (content box under
+/// `content-box` sizing, border box under `border-box` sizing) into a
+/// border-box main size.
 fn definite_border_size(resolved: f32, border_box: bool, insets: f32) -> f32 {
     if border_box {
         resolved.max(0.0)
@@ -519,7 +740,41 @@ fn definite_border_size(resolved: f32, border_box: bool, insets: f32) -> f32 {
     }
 }
 
-/// The container's definite content height, or zero when height is auto.
+/// Border + padding of `style` on the given axis. Percentage padding resolves
+/// against `available` (the containing-block width) on either axis.
+fn insets_for_axis(style: &ComputedStyle, axis: Axis, available: f32) -> f32 {
+    match axis {
+        Axis::Horizontal => {
+            style.border_width(Side::Left)
+                + style.border_width(Side::Right)
+                + resolve(style.padding(Side::Left), available)
+                + resolve(style.padding(Side::Right), available)
+        }
+        Axis::Vertical => {
+            style.border_width(Side::Top)
+                + style.border_width(Side::Bottom)
+                + resolve(style.padding(Side::Top), available)
+                + resolve(style.padding(Side::Bottom), available)
+        }
+    }
+}
+
+/// The container's definite content height, or `None` when height is auto (or
+/// a percentage, which has no definite base in this top-down layout).
+fn definite_main_size(style: &ComputedStyle, available: f32, insets: f32) -> Option<f32> {
+    match style.height() {
+        Dim::Auto | Dim::Percent(_) => None,
+        Dim::Calc { percent, .. } if percent != 0.0 => None,
+        dim => Some(definite_border_size(
+            resolve(dim, available),
+            style.box_sizing() == BoxSizing::BorderBox,
+            insets,
+        )),
+    }
+}
+
+/// The container's definite content size on the cross axis (vertical for
+/// rows), or zero when height is auto.
 fn definite_container_cross(style: &ComputedStyle, available: f32, insets_v: f32) -> f32 {
     match style.height() {
         Dim::Auto => 0.0,
@@ -531,21 +786,14 @@ fn definite_container_cross(style: &ComputedStyle, available: f32, insets_v: f32
     }
 }
 
-/// Border + padding on the main (horizontal) axis of an item.
-fn style_insets_main(style: &ComputedStyle, available: f32) -> f32 {
-    style.border_width(Side::Left)
-        + style.border_width(Side::Right)
-        + resolve(style.padding(Side::Left), available)
-        + resolve(style.padding(Side::Right), available)
-}
-
 /// Lays out one item at a requested border-box main size.
 ///
-/// `layout_box` honours a specified `width` over the width hint passed to it,
-/// so a definite `flex-basis` (or a shrunk/grown size) is applied by
-/// temporarily pinning `width` to the resolved value. Percentage padding and
-/// margins therefore still resolve against the flex container, and text is
-/// line-broken at the final main size.
+/// `layout_box` honours a specified `width`/`height` over the size hint passed
+/// to it, so a definite `flex-basis` (or a shrunk/grown size) is applied by
+/// temporarily pinning the main-axis size. Percentage padding and margins
+/// therefore still resolve against the flex container, and text is line-broken
+/// at the final main size.
+#[allow(clippy::too_many_arguments)]
 fn layout_item(
     tree: &mut LayoutTree,
     doc: &Document,
@@ -554,22 +802,42 @@ fn layout_item(
     insets: f32,
     border_box: bool,
     main_border: f32,
+    main_axis: Axis,
 ) {
+    let prop = match main_axis {
+        Axis::Horizontal => Property::Width,
+        Axis::Vertical => Property::Height,
+    };
     let original = tree.boxes[child]
         .style
-        .get(Property::Width)
+        .get(prop)
         .cloned()
         .unwrap_or(ComputedValue::Dim(Dim::Auto));
-    let width = if border_box {
+    let size = if border_box {
         main_border.max(0.0)
     } else {
         (main_border - insets).max(0.0)
     };
     tree.boxes[child]
         .style
-        .set(Property::Width, ComputedValue::Dim(Dim::Px(width)));
+        .set(prop, ComputedValue::Dim(Dim::Px(size)));
     let _ = layout_box(tree, doc, child, 0.0, 0.0, available.max(1.0));
-    tree.boxes[child].style.set(Property::Width, original);
+    tree.boxes[child].style.set(prop, original);
+}
+
+/// The absolute y of the first text fragment baseline in the subtree rooted at
+/// `index`, or `None` when the subtree paints no text.
+fn first_text_baseline(tree: &LayoutTree, index: usize) -> Option<f32> {
+    let b = &tree.boxes[index];
+    if let Some(fragment) = b.lines.iter().find_map(|line| line.fragments.first()) {
+        return Some(fragment.baseline);
+    }
+    for &child in &b.children {
+        if let Some(y) = first_text_baseline(tree, child) {
+            return Some(y);
+        }
+    }
+    None
 }
 
 /// Computes the intrinsic `(min-content, max-content)` border-box widths of a
@@ -611,9 +879,6 @@ fn intrinsic_width(
         BoxType::Image => {
             let w = if ignore_percentages {
                 match b.style.width() {
-                    // Definite pixel widths are safe to use; a percentage can
-                    // only be resolved against a container, so treat it as
-                    // indefinite and fall back to the replaced-element default.
                     Dim::Px(px) => px.max(0.0),
                     _ => 150.0,
                 }
@@ -646,14 +911,12 @@ fn intrinsic_width(
         }
     };
     let insets = if ignore_percentages {
-        // Percentage padding is indefinite during intrinsic sizing, so resolve
-        // it against zero rather than against the flex container's width.
         b.style.border_width(Side::Left)
             + b.style.border_width(Side::Right)
             + resolve(b.style.padding(Side::Left), 0.0)
             + resolve(b.style.padding(Side::Right), 0.0)
     } else {
-        style_insets_main(&b.style, available)
+        insets_for_axis(&b.style, Axis::Horizontal, available)
     };
     min += insets;
     max += insets;
@@ -661,11 +924,75 @@ fn intrinsic_width(
 }
 
 /// Returns `(min-content, max-content)` border-box widths for a flex item.
-///
-/// Percentages are deliberately treated as indefinite here: an intrinsic
-/// contribution must never be derived from the flex container's own width.
+/// Percentages are deliberately treated as indefinite here.
 fn content_widths(tree: &LayoutTree, index: usize, available: f32) -> (f32, f32) {
     intrinsic_width(tree, index, available, true)
+}
+
+/// Approximate intrinsic heights for column items: a text run occupies one
+/// line, images use their declared height (or a replaced-element default),
+/// and containers combine their children. Percentages are treated as
+/// indefinite so an intrinsic contribution never depends on the container.
+fn intrinsic_height(
+    tree: &LayoutTree,
+    index: usize,
+    available: f32,
+    ignore_percentages: bool,
+) -> (f32, f32) {
+    let b = &tree.boxes[index];
+    let (mut min, mut max) = match b.box_type {
+        BoxType::Text => {
+            let line = b.style.line_height_px();
+            (line, line)
+        }
+        BoxType::Image => {
+            let h = if ignore_percentages {
+                match b.style.height() {
+                    Dim::Px(px) => px.max(0.0),
+                    _ => 150.0,
+                }
+            } else {
+                b.style.height().resolve(available).unwrap_or(150.0)
+            };
+            (h, h)
+        }
+        _ => {
+            let mut mins = Vec::with_capacity(b.children.len());
+            let mut maxs = Vec::with_capacity(b.children.len());
+            for &child in &b.children {
+                let (cmin, cmax) = intrinsic_height(tree, child, available, ignore_percentages);
+                mins.push(cmin);
+                maxs.push(cmax);
+            }
+            let inline_children = b.children.iter().any(|&child| {
+                matches!(
+                    tree.boxes[child].box_type,
+                    BoxType::Text | BoxType::Inline | BoxType::InlineBlock | BoxType::Image
+                )
+            });
+            let min = mins.iter().copied().fold(0.0, f32::max);
+            let max = if inline_children {
+                maxs.iter().sum()
+            } else {
+                maxs.iter().copied().fold(0.0, f32::max)
+            };
+            (min, max)
+        }
+    };
+    let pad = if ignore_percentages { 0.0 } else { available };
+    min += b.style.border_width(Side::Top)
+        + b.style.border_width(Side::Bottom)
+        + resolve(b.style.padding(Side::Top), pad)
+        + resolve(b.style.padding(Side::Bottom), pad);
+    max += b.style.border_width(Side::Top)
+        + b.style.border_width(Side::Bottom)
+        + resolve(b.style.padding(Side::Top), pad)
+        + resolve(b.style.padding(Side::Bottom), pad);
+    (min, max)
+}
+
+fn content_heights(tree: &LayoutTree, index: usize, available: f32) -> (f32, f32) {
+    intrinsic_height(tree, index, available, true)
 }
 
 /// Shrinks the items of one line so their outer sizes fit `available`.
@@ -719,7 +1046,7 @@ fn distribute_shrink(items: &[FlexItem], line: &[usize], deficit: f32) -> Vec<f3
 }
 
 /// Grows the items of one line into the positive free space, honouring each
-/// item's `max-width` (and redistributing space freed by clamped items).
+/// item's `max` main size (and redistributing space freed by clamped items).
 fn distribute_grow(items: &[FlexItem], line: &[usize], free: f32) -> Vec<f32> {
     let mut sizes: Vec<f32> = line.iter().map(|&i| items[i].base).collect();
     let mut frozen = vec![false; line.len()];
@@ -1089,5 +1416,163 @@ mod tests {
             a.rect.width,
             b.rect.width
         );
+    }
+
+    // --- Column direction ---------------------------------------------------
+
+    #[test]
+    fn column_grow_fills_the_container_height() {
+        let (_doc, tree, ids) = layout_grid(
+            "body { margin: 0; } #g { display: flex; flex-direction: column; height: 90px; } \
+             #g > div { flex: 1 1 auto; }",
+            &[("div", "a", "A"), ("div", "b", "B")],
+        );
+        let col = tree.find_node(ids[1]).unwrap();
+        let a = &tree.boxes[col.children[0]];
+        let b = &tree.boxes[col.children[1]];
+        assert!(
+            (a.rect.height + b.rect.height - 90.0).abs() < 1.0,
+            "column items should grow to fill the height: {} + {}",
+            a.rect.height,
+            b.rect.height
+        );
+        assert!(
+            (a.rect.height - b.rect.height).abs() < 1.0,
+            "equal grow factors should yield equal heights"
+        );
+        assert!(
+            b.rect.y >= a.rect.bottom() - 0.01,
+            "grown column items must not overlap"
+        );
+    }
+
+    #[test]
+    fn column_shrink_and_min_max_main_size() {
+        let (_doc, tree, ids) = layout_grid(
+            "body { margin: 0; } #g { display: flex; flex-direction: column; height: 60px; } \
+             #g > div { height: 50px; } #a { min-height: 10px; } #b { max-height: 20px; }",
+            &[("div", "a", ""), ("div", "b", "")],
+        );
+        let col = tree.find_node(ids[1]).unwrap();
+        let a = &tree.boxes[col.children[0]];
+        let b = &tree.boxes[col.children[1]];
+        assert!(
+            b.rect.height <= 20.5,
+            "max-height not honoured: {}",
+            b.rect.height
+        );
+        assert!(
+            a.rect.height >= 9.5,
+            "min-height not honoured: {}",
+            a.rect.height
+        );
+        assert!(
+            a.rect.height + b.rect.height <= 60.5,
+            "column items should shrink to fit the container"
+        );
+    }
+
+    #[test]
+    fn column_align_items_center_on_the_cross_axis() {
+        let (_doc, tree, ids) = layout_grid(
+            "body { margin: 0; } #g { display: flex; flex-direction: column; width: 100px; \
+             align-items: center; } #g > div { width: 20px; height: 10px; }",
+            &[("div", "a", ""), ("div", "b", "")],
+        );
+        let col = tree.find_node(ids[1]).unwrap();
+        for &child in &col.children {
+            let b = &tree.boxes[child];
+            assert!(
+                (b.rect.x - 40.0).abs() < 0.5,
+                "centered column item should start at x=40, got {}",
+                b.rect.x
+            );
+        }
+    }
+
+    #[test]
+    fn column_reverse_reverses_main_order() {
+        let (_doc, tree, ids) = layout_grid(
+            "body { margin: 0; } #g { display: flex; flex-direction: column-reverse; height: 40px; } \
+             #g > div { height: 20px; }",
+            &[("div", "a", ""), ("div", "b", "")],
+        );
+        let col = tree.find_node(ids[1]).unwrap();
+        let a = &tree.boxes[col.children[0]];
+        let b = &tree.boxes[col.children[1]];
+        assert!(
+            b.rect.y < a.rect.y,
+            "column-reverse must place the first DOM item below the second"
+        );
+    }
+
+    // --- Wrapping and alignment ---------------------------------------------
+
+    #[test]
+    fn wrap_reverse_reverses_line_order() {
+        let (_doc, tree, ids) = layout_grid(
+            "body { margin: 0; } #g { display: flex; flex-wrap: wrap-reverse; width: 100px; } \
+             #g > div { width: 60px; height: 20px; }",
+            &[("div", "a", ""), ("div", "b", "")],
+        );
+        let row = tree.find_node(ids[1]).unwrap();
+        let a = &tree.boxes[row.children[0]];
+        let b = &tree.boxes[row.children[1]];
+        assert!(
+            a.rect.y > b.rect.y,
+            "items should still wrap onto two lines"
+        );
+        // With `wrap` the first item (a) would be on the first line at the
+        // top; `wrap-reverse` reverses line order so b is topmost.
+        assert!(
+            b.rect.y + b.rect.height <= a.rect.y + 0.5,
+            "wrap-reverse should put the second line above the first: a.y={} b.y={}",
+            a.rect.y,
+            b.rect.y
+        );
+    }
+
+    #[test]
+    fn align_content_space_between_column() {
+        let (_doc, tree, ids) = layout_grid(
+            "body { margin: 0; } #g { display: flex; flex-direction: column; width: 300px; \
+             flex-wrap: wrap; height: 100px; align-content: space-between; } \
+             #g > div { height: 40px; width: 50px; }",
+            &[("div", "a", ""), ("div", "b", "")],
+        );
+        let col = tree.find_node(ids[1]).unwrap();
+        let a = &tree.boxes[col.children[0]];
+        // Two 40px lines with a 100px cross extent leave 20px of free cross
+        // space; space-between keeps the first line at the cross start.
+        assert!(
+            (a.rect.x - col.content.x).abs() < 0.5,
+            "first column line should start at the cross origin"
+        );
+    }
+
+    // --- Baseline ------------------------------------------------------------
+
+    #[test]
+    fn align_items_baseline_lines_up_text() {
+        let (_doc, tree, ids) = layout_grid(
+            "body { margin: 0; } #g { display: flex; align-items: baseline; font-size: 20px; } \
+             #a { height: 20px; font-size: 20px; } \
+             #b { height: 60px; font-size: 20px; padding-top: 20px; }",
+            &[("div", "a", "Aa"), ("div", "b", "Bb")],
+        );
+        let row = tree.find_node(ids[1]).unwrap();
+        let a = &tree.boxes[row.children[0]];
+        let b = &tree.boxes[row.children[1]];
+        let baseline_a = a.lines[0].fragments[0].baseline;
+        let baseline_b = b.lines[0].fragments[0].baseline;
+        assert!(
+            (baseline_a - baseline_b).abs() < 1.0,
+            "baseline items should share a text baseline: {} vs {}",
+            baseline_a,
+            baseline_b
+        );
+        // The item whose text starts lower (due to padding) stays put while
+        // the other shifts down so their baselines line up.
+        assert!(a.rect.y > b.rect.y);
     }
 }

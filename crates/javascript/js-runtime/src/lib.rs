@@ -12,11 +12,14 @@ mod function;
 mod gc;
 mod generator;
 mod interpreter;
+mod intl;
 mod module;
 mod object;
 mod promise;
+mod reflect;
 mod scope;
 mod value;
+mod weak;
 
 use std::collections::{HashMap, VecDeque};
 
@@ -38,12 +41,18 @@ pub(crate) type Microtask = Box<dyn FnOnce(&mut Runtime) -> Result<(), JsError>>
 /// interpreter state.
 pub struct Runtime {
     pub(crate) heap: Vec<Option<Object>>,
+    /// Monotonic generation counter for each heap slot. Incremented whenever a
+    /// slot is freed or reused so stale weak references can be detected even
+    /// after an object id has been recycled.
+    pub(crate) heap_generations: Vec<u64>,
     pub(crate) heap_free: Vec<usize>,
     pub(crate) scopes: Vec<Option<Scope>>,
     pub(crate) scope_free: Vec<usize>,
     pub(crate) prototypes: Prototypes,
     /// Well-known `Symbol.iterator` value.
     pub(crate) symbol_iterator: ObjectId,
+    /// Well-known `Symbol.asyncIterator` value.
+    pub(crate) symbol_async_iterator: ObjectId,
     /// Prototype shared by generator objects.
     pub(crate) generator_prototype: ObjectId,
     pub(crate) global: ObjectId,
@@ -100,6 +109,7 @@ impl Runtime {
             .unwrap_or(0x9E37_79B9_7F4A_7C15);
         let mut runtime = Self {
             heap: Vec::new(),
+            heap_generations: Vec::new(),
             heap_free: Vec::new(),
             scopes: Vec::new(),
             scope_free: Vec::new(),
@@ -115,6 +125,7 @@ impl Runtime {
                 regexp: ObjectId(0),
             },
             symbol_iterator: ObjectId(0),
+            symbol_async_iterator: ObjectId(0),
             generator_prototype: ObjectId(0),
             global: ObjectId(0),
             global_scope: ScopeId(0),

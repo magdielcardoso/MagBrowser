@@ -35,7 +35,7 @@ impl Navigator {
 
     /// Mutable access to session history.
     ///
-    /// Prefer [`Self::navigate`] for ordinary navigation; direct mutation is for
+    /// Prefer [`Self::start_navigation`] for ordinary navigation; direct mutation is for
     /// updating titles and scroll positions.
     pub fn history_mut(&mut self) -> &mut SessionHistory {
         &mut self.history

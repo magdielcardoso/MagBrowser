@@ -193,6 +193,24 @@ impl crate::Runtime {
         }
     }
 
+    /// Prepare a lexical binding for initialization. Unlike `declare_binding`,
+    /// this resets an existing binding (needed by the generator machine when a
+    /// loop declares the same `let`/`const` binding on every iteration).
+    pub(crate) fn prepare_binding(&mut self, scope: ScopeId, name: &str, kind: BindingKind) {
+        if let Some(target) = self.scope_mut(scope) {
+            if let Some((_, binding)) = target.bindings.iter_mut().find(|(bound, _)| bound == name)
+            {
+                binding.kind = kind;
+                binding.value = Value::Undefined;
+                binding.initialized = false;
+            } else {
+                target
+                    .bindings
+                    .push((name.to_owned(), Binding::new(kind, Value::Undefined, false)));
+            }
+        }
+    }
+
     /// Assign to an existing binding; returns `false` when the name is unbound.
     pub(crate) fn assign_binding(&mut self, name: &str, value: Value) -> Result<bool, JsError> {
         let Some(scope_id) = self.find_binding_scope(name) else {

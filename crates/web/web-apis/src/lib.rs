@@ -31,6 +31,7 @@ pub mod events;
 pub mod fetch;
 pub mod form;
 pub mod location;
+pub mod observers;
 pub mod storage;
 pub mod timers;
 pub mod url_search_params;
@@ -105,6 +106,8 @@ pub struct HostState {
     pub abort_signals: HashMap<u64, AbortSignalState>,
     /// Next abort signal id.
     pub next_abort_id: u64,
+    /// Intersection, resize and mutation observers plus their host hooks.
+    pub observers: observers::Observers,
 }
 
 impl HostState {
@@ -126,6 +129,7 @@ impl HostState {
             fetch_handler: None,
             abort_signals: HashMap::new(),
             next_abort_id: 0,
+            observers: observers::Observers::new(),
         }
     }
 
@@ -145,6 +149,16 @@ impl HostState {
     /// Runs the installed fetch bridge.
     pub fn fetch(&self, request: FetchRequest) -> Result<FetchResponse, FetchError> {
         fetch::perform_fetch(self, request)
+    }
+
+    /// Installs the callback that maps a node to its current layout box. Called
+    /// by browser-core once a layout tree is available; observers use it to
+    /// compute `boundingClientRect`, `contentRect` and intersection ratios.
+    pub fn set_layout_box_resolver(
+        &mut self,
+        resolver: impl Fn(NodeId) -> Option<observers::Rect> + 'static,
+    ) {
+        self.observers.set_layout_box_resolver(resolver);
     }
 
     /// Drains collected console output.
@@ -195,6 +209,7 @@ pub fn install(
     fetch::install(runtime, &state);
     url_search_params::install(runtime);
     xhr::install(runtime, &state);
+    observers::install(runtime, &state);
 
     state
 }
@@ -212,4 +227,9 @@ pub fn drain_timers_now(runtime: &mut Runtime, state: &Rc<RefCell<HostState>>) -
 pub use events::{
     DispatchOutcome, EventInit, dispatch_event, dispatch_event_object, dispatch_event_with,
     dispatch_keyboard_event, dispatch_mouse_event,
+};
+
+pub use observers::{
+    LayoutBoxResolver, Mutation, MutationKind, Observers, Rect, deliver_observer_callbacks,
+    deliver_observer_callbacks_now, notify_observers, record_mutation,
 };

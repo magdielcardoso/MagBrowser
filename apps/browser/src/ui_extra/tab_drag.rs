@@ -4,6 +4,9 @@
 //! and produces a new ordering (a permutation of `0..tab_count`) on commit.
 //! All state is plain integers, so this can be driven from any event system.
 
+// A framework-agnostic model: not every accessor is used by the window shell.
+#![allow(dead_code)]
+
 /// State of a tab drag operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TabDrag {
@@ -111,6 +114,68 @@ pub fn reorder(tab_count: usize, source: usize, target: usize) -> Option<Vec<usi
     Some(order)
 }
 
+/// Applies a committed drag order to a display-slot → browser-tab mapping.
+///
+/// `positions[slot]` is the index of the tab in `browser.tabs().ids()` shown in
+/// display slot `slot`. `order` is a permutation of display slots, normally the
+/// value returned by [`reorder`]. The result maps each new display slot to the
+/// same browser tab it showed before, just in the new order.
+///
+/// Returns `None` when the lengths differ or `order` is not a permutation.
+///
+/// # Engine gap
+///
+/// `browser_core::TabSet` has no `reorder` method, so the engine's tab order is
+/// deliberately left untouched. The window layer keeps this mapping and uses it
+/// to translate display slots into browser tab indices when selecting or
+/// closing tabs. A future `TabSet::reorder` can replace the mapping wholesale.
+pub fn reorder_tabs(positions: &[usize], order: &[usize]) -> Option<Vec<usize>> {
+    if positions.len() != order.len() || !is_permutation(order, positions.len()) {
+        return None;
+    }
+    Some(order.iter().map(|&slot| positions[slot]).collect())
+}
+
+/// Removes a browser tab index from a display mapping.
+///
+/// `index` is an index into `browser.tabs().ids()`, not a display slot. Later
+/// indices shift down so the mapping stays valid after `TabSet::close`.
+pub fn remove_tab(positions: &[usize], index: usize) -> Vec<usize> {
+    positions
+        .iter()
+        .copied()
+        .filter(|&position| position != index)
+        .map(|position| {
+            if position > index {
+                position - 1
+            } else {
+                position
+            }
+        })
+        .collect()
+}
+
+/// Appends a browser tab index to a display mapping.
+pub fn push_tab(positions: &[usize], index: usize) -> Vec<usize> {
+    let mut next = positions.to_vec();
+    next.push(index);
+    next
+}
+
+fn is_permutation(order: &[usize], len: usize) -> bool {
+    if order.len() != len {
+        return false;
+    }
+    let mut seen = vec![false; len];
+    for &slot in order {
+        if slot >= len || seen[slot] {
+            return false;
+        }
+        seen[slot] = true;
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -177,5 +242,30 @@ mod tests {
         drag.move_to(5);
         assert_eq!(drag.commit(3), None);
         assert_eq!(drag.commit(6), Some(vec![1, 2, 3, 4, 5, 0]));
+    }
+
+    #[test]
+    fn reorder_tabs_maps_display_slots_to_browser_indices() {
+        let mut drag = TabDrag::new();
+        drag.start(0);
+        drag.move_to(2);
+        let order = drag.commit(4).unwrap();
+        // Before: display slots [tab0, tab1, tab2, tab3].
+        assert_eq!(reorder_tabs(&[0, 1, 2, 3], &order), Some(vec![1, 2, 0, 3]));
+        // A non-identity starting mapping is carried through unchanged.
+        assert_eq!(reorder_tabs(&[3, 2, 1, 0], &order), Some(vec![2, 1, 3, 0]));
+    }
+
+    #[test]
+    fn reorder_tabs_rejects_invalid_orders() {
+        assert_eq!(reorder_tabs(&[0, 1], &[0, 0]), None);
+        assert_eq!(reorder_tabs(&[0, 1], &[0, 2]), None);
+        assert_eq!(reorder_tabs(&[0, 1], &[0]), None);
+    }
+
+    #[test]
+    fn tab_mapping_tracks_closes_and_opens() {
+        assert_eq!(remove_tab(&[1, 2, 0, 3], 2), vec![1, 0, 2]);
+        assert_eq!(push_tab(&[1, 0, 2], 3), vec![1, 0, 2, 3]);
     }
 }

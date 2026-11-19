@@ -9,6 +9,10 @@
 //!   queue.
 //! * [`Scheduler`] adds a `std::time::Instant`-based timer heap, drains
 //!   microtasks at every checkpoint and reports how much work it ran.
+//! * [`ServiceWorkerRegistry`] models worker registration and fetch interception,
+//!   delegating script execution to a host-supplied callback.
+//! * [`WebSocketManager`] drives WebSocket connections through a state machine
+//!   with a pluggable [`WebSocketTransport`] and an in-memory test transport.
 //!
 //! Time is always supplied by the caller ([`Scheduler::run_due_timers`] and
 //! [`Scheduler::run_until_idle`]), so hosts can use a real clock while tests use a
@@ -39,8 +43,19 @@
 
 mod microtasks;
 mod scheduler;
+mod service_worker;
 mod tasks;
+mod websocket;
 
 pub use microtasks::{MAX_MICROTASK_BATCH, MicrotaskQueue, drain_bounded};
 pub use scheduler::{DEFAULT_MICROTASK_LIMIT, RunReport, Scheduler, TimerId};
+pub use service_worker::{
+    Registration, RegistrationId, Response, ServiceWorkerEvent, ServiceWorkerRegistry,
+    ServiceWorkerResponse, WorkerError, WorkerEventKind, WorkerEventResult, WorkerScriptHandler,
+    WorkerState,
+};
 pub use tasks::{Task, TaskQueue, TaskSource};
+pub use websocket::{
+    MemoryTransport, TransportError, WebSocket, WebSocketError, WebSocketEvent, WebSocketId,
+    WebSocketManager, WebSocketMessage, WebSocketState, WebSocketTransport,
+};

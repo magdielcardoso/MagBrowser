@@ -1304,6 +1304,23 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn parses_for_await_of() {
+        let program = parse_ok("async function f() { for await (const x of xs) { use(x); } }");
+        let Stmt::FunctionDecl(function) = &program.body[0] else {
+            panic!("expected function");
+        };
+        assert!(function.is_async);
+        let Stmt::ForIn {
+            is_of, is_await, ..
+        } = &function.body[0]
+        else {
+            panic!("expected for-in/of");
+        };
+        assert!(*is_of);
+        assert!(*is_await);
+    }
+
     // -----------------------------------------------------------------------
     // More template literal coverage
     // -----------------------------------------------------------------------

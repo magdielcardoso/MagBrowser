@@ -19,17 +19,24 @@
 #![forbid(unsafe_code)]
 
 pub mod attributes;
+pub mod custom_elements;
 pub mod document;
 pub mod element;
 pub mod limits;
 pub mod mutation;
 pub mod node;
 pub mod serialize;
+pub mod shadow;
 pub mod text;
 pub mod traversal;
 
 pub use attributes::Attributes;
+pub use custom_elements::{
+    CallbackHandle, CustomElementDefinition, CustomElementError, CustomElementRegistry,
+    LifecycleCallbacks, RESERVED_CUSTOM_ELEMENT_NAMES, WhenDefinedCallback,
+};
 pub use document::Document;
 pub use limits::Limits;
 pub use node::{ElementData, Namespace, Node, NodeData, NodeId, TextData};
 pub use serialize::{escape_attr, escape_text, serialize, serialize_children, serialize_outer};
+pub use shadow::{ShadowRoot, ShadowRootMode};

@@ -1,6 +1,7 @@
 //! Page script execution: `<script>` collection and the JS runtime bridge.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
@@ -141,6 +142,38 @@ pub fn execute_in_page(page: &mut Page) -> (usize, Vec<String>) {
     execute_scripts(page, &scripts)
 }
 
+/// Gives the observer host a snapshot of the current layout geometry.
+fn install_observer_layout(page: &Page, host: &Rc<RefCell<HostState>>) {
+    let mut boxes = HashMap::new();
+    for b in &page.layout.boxes {
+        if let Some(node) = b.node {
+            boxes.insert(
+                node,
+                browser_web_apis::Rect::new(
+                    b.rect.x as f64,
+                    b.rect.y as f64,
+                    b.rect.width as f64,
+                    b.rect.height as f64,
+                ),
+            );
+        }
+    }
+    host.borrow_mut()
+        .set_layout_box_resolver(move |node| boxes.get(&node).copied());
+}
+
+/// Queues observer notifications using the latest layout and viewport.
+pub fn notify_observers(page: &Page, host: &Rc<RefCell<HostState>>) {
+    let viewport = browser_web_apis::Rect::new(
+        0.0,
+        0.0,
+        page.viewport().width as f64,
+        page.viewport().height as f64,
+    );
+    let document = page.document.borrow();
+    browser_web_apis::notify_observers(host, viewport, &document);
+}
+
 /// Executes the given scripts in order, returning how many ran and console output.
 pub fn execute_scripts(page: &mut Page, scripts: &[String]) -> (usize, Vec<String>) {
     if page.scripts_executed {
@@ -168,6 +201,13 @@ pub fn execute_scripts(page: &mut Page, scripts: &[String]) -> (usize, Vec<Strin
         executed += 1;
     }
     browser_web_apis::drain_timers_now(&mut runtime, &host);
+    let _ = runtime.run_microtasks();
+
+    // Give IntersectionObserver/ResizeObserver their first snapshot after the
+    // initial layout, then deliver the queued callbacks.
+    install_observer_layout(page, &host);
+    notify_observers(page, &host);
+    browser_web_apis::deliver_observer_callbacks(&mut runtime, &host);
     let _ = runtime.run_microtasks();
 
     page.runtime = Some(runtime);

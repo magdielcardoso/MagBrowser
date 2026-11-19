@@ -63,6 +63,50 @@ pub fn matches_pseudo_element_host_with_state(
     matches_inner(doc, node, selector, state, true)
 }
 
+/// Matches a `::slotted()` selector against a light-DOM child of a shadow host.
+///
+/// `node` must actually be assigned to a `<slot>` in a shadow tree and the
+/// selector's argument must match it. The compounds preceding
+/// `::slotted(...)` match the slot itself, so `slot[name=title]::slotted(h1)`
+/// matches an `<h1>` assigned to the slot named `title`.
+///
+/// Like other pseudo-elements, `::slotted()` never matches through
+/// [`matches`]; use this function (or [`matches_slotted_with_state`]).
+#[must_use]
+pub fn matches_slotted(doc: &Document, node: NodeId, selector: &Selector) -> bool {
+    matches_slotted_with_state(doc, node, selector, &ElementState::default())
+}
+
+/// Like [`matches_slotted`], but honours interactive pseudo-class state.
+#[must_use]
+pub fn matches_slotted_with_state(
+    doc: &Document,
+    node: NodeId,
+    selector: &Selector,
+    state: &ElementState,
+) -> bool {
+    if selector.pseudo_element.as_deref() != Some("slotted") {
+        return false;
+    }
+    let Some(slot) = doc.assigned_slot(node) else {
+        return false;
+    };
+    // `ignore_pseudo_elements = true` treats the `::slotted()` simple as a
+    // wildcard so the preceding compounds match the slot element itself.
+    if !matches_inner(doc, slot, selector, state, true) {
+        return false;
+    }
+    let Some(argument) = selector.pseudo_element_argument.as_deref() else {
+        return false;
+    };
+    let Ok(selectors) = crate::parse_selectors(argument) else {
+        return false;
+    };
+    selectors
+        .iter()
+        .any(|candidate| matches_inner(doc, node, candidate, state, false))
+}
+
 fn matches_inner(
     doc: &Document,
     node: NodeId,
@@ -427,6 +471,18 @@ fn contains(actual: &str, expected: &str, case_insensitive: bool) -> bool {
     }
 }
 
+/// The shadow host whose tree `node` belongs to, if any.
+///
+/// A host element matches `:host` / `:host-context()` when styles are
+/// evaluated in its own shadow tree (`state.host`) or when it owns a shadow
+/// root. For a node inside a shadow tree, the enclosing host is used.
+fn shadow_context_host(doc: &Document, node: NodeId, state: &ElementState) -> Option<NodeId> {
+    if state.host || doc.shadow_root(node).is_some() {
+        return Some(node);
+    }
+    doc.enclosing_host(node)
+}
+
 fn matches_pseudo_class(
     doc: &Document,
     node: NodeId,
@@ -509,7 +565,20 @@ fn matches_pseudo_class(
         PseudoClass::ReadOnly => !is_read_write(doc, node),
         PseudoClass::ReadWrite => is_read_write(doc, node),
         PseudoClass::Dir(wanted) => element_direction(doc, node) == *wanted,
-        PseudoClass::Host => state.host,
+        PseudoClass::Host => state.host || doc.shadow_root(node).is_some(),
+        PseudoClass::HostContext(selectors) => {
+            let Some(host) = shadow_context_host(doc, node, state) else {
+                return false;
+            };
+            std::iter::once(host)
+                .chain(doc.ancestors(host))
+                .any(|ancestor| {
+                    doc.node(ancestor).is_element()
+                        && selectors.iter().any(|selector| {
+                            matches_inner(doc, ancestor, selector, state, ignore_pseudo_elements)
+                        })
+                })
+        }
         PseudoClass::Defined => is_defined(doc, node, state),
         PseudoClass::Modal => state.modal,
         PseudoClass::Autofill => state.autofill,
@@ -2091,5 +2160,119 @@ mod tests {
         assert!(!is_match(&f.doc, f.a, ":nth-last-child(1 of .item)"));
         assert!(is_match(&f.doc, f.b, ":nth-last-child(3 of li)"));
         assert!(!is_match(&f.doc, f.d, ":nth-last-child(1 of li)"));
+    }
+
+    struct ShadowFixture {
+        doc: Document,
+        body: NodeId,
+        host: NodeId,
+        light: NodeId,
+        titled: NodeId,
+        unassigned: NodeId,
+        shadow_para: NodeId,
+    }
+
+    fn shadow_fixture() -> ShadowFixture {
+        let mut doc = Document::new();
+        let html = doc.create_element("html");
+        let body = doc.create_element("body");
+        doc.append_child(doc.root(), html);
+        doc.append_child(html, body);
+
+        let host = doc.create_element("x-card");
+        doc.set_attr(host, "class", "card");
+        doc.append_child(body, host);
+        let root = doc
+            .attach_shadow(host, browser_dom::ShadowRootMode::Open)
+            .unwrap();
+
+        let default_slot = doc.create_element("slot");
+        let named_slot = doc.create_element("slot");
+        doc.set_attr(named_slot, "name", "title");
+        doc.append_child(root, default_slot);
+        doc.append_child(root, named_slot);
+        let shadow_para = doc.create_element("p");
+        doc.set_attr(shadow_para, "class", "inside");
+        doc.append_child(root, shadow_para);
+
+        let light = doc.create_element("span");
+        doc.set_attr(light, "class", "item");
+        let titled = doc.create_element("h1");
+        doc.set_attr(titled, "slot", "title");
+        doc.set_attr(titled, "class", "heading");
+        let unassigned = doc.create_element("em");
+        doc.set_attr(unassigned, "slot", "other");
+        for node in [light, titled, unassigned] {
+            doc.append_child(host, node);
+        }
+
+        ShadowFixture {
+            doc,
+            body,
+            host,
+            light,
+            titled,
+            unassigned,
+            shadow_para,
+        }
+    }
+
+    #[test]
+    fn host_pseudo_class() {
+        let f = shadow_fixture();
+        assert!(is_match(&f.doc, f.host, ":host"));
+        assert!(is_match(&f.doc, f.host, "x-card:host"));
+        assert!(!is_match(&f.doc, f.light, ":host"));
+        assert!(!is_match(&f.doc, f.shadow_para, ":host"));
+
+        // The style engine can also mark any element as a host explicitly.
+        let state = ElementState {
+            host: true,
+            ..ElementState::default()
+        };
+        assert!(is_match_state(&f.doc, f.light, ":host", &state));
+    }
+
+    #[test]
+    fn host_context_pseudo_class() {
+        let mut f = shadow_fixture();
+        assert!(is_match(&f.doc, f.host, ":host-context(.card)"));
+        assert!(is_match(&f.doc, f.host, ":host-context(body)"));
+        assert!(!is_match(&f.doc, f.host, ":host-context(.theme)"));
+        assert!(!is_match(&f.doc, f.light, ":host-context(.card)"));
+
+        f.doc.set_attr(f.body, "class", "theme");
+        assert!(is_match(&f.doc, f.host, ":host-context(.theme)"));
+        assert!(is_match(
+            &f.doc,
+            f.host,
+            ":host-context(body.theme, .other)"
+        ));
+        assert!(!is_match(&f.doc, f.host, ":host-context(html.theme)"));
+    }
+
+    #[test]
+    fn slotted_pseudo_element() {
+        let f = shadow_fixture();
+        let selector = parse_selector("::slotted(.item)").unwrap();
+        // Ordinary matching never matches a pseudo-element.
+        assert!(!matches(&f.doc, f.light, &selector));
+        assert!(matches_slotted(&f.doc, f.light, &selector));
+        assert!(!matches_slotted(&f.doc, f.titled, &selector));
+        assert!(!matches_slotted(&f.doc, f.unassigned, &selector));
+        assert!(!matches_slotted(&f.doc, f.host, &selector));
+
+        let named = parse_selector("slot[name=title]::slotted(h1.heading)").unwrap();
+        assert!(matches_slotted(&f.doc, f.titled, &named));
+        assert!(!matches_slotted(&f.doc, f.light, &named));
+
+        let any = parse_selector("::slotted(*)").unwrap();
+        assert!(matches_slotted(&f.doc, f.light, &any));
+        assert!(matches_slotted(&f.doc, f.titled, &any));
+        assert!(!matches_slotted(&f.doc, f.unassigned, &any));
+
+        // A non-slotted pseudo-element selector is rejected by matches_slotted.
+        let before = parse_selector("p::before").unwrap();
+        assert!(!matches_slotted(&f.doc, f.light, &before));
     }
 }

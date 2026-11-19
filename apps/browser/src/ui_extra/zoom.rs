@@ -4,6 +4,9 @@
 //! walks that ladder and computes the factor that multiplies the device pixel
 //! ratio before rendering. It is pure: no winit or wgpu types appear here.
 
+// A framework-agnostic model: not every accessor is used by the window shell.
+#![allow(dead_code)]
+
 /// The supported logical zoom levels, ascending.
 pub const ZOOM_LEVELS: [f32; 11] = [0.5, 0.67, 0.75, 0.8, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0];
 

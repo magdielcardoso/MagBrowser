@@ -1,8 +1,12 @@
 //! The document arena, node creation and core tree queries.
 
+use std::collections::HashMap;
+
 use crate::attributes::Attributes;
+use crate::custom_elements::{CustomElementDefinition, CustomElementRegistry};
 use crate::limits::Limits;
 use crate::node::{ElementData, Namespace, Node, NodeData, NodeId, TextData};
+use crate::shadow::ShadowRoot;
 
 /// A parsed document.
 ///
@@ -18,6 +22,12 @@ pub struct Document {
     pub base_url: Option<String>,
     /// Document title cache (updated by the HTML parser).
     pub title: String,
+    /// Registered custom elements for this document.
+    pub(crate) custom_elements: CustomElementRegistry,
+    /// Shadow roots keyed by their host element.
+    pub(crate) shadow_roots: HashMap<NodeId, ShadowRoot>,
+    /// Reverse index from a shadow root's arena node to its host element.
+    pub(crate) shadow_root_nodes: HashMap<NodeId, NodeId>,
 }
 
 impl Default for Document {
@@ -47,6 +57,9 @@ impl Document {
             limits,
             base_url: None,
             title: String::new(),
+            custom_elements: CustomElementRegistry::new(),
+            shadow_roots: HashMap::new(),
+            shadow_root_nodes: HashMap::new(),
         }
     }
 
@@ -59,6 +72,30 @@ impl Document {
     /// subsequent allocations and mutations respect the new values.
     pub fn set_limits(&mut self, limits: Limits) {
         self.limits = limits;
+    }
+
+    /// The custom element registry of this document.
+    ///
+    /// This is the Rust-side counterpart of `window.customElements`; the JS
+    /// host maps the opaque callback handles to its own function objects.
+    #[must_use]
+    pub fn custom_elements(&self) -> &CustomElementRegistry {
+        &self.custom_elements
+    }
+
+    /// Mutable access to the custom element registry.
+    pub fn custom_elements_mut(&mut self) -> &mut CustomElementRegistry {
+        &mut self.custom_elements
+    }
+
+    /// The registered definition for `node`'s tag name, if it is a defined
+    /// custom element.
+    ///
+    /// The JS host uses this to map a DOM node back to its constructor and
+    /// lifecycle callback handles.
+    #[must_use]
+    pub fn custom_element_definition(&self, node: NodeId) -> Option<&CustomElementDefinition> {
+        self.custom_elements.get(self.element_name(node)?)
     }
 
     /// The document root node.
@@ -78,7 +115,7 @@ impl Document {
 
     /// Allocates a new detached node, returning `None` when the node cap is
     /// reached.
-    fn try_alloc(&mut self, data: NodeData) -> Option<NodeId> {
+    pub(crate) fn try_alloc(&mut self, data: NodeData) -> Option<NodeId> {
         if self.nodes.len() >= self.limits.max_nodes {
             return None;
         }
@@ -501,6 +538,25 @@ mod tests {
         assert_eq!(doc.node(a).id, a);
         assert_eq!(doc.node(b).id, b);
         assert_eq!(doc.node(c).id, c);
+    }
+
+    #[test]
+    fn custom_element_registry_is_per_document() {
+        let mut doc = Document::new();
+        let element = doc.create_element("x-card");
+        let plain = doc.create_element("div");
+        assert!(doc.custom_element_definition(element).is_none());
+
+        let constructor = doc.custom_elements_mut().allocate_handle();
+        doc.custom_elements_mut()
+            .define("x-card", constructor)
+            .unwrap();
+        assert_eq!(
+            doc.custom_element_definition(element).unwrap().constructor,
+            constructor
+        );
+        assert!(doc.custom_element_definition(plain).is_none());
+        assert!(Document::new().custom_elements().is_empty());
     }
 
     #[test]

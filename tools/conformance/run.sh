@@ -7,7 +7,7 @@ cargo fmt --all -- --check
 echo "== check =="
 cargo check --workspace
 echo "== test =="
-cargo test --workspace
+cargo test --workspace -- --test-threads=1
 echo "== clippy =="
 cargo clippy --workspace --all-targets -- -D warnings
 echo "OK"

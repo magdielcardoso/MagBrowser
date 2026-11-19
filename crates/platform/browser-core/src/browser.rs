@@ -138,6 +138,10 @@ impl Browser {
             user_agent: settings.user_agent.clone(),
             timeout: request_timeout,
             max_body_bytes: settings.max_body_bytes,
+            request: browser_http::RequestConfig {
+                viewport_width: settings.viewport_width.max(1.0).round() as u32,
+                ..browser_http::RequestConfig::default()
+            },
             ..ClientConfig::default()
         };
         let size = settings.viewport();
@@ -578,7 +582,18 @@ impl Browser {
 
     /// Scrolls the container under a point by `delta` pixels.
     pub fn scroll_at(&mut self, x: f32, y: f32, delta: f32) -> bool {
-        self.tab_mut().page.scroll_at(x, y, 0.0, delta)
+        let scrolled = self.tab_mut().page.scroll_at(x, y, 0.0, delta);
+        if scrolled {
+            let host = self.page().host.clone();
+            if let Some(host) = host {
+                crate::script::notify_observers(self.page(), &host);
+                if let Some(runtime) = self.tab_mut().page.runtime.as_mut() {
+                    browser_web_apis::deliver_observer_callbacks(runtime, &host);
+                    let _ = runtime.run_microtasks();
+                }
+            }
+        }
+        scrolled
     }
 
     /// Current page snapshot.

@@ -10,9 +10,10 @@
 //! * Root `<svg>` with `width`, `height`, `viewBox` and `preserveAspectRatio`.
 //! * Shape elements `<rect>` (with `rx`/`ry`), `<circle>`, `<ellipse>`,
 //!   `<line>`, `<polyline>`, `<polygon>` and `<path>`.
-//! * Path commands `M`, `L`, `H`, `V`, `C`, `Q` and `Z` (both cases). Cubic and
-//!   quadratic Bézier segments are flattened into line segments. Other
-//!   commands (including arcs and shorthand curves) are rejected.
+//! * Path commands `M`, `L`, `H`, `V`, `C`, `S`, `Q`, `A` and `Z` (both cases).
+//!   Cubic and quadratic Bézier segments and elliptical arcs (endpoint-to-center
+//!   parameterisation with adaptive flattening) are converted to line segments.
+//!   Other commands (for example `T`) are rejected.
 //! * Presentation attributes `fill`, `stroke`, `stroke-width`, `opacity`,
 //!   `fill-opacity`, `stroke-opacity` and `fill-rule`, either as attributes or
 //!   inside a `style="..."` property list. Group attributes are inherited.
@@ -1042,12 +1043,32 @@ struct Path {
 enum Token {
     Command(u8),
     Number(f32),
+    /// A single-digit arc flag (`0` or `1`). Flags are tokenised separately
+    /// from ordinary numbers so adjacent flags such as `01` are not read as
+    /// the number `1`.
+    Flag(u8),
+}
+
+/// Number of arguments per repetition of each path command. Only arcs need
+/// special handling while tokenising (their 4th and 5th arguments are flags).
+fn args_per_command(command: u8) -> usize {
+    match command.to_ascii_uppercase() {
+        b'M' | b'L' | b'Q' | b'S' | b'T' => 2,
+        b'H' | b'V' => 1,
+        b'C' => 6,
+        b'A' => 7,
+        _ => 0,
+    }
 }
 
 fn tokenize_path(data: &str) -> Result<Vec<Token>, DecodeError> {
     let bytes = data.as_bytes();
     let mut pos = 0;
     let mut out = Vec::new();
+    // Track which argument of the current command we are reading so arc flags
+    // can be scanned as single digits (SVG allows `A 5 5 0 0110 10`).
+    let mut command: Option<u8> = None;
+    let mut arg: usize = 0;
     while pos < bytes.len() {
         let byte = bytes[pos];
         if byte.is_ascii_whitespace() || byte == b',' {
@@ -1056,10 +1077,36 @@ fn tokenize_path(data: &str) -> Result<Vec<Token>, DecodeError> {
         }
         if byte.is_ascii_alphabetic() {
             out.push(Token::Command(byte));
+            command = if byte.eq_ignore_ascii_case(&b'z') {
+                None
+            } else {
+                Some(byte.to_ascii_uppercase())
+            };
+            arg = 0;
             pos += 1;
             continue;
         }
-        out.push(Token::Number(scan_number(bytes, &mut pos)?));
+        let flag = command == Some(b'A') && matches!(arg, 3 | 4);
+        if flag {
+            match byte {
+                b'0' | b'1' => {
+                    out.push(Token::Flag(byte - b'0'));
+                    pos += 1;
+                }
+                other => {
+                    return Err(err(format!("invalid arc flag '{}'", other as char)));
+                }
+            }
+        } else {
+            out.push(Token::Number(scan_number(bytes, &mut pos)?));
+        }
+        arg += 1;
+        if let Some(cmd) = command {
+            let count = args_per_command(cmd);
+            if count > 0 && arg >= count {
+                arg = 0;
+            }
+        }
     }
     Ok(out)
 }
@@ -1071,6 +1118,22 @@ fn take_number(tokens: &[Token], pos: &mut usize) -> Result<f32, DecodeError> {
             Ok(*value)
         }
         _ => Err(err("path command is missing a number")),
+    }
+}
+
+/// Reads an arc flag. Well-formed data yields a `Flag` token, but accept a
+/// plain `0`/`1` number too for tolerance of upstream tokenisation changes.
+fn take_flag(tokens: &[Token], pos: &mut usize) -> Result<bool, DecodeError> {
+    match tokens.get(*pos) {
+        Some(Token::Flag(value)) => {
+            *pos += 1;
+            Ok(*value != 0)
+        }
+        Some(Token::Number(value)) if *value == 0.0 || *value == 1.0 => {
+            *pos += 1;
+            Ok(*value != 0.0)
+        }
+        _ => Err(err("arc flag must be 0 or 1")),
     }
 }
 
@@ -1124,12 +1187,110 @@ fn flatten_quadratic(p0: Point, p1: Point, p2: Point, out: &mut Vec<Point>) {
     }
 }
 
+/// Parameters of one `A` command, excluding its endpoints.
+struct ArcParams {
+    rx: f32,
+    ry: f32,
+    rotation: f32,
+    large: bool,
+    sweep: bool,
+}
+
+/// Flattens an elliptical arc from `start` to `end` into line segments.
+///
+/// Uses the endpoint-to-center conversion from the SVG 1.1 spec (F.6.5):
+/// radii too small to span the endpoints are corrected, then the arc is
+/// parameterised by angle and subdivided adaptively (the angular step shrinks
+/// for larger ellipses so long arcs get more segments).
+fn flatten_arc(start: Point, end: Point, arc: ArcParams, out: &mut Vec<Point>) {
+    if out.is_empty() {
+        out.push(start);
+    }
+    if start == end || arc.rx == 0.0 || arc.ry == 0.0 {
+        if start != end {
+            out.push(end);
+        }
+        return;
+    }
+
+    let (mut rx, mut ry) = (arc.rx.abs(), arc.ry.abs());
+    let (sin_phi, cos_phi) = arc.rotation.to_radians().sin_cos();
+
+    // Rotate the midpoint vector into the ellipse's axis-aligned frame.
+    let dx = (start.0 - end.0) / 2.0;
+    let dy = (start.1 - end.1) / 2.0;
+    let x1 = cos_phi * dx + sin_phi * dy;
+    let y1 = -sin_phi * dx + cos_phi * dy;
+
+    // Radii correction: scale both radii up until the arc can join the ends.
+    let lambda = x1 * x1 / (rx * rx) + y1 * y1 / (ry * ry);
+    if lambda > 1.0 {
+        let scale = lambda.sqrt();
+        rx *= scale;
+        ry *= scale;
+    }
+
+    let numerator = rx * rx * ry * ry - rx * rx * y1 * y1 - ry * ry * x1 * x1;
+    let denominator = rx * rx * y1 * y1 + ry * ry * x1 * x1;
+    let ratio = if denominator > 0.0 {
+        (numerator / denominator).max(0.0)
+    } else {
+        0.0
+    };
+    let sign = if arc.large == arc.sweep { -1.0 } else { 1.0 };
+    let coef = sign * ratio.sqrt();
+
+    // Center in the rotated frame, then in user space.
+    let cx1 = coef * rx * y1 / ry;
+    let cy1 = coef * -ry * x1 / rx;
+    let cx = cos_phi * cx1 - sin_phi * cy1 + (start.0 + end.0) / 2.0;
+    let cy = sin_phi * cx1 + cos_phi * cy1 + (start.1 + end.1) / 2.0;
+
+    // Start angle and signed sweep in the ellipse parameter space.
+    let ux = (x1 - cx1) / rx;
+    let uy = (y1 - cy1) / ry;
+    let vx = (-x1 - cx1) / rx;
+    let vy = (-y1 - cy1) / ry;
+    let theta1 = uy.atan2(ux);
+    let mut delta = (ux * vy - uy * vx).atan2(ux * vx + uy * vy);
+    if !arc.sweep && delta > 0.0 {
+        delta -= std::f32::consts::TAU;
+    } else if arc.sweep && delta < 0.0 {
+        delta += std::f32::consts::TAU;
+    }
+
+    // A chord spanning `tolerance` user units (~a fraction of a pixel in the
+    // common 1:1 case) is accurate enough for rasterisation. Clamp the step so
+    // tiny ellipses still get a usable number of segments.
+    let max_radius = rx.max(ry);
+    let tolerance = 0.25;
+    let step = if max_radius > tolerance {
+        2.0 * (1.0 - tolerance / max_radius).acos()
+    } else {
+        std::f32::consts::FRAC_PI_2
+    }
+    .clamp(0.02, std::f32::consts::FRAC_PI_4);
+    let segments = (delta.abs() / step).ceil().max(1.0) as usize;
+
+    for index in 1..=segments {
+        let theta = theta1 + delta * index as f32 / segments as f32;
+        let (sin_t, cos_t) = theta.sin_cos();
+        out.push((
+            cos_phi * rx * cos_t - sin_phi * ry * sin_t + cx,
+            sin_phi * rx * cos_t + cos_phi * ry * sin_t + cy,
+        ));
+    }
+}
+
 fn parse_path_data(data: &str) -> Result<Path, DecodeError> {
     let tokens = tokenize_path(data)?;
     let mut subs = Vec::new();
     let mut current: Vec<Point> = Vec::new();
     let mut cur: Point = (0.0, 0.0);
     let mut start: Point = (0.0, 0.0);
+    // Second control point of the most recent C/S command, used by S to
+    // reflect the implied first control point about the current point.
+    let mut last_ctrl: Option<Point> = None;
     let mut command: Option<u8> = None;
     let mut pos = 0;
 
@@ -1139,6 +1300,7 @@ fn parse_path_data(data: &str) -> Result<Path, DecodeError> {
             if c.eq_ignore_ascii_case(&b'z') {
                 flush_closed(&mut subs, &mut current);
                 cur = start;
+                last_ctrl = None;
                 command = None;
                 continue;
             }
@@ -1146,7 +1308,8 @@ fn parse_path_data(data: &str) -> Result<Path, DecodeError> {
         }
         let cmd = command.ok_or_else(|| err("path data starts with coordinates"))?;
         let relative = cmd.is_ascii_lowercase();
-        match cmd.to_ascii_uppercase() {
+        let upper = cmd.to_ascii_uppercase();
+        match upper {
             b'M' => {
                 let x = take_number(&tokens, &mut pos)?;
                 let y = take_number(&tokens, &mut pos)?;
@@ -1187,6 +1350,28 @@ fn parse_path_data(data: &str) -> Result<Path, DecodeError> {
                 };
                 flatten_cubic(cur, p1, p2, p3, &mut current);
                 cur = p3;
+                last_ctrl = Some(p2);
+            }
+            b'S' => {
+                let x2 = take_number(&tokens, &mut pos)?;
+                let y2 = take_number(&tokens, &mut pos)?;
+                let x = take_number(&tokens, &mut pos)?;
+                let y = take_number(&tokens, &mut pos)?;
+                let p2 = if relative {
+                    add(cur, (x2, y2))
+                } else {
+                    (x2, y2)
+                };
+                let p3 = if relative { add(cur, (x, y)) } else { (x, y) };
+                // The first control point is the previous second control
+                // point reflected about the current point (or the current
+                // point itself when there was no preceding C/S).
+                let p1 = last_ctrl
+                    .map(|c| (2.0 * cur.0 - c.0, 2.0 * cur.1 - c.1))
+                    .unwrap_or(cur);
+                flatten_cubic(cur, p1, p2, p3, &mut current);
+                cur = p3;
+                last_ctrl = Some(p2);
             }
             b'Q' => {
                 let x1 = take_number(&tokens, &mut pos)?;
@@ -1201,9 +1386,35 @@ fn parse_path_data(data: &str) -> Result<Path, DecodeError> {
                 flatten_quadratic(cur, p1, p2, &mut current);
                 cur = p2;
             }
+            b'A' => {
+                let rx = take_number(&tokens, &mut pos)?;
+                let ry = take_number(&tokens, &mut pos)?;
+                let rotation = take_number(&tokens, &mut pos)?;
+                let large = take_flag(&tokens, &mut pos)?;
+                let sweep = take_flag(&tokens, &mut pos)?;
+                let x = take_number(&tokens, &mut pos)?;
+                let y = take_number(&tokens, &mut pos)?;
+                let end = if relative { add(cur, (x, y)) } else { (x, y) };
+                flatten_arc(
+                    cur,
+                    end,
+                    ArcParams {
+                        rx,
+                        ry,
+                        rotation,
+                        large,
+                        sweep,
+                    },
+                    &mut current,
+                );
+                cur = end;
+            }
             other => {
                 return Err(err(format!("unsupported path command '{}'", other as char)));
             }
+        }
+        if !matches!(upper, b'C' | b'S') {
+            last_ctrl = None;
         }
     }
     flush_open(&mut subs, &mut current);
@@ -2141,13 +2352,99 @@ mod tests {
 
     #[test]
     fn rejects_unsupported_path_commands() {
+        // `T` (smooth quadratic) is still unsupported; `S` and `A` are.
         let error = rasterize(
             "<svg width='4' height='4'>\
-             <path d='M0 0 A2 2 0 0 1 4 4' fill='red'/>\
+             <path d='M0 0 T4 4' fill='red'/>\
              </svg>",
         )
-        .expect_err("arcs are not supported");
-        assert!(error.message.contains("'A'"));
+        .expect_err("T is not supported");
+        assert!(error.message.contains("'T'"));
+    }
+
+    /// Compares the flattened points of two path strings with a tolerance.
+    fn assert_same_points(a: &str, b: &str) {
+        let left = parse_path_data(a).expect("left path");
+        let right = parse_path_data(b).expect("right path");
+        assert_eq!(left.subs.len(), right.subs.len(), "sub-path count");
+        for (sub_a, sub_b) in left.subs.iter().zip(&right.subs) {
+            assert_eq!(sub_a.pts.len(), sub_b.pts.len(), "point count");
+            for (p, q) in sub_a.pts.iter().zip(&sub_b.pts) {
+                assert!(
+                    (p.0 - q.0).abs() < 1e-3 && (p.1 - q.1).abs() < 1e-3,
+                    "points differ: {p:?} vs {q:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn smooth_cubic_reflects_previous_control_point() {
+        // S continues a C by reflecting (10, 10) about (20, 10) -> (30, 10).
+        assert_same_points(
+            "M0 0 C10 0 10 10 20 10 S30 0 40 0",
+            "M0 0 C10 0 10 10 20 10 C30 10 30 0 40 0",
+        );
+        // With no preceding curve, S uses the current point as p1.
+        assert_same_points("M0 0 S10 10 20 0", "M0 0 C0 0 10 10 20 0");
+        // A second S reflects the previous S's second control point.
+        assert_same_points(
+            "M0 0 S10 10 20 0 S30 -10 40 0",
+            "M0 0 C0 0 10 10 20 0 C30 -10 30 -10 40 0",
+        );
+    }
+
+    #[test]
+    fn relative_smooth_cubic_matches_absolute() {
+        assert_same_points(
+            "m5 5 c10 0 10 10 20 10 s10 -10 20 -10",
+            "M5 5 C15 5 15 15 25 15 S35 5 45 5",
+        );
+    }
+
+    #[test]
+    fn arc_semicircle_has_expected_geometry_and_pixels() {
+        // Sweep=1 in SVG's y-down space draws the upper half-disk.
+        let path = parse_path_data("M0 0 A10 10 0 0 1 20 0 Z").expect("semicircle");
+        let pts = &path.subs[0].pts;
+        let max_y = pts.iter().map(|p| p.1).fold(f32::NEG_INFINITY, f32::max);
+        let min_y = pts.iter().map(|p| p.1).fold(f32::INFINITY, f32::min);
+        let min_x = pts.iter().map(|p| p.0).fold(f32::INFINITY, f32::min);
+        let max_x = pts.iter().map(|p| p.0).fold(f32::NEG_INFINITY, f32::max);
+        assert!((min_x - 0.0).abs() < 0.1 && (max_x - 20.0).abs() < 0.1);
+        assert!(
+            (min_y + 10.0).abs() < 0.1,
+            "top should reach y=-10: {min_y}"
+        );
+        assert!(max_y.abs() < 0.1, "bottom should be y=0: {max_y}");
+
+        let image = render(
+            "<svg width='24' height='14' viewBox='-2 -12 24 14'>\
+               <path d='M0 0 A10 10 0 0 1 20 0 Z' fill='red'/>\
+             </svg>",
+        );
+        assert_eq!(image.pixel(12, 6), [255, 0, 0, 255]);
+        assert_eq!(image.pixel(12, 12), [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn arc_flags_radii_and_relative_variants() {
+        // Radii too small are scaled up to the minimum circle.
+        assert_same_points("M0 0 A5 5 0 0 1 20 0", "M0 0 A10 10 0 0 1 20 0");
+        // sweep=0 mirrors the semicircle below the x axis.
+        let lower = parse_path_data("M0 0 A10 10 0 0 0 20 0").expect("lower arc");
+        let max_y = lower.subs[0]
+            .pts
+            .iter()
+            .map(|p| p.1)
+            .fold(f32::NEG_INFINITY, f32::max);
+        assert!(
+            (max_y - 10.0).abs() < 0.1,
+            "bottom should reach y=10: {max_y}"
+        );
+        // compact flags and relative coordinates describe the same arc.
+        assert_same_points("M0 0 A10 10 0 0110 0", "M0 0 a10 10 0 0 1 10 0");
+        assert_same_points("m2 3 a10 5 30 0 1 12 4", "M2 3 A10 5 30 0 1 14 7");
     }
 
     #[test]

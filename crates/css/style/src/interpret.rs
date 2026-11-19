@@ -35,6 +35,23 @@ impl Default for InterpretContext {
     }
 }
 
+/// Interprets a lone `env()` or `attr()` call as an opaque string.
+///
+/// The engine does not resolve environment variables or attribute references
+/// into typed values. Rather than dropping such declarations, callers can use
+/// this helper to expose the authored text as a [`ComputedValue::Str`] on
+/// properties that accept raw text. Returns `None` for every other value.
+#[must_use]
+pub fn env_or_attr(value: &Value) -> Option<ComputedValue> {
+    let [ComponentValue::Function(name, _)] = value.components.as_slice() else {
+        return None;
+    };
+    if !matches!(name.to_ascii_lowercase().as_str(), "env" | "attr") {
+        return None;
+    }
+    Some(ComputedValue::Str(raw_value_text(value)))
+}
+
 /// Interprets one longhand declaration.
 pub fn interpret(
     property: Property,
@@ -406,6 +423,19 @@ pub fn interpret(
             Some(ComputedValue::ObjectFit(fit))
         }
         Property::Filter => Some(ComputedValue::Filter(parse_filter(value, ctx)?)),
+        // Logical and scrollbar properties are resolved to physical sides by
+        // the layout layer; keep their authored text here.
+        Property::MarginInlineStart
+        | Property::MarginInlineEnd
+        | Property::PaddingInlineStart
+        | Property::PaddingInlineEnd
+        | Property::BorderInlineStartWidth
+        | Property::BorderInlineEndWidth
+        | Property::InsetInlineStart
+        | Property::InsetInlineEnd
+        | Property::InlineSize
+        | Property::BlockSize
+        | Property::ScrollbarWidth => Some(ComputedValue::Str(raw_value_text(value))),
     }
 }
 

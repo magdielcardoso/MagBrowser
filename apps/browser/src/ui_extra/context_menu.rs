@@ -4,6 +4,9 @@
 //! actions the menu offers, where each item sits, and which action a click
 //! lands on. No winit or wgpu types are used.
 
+// A framework-agnostic model: not every accessor is used by the window shell.
+#![allow(dead_code)]
+
 /// Actions offered by the page context menu.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ContextAction {

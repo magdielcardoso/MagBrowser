@@ -2,6 +2,7 @@
 
 use crate::document::Document;
 use crate::node::NodeId;
+use crate::shadow::push_shadow_roots;
 
 impl Document {
     /// Parent of a node.
@@ -54,6 +55,9 @@ impl Document {
     }
 
     /// Pre-order traversal of `id`'s subtree, excluding `id`.
+    ///
+    /// Shadow trees attached to any node in the subtree are included, so
+    /// style and layout see shadow content through the normal traversal path.
     pub fn descendants(&self, id: NodeId) -> Descendants<'_> {
         let stack: Vec<NodeId> = self.node(id).children.iter().rev().copied().collect();
         Descendants { doc: self, stack }
@@ -69,7 +73,7 @@ impl Document {
             .collect()
     }
 
-    /// Every element in document order (pre-order).
+    /// Every element in document order (pre-order), including shadow trees.
     pub fn elements_in_order(&self) -> Vec<NodeId> {
         self.descendants(self.root())
             .filter(|id| self.node(*id).is_element())
@@ -146,7 +150,13 @@ impl Iterator for Ancestors<'_> {
 
     fn next(&mut self) -> Option<Self::Item> {
         let id = self.current?;
-        self.current = self.doc.node(id).parent;
+        // A shadow root arena node has no parent of its own; logically its
+        // parent is the host element, so inherited styles and :host-context()
+        // continue into the light tree.
+        self.current = self
+            .doc
+            .shadow_root_host(id)
+            .or_else(|| self.doc.node(id).parent);
         Some(id)
     }
 }
@@ -162,6 +172,10 @@ impl Iterator for Descendants<'_> {
 
     fn next(&mut self) -> Option<Self::Item> {
         let id = self.stack.pop()?;
+        // Light children are pushed last so they are visited before the
+        // shadow tree; this keeps ordinary document order unchanged when no
+        // shadow roots are present.
+        push_shadow_roots(self.doc, id, &mut self.stack);
         let children = &self.doc.node(id).children;
         for child in children.iter().rev() {
             self.stack.push(*child);
@@ -200,6 +214,43 @@ mod tests {
         assert_eq!(doc.last_child(body), Some(b));
         assert_eq!(doc.elements_in_order(), vec![html, body, a, b]);
         assert_eq!(doc.parent_element(a), Some(body));
+    }
+
+    #[test]
+    fn traversal_includes_shadow_content_and_hosts() {
+        let mut doc = Document::new();
+        let html = doc.create_element("html");
+        let host = doc.create_element("x-card");
+        doc.append_child(doc.root(), html);
+        doc.append_child(html, host);
+
+        let light = doc.create_element("span");
+        doc.append_child(host, light);
+        let root = doc
+            .attach_shadow(host, crate::ShadowRootMode::Open)
+            .unwrap();
+        let shadow_child = doc.create_element("p");
+        let shadow_text = doc.create_text("inside");
+        doc.append_child(root, shadow_child);
+        doc.append_child(shadow_child, shadow_text);
+
+        // Descendants of the document include both light and shadow content.
+        assert_eq!(
+            doc.descendants(doc.root()).collect::<Vec<_>>(),
+            vec![html, host, light, shadow_child, shadow_text]
+                .into_iter()
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            doc.elements_in_order(),
+            vec![html, host, light, shadow_child]
+        );
+
+        // Ancestors of shadow content continue through the host into the light tree.
+        assert_eq!(
+            doc.ancestors(shadow_text).collect::<Vec<_>>(),
+            vec![shadow_child, root, host, html, doc.root()]
+        );
     }
 
     #[test]

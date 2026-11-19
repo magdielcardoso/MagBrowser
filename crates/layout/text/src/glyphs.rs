@@ -34,6 +34,27 @@ impl Glyph {
     }
 }
 
+/// One glyph produced by the shared layout engine, with its source byte range.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct LaidOutGlyph {
+    pub ch: char,
+    pub glyph_id: u16,
+    /// Byte offset of the first source character in the run's text.
+    pub byte_start: usize,
+    /// Byte offset just past the last source character (exclusive).
+    pub byte_end: usize,
+    pub x: f32,
+    /// Advance including kerning and letter/word spacing.
+    pub advance: f32,
+}
+
+/// A cluster of one or more consecutive source characters forming one glyph.
+struct Cluster {
+    start: usize,
+    end: usize,
+    glyph_id: u16,
+}
+
 /// The engine's embedded proportional typeface.
 #[derive(Debug)]
 pub struct Font {
@@ -104,6 +125,124 @@ impl Font {
         f32::from(self.face.advance(self.face.glyph_index(c))) * px / self.units_per_em()
     }
 
+    /// Pair kerning to apply to the advance of `a` when it is followed by `b`,
+    /// in pixels at size `px`. A negative value tightens the pair (e.g. `AV`).
+    ///
+    /// Values come from the font's GPOS `kern` data (or a legacy `kern` table).
+    pub fn kerning(&self, a: char, b: char, px: f32) -> f32 {
+        if px <= 0.0 {
+            return 0.0;
+        }
+        let ga = self.face.glyph_index(a);
+        let gb = self.face.glyph_index(b);
+        f32::from(self.face.kerning_units(ga, gb)) * px / self.units_per_em()
+    }
+
+    /// Glyph to draw for a character sequence, or `None` when no ligature
+    /// substitution applies. GSUB ligatures are preferred; the classic
+    /// `fi`/`fl`/`ff`/`ffi`/`ffl` forms fall back to their Unicode compatibility
+    /// code points, but only when this face resolves them to a distinct glyph
+    /// with an outline (this Inter build has no such outlines, so f-ligatures
+    /// are intentionally left unligated to match harfbuzz/Blink).
+    pub(crate) fn ligature_glyph(&self, chars: &[char]) -> Option<u16> {
+        let gids: Vec<u16> = chars.iter().map(|&c| self.face.glyph_index(c)).collect();
+        if let Some(gid) = self.face.ligature(&gids) {
+            return Some(gid);
+        }
+        let sequence: String = chars.iter().collect();
+        let cp = match sequence.as_str() {
+            "ffi" => 0xFB03,
+            "ffl" => 0xFB04,
+            "ff" => 0xFB00,
+            "fi" => 0xFB01,
+            "fl" => 0xFB02,
+            _ => return None,
+        };
+        let gid = self.face.glyph_index(char::from_u32(cp)?);
+        if gid == 0 || gids.contains(&gid) {
+            return None;
+        }
+        self.face
+            .outline_gid(gid)
+            .filter(|outline| !outline.is_empty())
+            .map(|_| gid)
+    }
+
+    /// Lays out `text` into positioned glyphs with byte ranges, applying
+    /// ligature substitution, pair kerning and letter/word spacing. This is the
+    /// single source of truth shared by [`Self::measure`] and
+    /// [`crate::shape`] so their widths always agree.
+    pub(crate) fn layout(
+        &self,
+        text: &str,
+        px: f32,
+        letter_spacing: f32,
+        word_spacing: f32,
+    ) -> Vec<LaidOutGlyph> {
+        if px <= 0.0 {
+            return Vec::new();
+        }
+        let upem = self.units_per_em();
+        let chars: Vec<(usize, char)> = text
+            .char_indices()
+            .filter(|&(_, ch)| !ch.is_control())
+            .collect();
+
+        // Group drawable characters into clusters, substituting the longest
+        // available ligature at each position.
+        let mut clusters: Vec<Cluster> = Vec::with_capacity(chars.len());
+        let mut i = 0;
+        while i < chars.len() {
+            let max = (chars.len() - i).min(4);
+            let mut matched = None;
+            for len in (2..=max).rev() {
+                let sequence: Vec<char> = chars[i..i + len].iter().map(|&(_, c)| c).collect();
+                if let Some(gid) = self.ligature_glyph(&sequence) {
+                    matched = Some((len, gid));
+                    break;
+                }
+            }
+            if let Some((len, gid)) = matched {
+                clusters.push(Cluster {
+                    start: i,
+                    end: i + len,
+                    glyph_id: gid,
+                });
+                i += len;
+            } else {
+                clusters.push(Cluster {
+                    start: i,
+                    end: i + 1,
+                    glyph_id: self.face.glyph_index(chars[i].1),
+                });
+                i += 1;
+            }
+        }
+
+        let mut x = 0.0;
+        let mut positioned = Vec::with_capacity(clusters.len());
+        for (index, cluster) in clusters.iter().enumerate() {
+            let first = chars[cluster.start];
+            let last = chars[cluster.end - 1];
+            let base = f32::from(self.face.advance(cluster.glyph_id)) * px / upem;
+            let kern = clusters.get(index + 1).map_or(0.0, |next| {
+                f32::from(self.face.kerning_units(cluster.glyph_id, next.glyph_id)) * px / upem
+            });
+            let spacing = letter_spacing + if first.1 == ' ' { word_spacing } else { 0.0 };
+            let advance = base + kern + spacing;
+            positioned.push(LaidOutGlyph {
+                ch: first.1,
+                glyph_id: cluster.glyph_id,
+                byte_start: first.0,
+                byte_end: last.0 + last.1.len_utf8(),
+                x,
+                advance,
+            });
+            x += advance;
+        }
+        positioned
+    }
+
     /// Line height in pixels (ascender + descender + line gap).
     pub fn line_height(&self, px: f32) -> f32 {
         if px <= 0.0 {
@@ -129,9 +268,27 @@ impl Font {
         f32::from((-self.face.descender).max(0)) * px / self.units_per_em()
     }
 
-    /// Sum of advances for every character in `text`, in pixels.
+    /// Width of `text` in pixels, including pair kerning and ligatures.
+    ///
+    /// This is the same value as [`crate::shape`]'s `width`, so layout and
+    /// painting agree on how wide a run is.
     pub fn measure(&self, text: &str, px: f32) -> f32 {
-        text.chars().map(|c| self.advance(c, px)).sum()
+        self.measure_with_spacing(text, px, 0.0, 0.0)
+    }
+
+    /// Width of `text` in pixels with CSS-style `letter_spacing` and
+    /// `word_spacing` applied (both in pixels).
+    pub fn measure_with_spacing(
+        &self,
+        text: &str,
+        px: f32,
+        letter_spacing: f32,
+        word_spacing: f32,
+    ) -> f32 {
+        self.layout(text, px, letter_spacing, word_spacing)
+            .iter()
+            .map(|glyph| glyph.advance)
+            .sum()
     }
 
     /// Sum of advances for `text[start..end]` in pixels.

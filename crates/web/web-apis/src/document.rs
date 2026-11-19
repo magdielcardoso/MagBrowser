@@ -226,7 +226,27 @@ fn install_accessors(runtime: &mut Runtime, state: &Rc<RefCell<HostState>>, obje
             Box::new(move |_runtime, _this, args| {
                 let title = args.first().map(Value::to_string_value).unwrap_or_default();
                 let document = state.borrow().document.clone();
-                document.borrow_mut().title = title;
+                // If the document has a <title> element, updating document.title
+                // is a characterData change on its text node. Record it so
+                // MutationObservers observing the head see the update.
+                let title_text = {
+                    let document = document.borrow();
+                    document
+                        .get_elements_by_tag_name("title")
+                        .into_iter()
+                        .next()
+                        .and_then(|node| document.first_child(node))
+                };
+                if let Some(text_node) = title_text {
+                    let old_value = document.borrow().text_content(text_node);
+                    document.borrow_mut().title = title;
+                    crate::observers::record_mutation(
+                        &state,
+                        crate::observers::Mutation::character_data(text_node, Some(old_value)),
+                    );
+                } else {
+                    document.borrow_mut().title = title;
+                }
                 Ok(Value::Undefined)
             })
         },

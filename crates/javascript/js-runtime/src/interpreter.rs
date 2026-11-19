@@ -193,6 +193,7 @@ impl crate::Runtime {
                 right,
                 body,
                 is_of,
+                ..
             } => self.exec_for_in(left, right, *is_of, body, label),
             Stmt::Break(name) => Ok(Completion::Break(name.clone())),
             Stmt::Continue(name) => Ok(Completion::Continue(name.clone())),
@@ -1271,27 +1272,11 @@ impl crate::Runtime {
         let outcome = (|| -> Result<Value, JsError> {
             let constructor = self.eval_expr(callee)?;
             self.temp_roots.push(constructor.clone());
-            if !self.is_callable(&constructor) {
-                return Err(JsError::type_error(format!(
-                    "{} is not a constructor",
-                    constructor.to_string_value()
-                )));
-            }
-            let prototype = match self.get_property_checked(&constructor, "prototype")? {
-                Value::Object(id) => Some(id),
-                _ => Some(self.prototypes.object),
-            };
-            let instance = Value::Object(self.alloc_object(ObjectKind::Ordinary, prototype));
-            self.temp_roots.push(instance.clone());
             let args = self.eval_arguments(arguments)?;
             for value in &args {
                 self.temp_roots.push(value.clone());
             }
-            let result = self.call_function(&constructor, instance.clone(), args)?;
-            match result {
-                Value::Object(_) => Ok(result),
-                _ => Ok(instance),
-            }
+            self.construct_value(constructor.clone(), args, constructor)
         })();
         self.temp_roots.truncate(mark);
         outcome
@@ -1634,6 +1619,7 @@ impl crate::Runtime {
                 Some(ObjectKind::Function(_)) => "function",
                 Some(ObjectKind::Symbol(_)) => "symbol",
                 Some(ObjectKind::Generator(_)) => "object",
+                Some(ObjectKind::Proxy { target, .. }) if self.is_callable(target) => "function",
                 _ => "object",
             },
             other => other.type_of(),

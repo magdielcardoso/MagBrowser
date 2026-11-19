@@ -23,8 +23,11 @@ pub mod damage;
 pub mod layers;
 pub mod tiles;
 
-pub use animations::{Animation, AnimationTimeline, Easing};
+pub use animations::{
+    AnimatedValue, Animation, AnimationClock, AnimationDirection, AnimationTimeline, Easing,
+    FillMode, IterationCount, Keyframe, KeyframeAnimation, PlayState, RgbaColor, StepPosition,
+};
 pub use clipping::ClipStack;
 pub use damage::Damage;
-pub use layers::{Layer, LayerId, LayerTree};
+pub use layers::{Layer, LayerComposite, LayerId, LayerTree};
 pub use tiles::{MAX_TILES, TileGrid};

@@ -16,41 +16,131 @@
 //!   cells occupied by explicitly placed items.
 //! - `gap`, `row-gap` and `column-gap`; per-track `auto` sizing from items.
 //! - `minmax(min, max)`: a flexible (`Nfr`) or definite (length / percentage)
-//!   `max` determines the track size; intrinsic maxima (and `fit-content()`,
-//!   `min-content`, `max-content`) are modelled as `auto`.
+//!   `max` determines the track size. A definite `min` on a flexible `max`
+//!   (`minmax(100px, 1fr)`) is honoured as a floor. Intrinsic maxima (and
+//!   `fit-content()`, `min-content`, `max-content`) are modelled as `auto`.
 //! - Item alignment: `justify-items` / `align-items` on the container and
 //!   `justify-self` / `align-self` on items (`start`, `center`, `end`,
 //!   `stretch`).
+//! - Whole-track content distribution: `justify-content` / `align-content`
+//!   (`start`, `end`, `center`, `space-between`, `space-around`,
+//!   `space-evenly`, `stretch`) when the tracks do not fill the container.
+//!   `stretch` grows `auto`-sized tracks; other values change gaps/offsets.
+//! - `grid-auto-flow: dense` backfills holes left by explicitly placed items.
+//! - `subgrid` for `grid-template-columns` / `grid-template-rows`: the axis
+//!   inherits the explicit track lines (and gutter) of the nearest grid
+//!   ancestor.
+//! - `auto` tracks use the min-content and max-content contributions of their
+//!   items; contributions from spanning items are distributed over the tracks
+//!   they cross.
 //!
 //! Placement, track lists, gaps and alignment are all read from computed
 //! style, so they work from stylesheets as well as inline `style` attributes.
 //!
 //! Limitations:
-//! - Dense packing, baseline alignment and `subgrid` are not implemented.
-//!   Intrinsic track keywords (`fit-content`, `min-content`, `max-content`)
-//!   behave as `auto`. Malformed track lists fall back to a single `auto`
-//!   column instead of failing.
+//! - Baseline alignment is not implemented. Intrinsic track keywords
+//!   (`fit-content`, `min-content`, `max-content`) behave as `auto` for the
+//!   track itself; only item contributions are measured. Malformed track lists
+//!   fall back to a single `auto` column instead of failing.
+//! - The style engine does not expose `grid` / `grid-template` shorthands (they
+//!   are not registered properties), so the longhands must be declared:
+//!   `grid-template-columns`, `grid-template-rows`, `grid-template-areas`,
+//!   `grid-auto-flow`, `grid-auto-rows` / `grid-auto-columns`.
+//! - `subgrid` inherits the parent's declared track list and resolves flexible
+//!   tracks against the child's own content box. Subgrids spanning only part
+//!   of the parent, and parent track sizing influenced by subgrid content, are
+//!   not modelled. Implicit tracks of the parent are not inherited.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use browser_dom::Document;
 use browser_style::interpret::is_intrinsic_sizing;
-use browser_style::{AlignItems, BoxSizing, ComputedValue, Dim, Property};
+use browser_style::{AlignItems, BoxSizing, ComputedValue, Dim, Property, Side};
 
 use crate::block::{layout_box, resolve, shrink_to_fit};
 use crate::position::translate_subtree;
-use crate::tree::LayoutTree;
+use crate::tree::{BoxType, LayoutTree};
 
 /// Upper bound on generated tracks, so `repeat(999999, 1fr)` cannot allocate
 /// without limit.
 const MAX_TRACKS: usize = 256;
 
+/// A definite floor carried by a flexible (`minmax(min, Nfr)`) track.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum FrMin {
+    Px(f32),
+    Percent(f32),
+}
+
+impl FrMin {
+    fn resolve(self, base: f32) -> f32 {
+        match self {
+            FrMin::Px(px) => px.max(0.0),
+            FrMin::Percent(percent) => (base * percent / 100.0).max(0.0),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Track {
     Fixed(f32),
     Percent(f32),
+    /// A flexible track without a definite minimum.
     Fr(f32),
+    /// A flexible track whose `minmax` minimum must be honoured.
+    FrMin(f32, FrMin),
     Auto,
+}
+
+/// Distribution of free space between/around a set of grid tracks, as selected
+/// by `justify-content` (inline axis) or `align-content` (block axis).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ContentAlign {
+    Start,
+    End,
+    Center,
+    SpaceBetween,
+    SpaceAround,
+    SpaceEvenly,
+    Stretch,
+}
+
+fn content_align(value: Option<&str>) -> ContentAlign {
+    match value.unwrap_or("").trim().to_ascii_lowercase().as_str() {
+        "start" | "flex-start" => ContentAlign::Start,
+        "end" | "flex-end" => ContentAlign::End,
+        "center" => ContentAlign::Center,
+        "space-between" => ContentAlign::SpaceBetween,
+        "space-around" => ContentAlign::SpaceAround,
+        "space-evenly" => ContentAlign::SpaceEvenly,
+        "stretch" | "normal" => ContentAlign::Stretch,
+        // An unset `justify-content` reads back as `None`; grid's initial
+        // `normal` behaves as `stretch` (growing `auto` tracks only).
+        _ => ContentAlign::Stretch,
+    }
+}
+
+/// Returns the leading offset and the extra gap for content distribution.
+/// `stretch` is handled separately because it grows tracks, not gaps.
+fn distribute(align: ContentAlign, free: f32, count: usize) -> (f32, f32) {
+    if count == 0 {
+        return (0.0, 0.0);
+    }
+    match align {
+        ContentAlign::Start | ContentAlign::Stretch => (0.0, 0.0),
+        ContentAlign::End => (free, 0.0),
+        ContentAlign::Center => (free / 2.0, 0.0),
+        ContentAlign::SpaceBetween if count > 1 => (0.0, free / (count - 1) as f32),
+        ContentAlign::SpaceBetween => (0.0, 0.0),
+        ContentAlign::SpaceAround => {
+            let each = free / count as f32;
+            (each / 2.0, each)
+        }
+        ContentAlign::SpaceEvenly => {
+            let each = free / (count + 1) as f32;
+            (each, each)
+        }
+    }
 }
 
 /// A parsed track list together with the line names declared around tracks.
@@ -163,14 +253,46 @@ pub fn layout_grid(tree: &mut LayoutTree, doc: &Document, index: usize) -> f32 {
         .copied()
         .filter(|child| !crate::tree::is_ignorable_child(tree, *child))
         .collect();
-    let column_gap = style.column_gap().max(0.0);
-    let row_gap = style.row_gap().max(0.0);
     let available = content.width.max(0.0);
     let item_count = children.len();
 
-    // --- Templates ---------------------------------------------------------
-    let mut col_tracks = parse_track_list(style.grid_template_columns().as_deref());
-    let mut row_tracks = parse_track_list(style.grid_template_rows().as_deref());
+    // --- Templates (including `subgrid` inheritance) -----------------------
+    let col_is_subgrid = is_subgrid(style.grid_template_columns().as_deref());
+    let row_is_subgrid = is_subgrid(style.grid_template_rows().as_deref());
+    let (mut col_tracks, inherited_col_gap) = if col_is_subgrid {
+        inherited_axis_tracks(tree, index, true)
+            .map(|(tracks, gap)| (tracks, Some(gap)))
+            .unwrap_or_else(|| {
+                (
+                    parse_track_list(style.grid_template_columns().as_deref()),
+                    None,
+                )
+            })
+    } else {
+        (
+            parse_track_list(style.grid_template_columns().as_deref()),
+            None,
+        )
+    };
+    let (mut row_tracks, inherited_row_gap) = if row_is_subgrid {
+        inherited_axis_tracks(tree, index, false)
+            .map(|(tracks, gap)| (tracks, Some(gap)))
+            .unwrap_or_else(|| {
+                (
+                    parse_track_list(style.grid_template_rows().as_deref()),
+                    None,
+                )
+            })
+    } else {
+        (
+            parse_track_list(style.grid_template_rows().as_deref()),
+            None,
+        )
+    };
+    // A subgrid uses the parent's gutters on the inherited axis.
+    let column_gap = inherited_col_gap.unwrap_or_else(|| style.column_gap().max(0.0));
+    let row_gap = inherited_row_gap.unwrap_or_else(|| style.row_gap().max(0.0));
+
     if col_tracks.is_empty() {
         col_tracks.tracks.push(Track::Fr(1.0));
         ensure_line_names(&mut col_tracks, 1);
@@ -180,7 +302,14 @@ pub fn layout_grid(tree: &mut LayoutTree, doc: &Document, index: usize) -> f32 {
     }
 
     let areas = parse_grid_areas(style.grid_template_areas().as_deref());
-    inject_area_lines(&mut col_tracks, &mut row_tracks, &areas);
+    // A subgrid axis already carries its ancestor's line names; only inject
+    // area lines on axes declared locally.
+    if !col_is_subgrid {
+        inject_area_axis(&mut col_tracks, &areas, true);
+    }
+    if !row_is_subgrid {
+        inject_area_axis(&mut row_tracks, &areas, false);
+    }
 
     let mut auto_cols = parse_track_list(style.grid_auto_columns().as_deref()).tracks;
     let mut auto_rows = parse_track_list(style.grid_auto_rows().as_deref()).tracks;
@@ -190,11 +319,13 @@ pub fn layout_grid(tree: &mut LayoutTree, doc: &Document, index: usize) -> f32 {
     if auto_rows.is_empty() {
         auto_rows.push(Track::Auto);
     }
-    let auto_flow_column = style.grid_auto_flow().is_some_and(|value| {
-        value
-            .split_whitespace()
-            .any(|k| k.eq_ignore_ascii_case("column"))
-    });
+    let auto_flow = style.grid_auto_flow().unwrap_or_default();
+    let auto_flow_column = auto_flow
+        .split_whitespace()
+        .any(|k| k.eq_ignore_ascii_case("column"));
+    let dense = auto_flow
+        .split_whitespace()
+        .any(|k| k.eq_ignore_ascii_case("dense"));
 
     // --- Per-item placement declarations -----------------------------------
     let mut raw_placements: Vec<Option<RawPlacement>> = Vec::with_capacity(item_count);
@@ -234,6 +365,7 @@ pub fn layout_grid(tree: &mut LayoutTree, doc: &Document, index: usize) -> f32 {
         &auto_cols,
         &auto_rows,
         auto_flow_column,
+        dense,
     );
 
     let column_count = col_tracks.len();
@@ -241,6 +373,7 @@ pub fn layout_grid(tree: &mut LayoutTree, doc: &Document, index: usize) -> f32 {
 
     // --- Column sizing -----------------------------------------------------
     let mut intrinsic = vec![0.0_f32; item_count];
+    let mut min_intrinsic = vec![0.0_f32; item_count];
     for (position, &child) in children.iter().enumerate() {
         if !crate::budget::try_step() {
             break;
@@ -252,49 +385,88 @@ pub fn layout_grid(tree: &mut LayoutTree, doc: &Document, index: usize) -> f32 {
         }
         .max(0.0);
         intrinsic[position] = width + b.margins.horizontal();
+        min_intrinsic[position] = min_content_width(tree, child) + b.margins.horizontal();
     }
 
+    // Size `auto` tracks from their items' intrinsic contributions. Single-track
+    // items set the base size; spanning items distribute their surplus over the
+    // auto tracks they cross (weighted by the size already assigned to them).
+    // The min-content contribution is kept as a floor for every such track.
     let mut auto_widths = vec![0.0_f32; column_count];
+    let mut auto_mins = vec![0.0_f32; column_count];
     for (position, cell) in cells.iter().enumerate() {
         if !crate::budget::try_step() {
             break;
         }
-        let auto_span = col_tracks
-            .tracks
-            .iter()
-            .take((cell.col + cell.col_span).min(column_count))
-            .skip(cell.col)
-            .filter(|track| matches!(track, Track::Auto))
-            .count();
-        if auto_span == 0 {
+        let span_start = cell.col;
+        let span_end = (cell.col + cell.col_span).min(column_count);
+        let auto_cols: Vec<usize> = (span_start..span_end)
+            .filter(|&c| matches!(col_tracks.tracks[c], Track::Auto))
+            .collect();
+        if auto_cols.is_empty() {
             continue;
         }
-        let per = intrinsic[position] / auto_span as f32;
-        for column in cell.col..(cell.col + cell.col_span).min(column_count) {
-            if matches!(col_tracks.tracks[column], Track::Auto) {
-                auto_widths[column] = auto_widths[column].max(per);
-            }
+        let per_min = min_intrinsic[position] / auto_cols.len() as f32;
+        for &column in &auto_cols {
+            auto_mins[column] = auto_mins[column].max(per_min);
         }
+        if auto_cols.len() == 1 {
+            let column = auto_cols[0];
+            auto_widths[column] = auto_widths[column].max(intrinsic[position]);
+        }
+    }
+    for (position, cell) in cells.iter().enumerate() {
+        if !crate::budget::try_step() {
+            break;
+        }
+        let span_start = cell.col;
+        let span_end = (cell.col + cell.col_span).min(column_count);
+        let auto_cols: Vec<usize> = (span_start..span_end)
+            .filter(|&c| matches!(col_tracks.tracks[c], Track::Auto))
+            .collect();
+        if auto_cols.len() < 2 {
+            continue;
+        }
+        let current: f32 = auto_cols.iter().map(|&c| auto_widths[c]).sum();
+        let surplus = (intrinsic[position] - current).max(0.0);
+        if surplus <= 0.0 {
+            continue;
+        }
+        let weight: f32 = auto_cols.iter().map(|&c| auto_widths[c].max(1.0)).sum();
+        for &column in &auto_cols {
+            auto_widths[column] += surplus * auto_widths[column].max(1.0) / weight;
+        }
+    }
+    for column in 0..column_count {
+        auto_widths[column] = auto_widths[column].max(auto_mins[column]);
     }
 
     let gaps_width = column_gap * column_count.saturating_sub(1) as f32;
     let mut fixed_width = gaps_width;
     let mut fr_units = 0.0_f32;
+    let mut fr_mins = vec![0.0_f32; column_count];
     for (column, track) in col_tracks.tracks.iter().enumerate() {
         match track {
             Track::Fixed(px) => fixed_width += px.max(0.0),
             Track::Percent(percent) => fixed_width += (available * percent / 100.0).max(0.0),
             Track::Auto => fixed_width += auto_widths[column],
             Track::Fr(units) => fr_units += units.max(0.0),
+            Track::FrMin(units, min) => {
+                fr_units += units.max(0.0);
+                fr_mins[column] = min.resolve(available);
+            }
         }
     }
-    let fr_space = (available - fixed_width).max(0.0);
+    // Definite `minmax` minima are taken out of the space shared by `fr`
+    // tracks; each flexible track then receives at least its minimum.
+    let fr_min_sum: f32 = fr_mins.iter().sum();
+    let fr_space = (available - fixed_width - fr_min_sum).max(0.0);
     let fr_unit = if fr_units > 0.0 {
         fr_space / fr_units
     } else {
         0.0
     };
-    let widths: Vec<f32> = col_tracks
+    let mut widths: Vec<f32> = col_tracks
         .tracks
         .iter()
         .enumerate()
@@ -303,8 +475,31 @@ pub fn layout_grid(tree: &mut LayoutTree, doc: &Document, index: usize) -> f32 {
             Track::Percent(percent) => (available * percent / 100.0).max(0.0),
             Track::Auto => auto_widths[column],
             Track::Fr(units) => fr_unit * units.max(0.0),
+            Track::FrMin(units, _) => fr_mins[column] + fr_unit * units.max(0.0),
         })
         .collect();
+
+    // --- Whole-track content distribution (`justify-content`) --------------
+    let used_inline = widths.iter().sum::<f32>() + gaps_width;
+    let free_inline = (available - used_inline).max(0.0);
+    let justify = content_align(style.justify_content_raw().as_deref());
+    let (col_offset, col_gap_extra) = distribute(justify, free_inline, column_count);
+    if justify == ContentAlign::Stretch && free_inline > 0.0 {
+        let auto_count = col_tracks
+            .tracks
+            .iter()
+            .filter(|track| **track == Track::Auto)
+            .count();
+        if auto_count > 0 {
+            let extra = free_inline / auto_count as f32;
+            for (column, track) in col_tracks.tracks.iter().enumerate() {
+                if *track == Track::Auto {
+                    widths[column] += extra;
+                }
+            }
+        }
+    }
+    let effective_column_gap = column_gap + col_gap_extra;
 
     // --- Child layout (needed for row sizing) ------------------------------
     let justify_items = inline_align(style.justify_items().as_deref());
@@ -316,7 +511,7 @@ pub fn layout_grid(tree: &mut LayoutTree, doc: &Document, index: usize) -> f32 {
         let cell_width: f32 = (cell.col..(cell.col + cell.col_span).min(column_count))
             .map(|c| widths[c])
             .sum::<f32>()
-            + column_gap * cell.col_span.saturating_sub(1) as f32;
+            + effective_column_gap * cell.col_span.saturating_sub(1) as f32;
         let justify_self = tree.boxes[child].style.justify_self();
         let effective_inline = inline_align_inherit(justify_self.as_deref(), justify_items);
         // An intrinsic width (`fit-content`, `min-content`, `max-content`) is
@@ -366,18 +561,22 @@ pub fn layout_grid(tree: &mut LayoutTree, doc: &Document, index: usize) -> f32 {
     let mut row_heights = vec![0.0_f32; row_count];
     let mut fixed_height = 0.0_f32;
     let mut fr_row_units = 0.0_f32;
+    let mut fr_row_mins = vec![0.0_f32; row_count];
+    let row_base = definite_height.unwrap_or(available);
     for (row, track) in row_tracks.tracks.iter().enumerate() {
         let base = match track {
             Track::Fixed(px) => px.max(0.0),
-            Track::Percent(percent) => {
-                let base = definite_height.unwrap_or(available);
-                (base * percent / 100.0).max(0.0)
-            }
+            Track::Percent(percent) => (row_base * percent / 100.0).max(0.0),
             Track::Auto | Track::Fr(_) => auto_heights[row],
+            Track::FrMin(_, min) => min.resolve(row_base).max(auto_heights[row]),
         };
         row_heights[row] = base;
         match track {
             Track::Fr(units) => fr_row_units += units.max(0.0),
+            Track::FrMin(units, min) => {
+                fr_row_units += units.max(0.0);
+                fr_row_mins[row] = min.resolve(row_base);
+            }
             _ => fixed_height += base,
         }
     }
@@ -385,27 +584,57 @@ pub fn layout_grid(tree: &mut LayoutTree, doc: &Document, index: usize) -> f32 {
         && fr_row_units > 0.0
     {
         let gaps_height = row_gap * row_count.saturating_sub(1) as f32;
-        let remaining = (height - fixed_height - gaps_height).max(0.0);
+        let min_sum: f32 = fr_row_mins.iter().sum();
+        let remaining = (height - fixed_height - gaps_height - min_sum).max(0.0);
         let unit = remaining / fr_row_units;
         for (row, track) in row_tracks.tracks.iter().enumerate() {
-            if let Track::Fr(factor) = track {
-                row_heights[row] = row_heights[row].max(unit * factor.max(0.0));
+            match track {
+                Track::Fr(factor) => {
+                    row_heights[row] = row_heights[row].max(unit * factor.max(0.0));
+                }
+                Track::FrMin(units, _) => {
+                    row_heights[row] = fr_row_mins[row] + unit * units.max(0.0);
+                }
+                _ => {}
             }
         }
     }
 
+    // --- Whole-track content distribution (`align-content`) ----------------
+    let gaps_height = row_gap * row_count.saturating_sub(1) as f32;
+    let used_block = row_heights.iter().sum::<f32>() + gaps_height;
+    let free_block = definite_height.map_or(0.0, |h| (h - used_block).max(0.0));
+    let align = content_align(style.align_content().as_deref());
+    let (row_offset, row_gap_extra) = distribute(align, free_block, row_count);
+    if align == ContentAlign::Stretch && free_block > 0.0 {
+        let auto_count = row_tracks
+            .tracks
+            .iter()
+            .filter(|track| **track == Track::Auto)
+            .count();
+        if auto_count > 0 {
+            let extra = free_block / auto_count as f32;
+            for (row, track) in row_tracks.tracks.iter().enumerate() {
+                if *track == Track::Auto {
+                    row_heights[row] += extra;
+                }
+            }
+        }
+    }
+    let effective_row_gap = row_gap + row_gap_extra;
+
     // --- Placement ---------------------------------------------------------
     let mut column_x = Vec::with_capacity(column_count);
-    let mut x = content.x;
+    let mut x = content.x + col_offset;
     for width in &widths {
         column_x.push(x);
-        x += width + column_gap;
+        x += width + effective_column_gap;
     }
     let mut row_y = Vec::with_capacity(row_count);
-    let mut y = content.y;
+    let mut y = content.y + row_offset;
     for height in &row_heights {
         row_y.push(y);
-        y += height + row_gap;
+        y += height + effective_row_gap;
     }
 
     let align_items = block_align_from_style(style.align_items());
@@ -420,11 +649,11 @@ pub fn layout_grid(tree: &mut LayoutTree, doc: &Document, index: usize) -> f32 {
         let cell_width: f32 = (cell.col..(cell.col + cell.col_span).min(column_count))
             .map(|c| widths[c])
             .sum::<f32>()
-            + column_gap * cell.col_span.saturating_sub(1) as f32;
+            + effective_column_gap * cell.col_span.saturating_sub(1) as f32;
         let cell_height: f32 = (cell.row..(cell.row + cell.row_span).min(row_count))
             .map(|r| row_heights[r])
             .sum::<f32>()
-            + row_gap * cell.row_span.saturating_sub(1) as f32;
+            + effective_row_gap * cell.row_span.saturating_sub(1) as f32;
 
         let inline = inline_align_inherit(
             tree.boxes[child].style.justify_self().as_deref(),
@@ -473,6 +702,100 @@ fn definite_content_height(tree: &LayoutTree, index: usize) -> Option<f32> {
         }
         Dim::Calc { percent, px } => Some((b.content.width * percent / 100.0 + px).max(0.0)),
     }
+}
+
+// --- Subgrid inheritance ----------------------------------------------------
+
+fn is_subgrid(raw: Option<&str>) -> bool {
+    raw.is_some_and(|value| {
+        value
+            .split_whitespace()
+            .next()
+            .is_some_and(|keyword| keyword.eq_ignore_ascii_case("subgrid"))
+    })
+}
+
+/// Finds the nearest ancestor box that establishes a grid formatting context.
+fn nearest_grid_ancestor(tree: &LayoutTree, index: usize) -> Option<usize> {
+    let mut current = index;
+    let mut seen = HashSet::new();
+    while seen.insert(current) {
+        let parent = tree
+            .boxes
+            .iter()
+            .position(|box_ref| box_ref.children.contains(&current))?;
+        if matches!(tree.boxes[parent].box_type, BoxType::Grid) {
+            return Some(parent);
+        }
+        current = parent;
+    }
+    None
+}
+
+/// Resolves a `subgrid` axis to the explicit track lines (and gutter) of the
+/// nearest grid ancestor. Nested subgrids recurse to the first non-subgrid
+/// ancestor. Returns `None` when the ancestor has no explicit template for the
+/// axis, in which case the caller falls back to a local template.
+fn inherited_axis_tracks(
+    tree: &LayoutTree,
+    index: usize,
+    columns: bool,
+) -> Option<(TrackList, f32)> {
+    let ancestor = nearest_grid_ancestor(tree, index)?;
+    let style = &tree.boxes[ancestor].style;
+    let raw = if columns {
+        style.grid_template_columns()
+    } else {
+        style.grid_template_rows()
+    };
+    let gap = if columns {
+        style.column_gap()
+    } else {
+        style.row_gap()
+    }
+    .max(0.0);
+    if is_subgrid(raw.as_deref()) {
+        return inherited_axis_tracks(tree, ancestor, columns);
+    }
+    let mut tracks = parse_track_list(raw.as_deref());
+    if tracks.is_empty() {
+        return None;
+    }
+    let areas = parse_grid_areas(style.grid_template_areas().as_deref());
+    inject_area_axis(&mut tracks, &areas, columns);
+    Some((tracks, gap))
+}
+
+/// Estimates a min-content width (the longest unbreakable word plus insets),
+/// used as a floor for `auto`-sized tracks.
+fn min_content_width(tree: &LayoutTree, index: usize) -> f32 {
+    fn walk(tree: &LayoutTree, index: usize) -> f32 {
+        let box_ref = &tree.boxes[index];
+        let mut width = if box_ref.box_type == BoxType::Text {
+            box_ref
+                .text
+                .split_whitespace()
+                .map(|word| {
+                    browser_text::Font::monospace().measure(word, box_ref.style.font_size())
+                })
+                .fold(0.0_f32, f32::max)
+        } else if let Dim::Px(px) = box_ref.style.width() {
+            px.max(0.0)
+        } else {
+            box_ref
+                .children
+                .iter()
+                .map(|&child| walk(tree, child))
+                .fold(0.0_f32, f32::max)
+        };
+        for side in [Side::Left, Side::Right] {
+            width += box_ref.style.padding(side).resolve(0.0).unwrap_or(0.0);
+            width += box_ref.style.border_width(side);
+            width += box_ref.style.margin(side).resolve(0.0).unwrap_or(0.0);
+        }
+        width
+    }
+    walk(tree, index)
 }
 
 // --- Track parsing ----------------------------------------------------------
@@ -631,10 +954,26 @@ fn parse_definite_track(token: &str) -> Option<Track> {
 
 /// Parses `minmax(min, max)`, preferring a definite `max` (`Nfr`, a length or a
 /// percentage) because it is the most faithful sizing the subset can express.
-/// An intrinsic `max` falls back to a definite, positive `min`, otherwise the
-/// track is sized from its items like `auto`.
+/// A flexible `max` keeps a definite, positive `min` as a floor (as in
+/// `minmax(100px, 1fr)`). An intrinsic `max` falls back to a definite, positive
+/// `min`, otherwise the track is sized from its items like `auto`.
 fn parse_minmax(inner: &str) -> Option<Track> {
     let (min, max) = split_once_top_level(inner)?;
+    let min = min.trim();
+    let max = max.trim();
+    // A flexible maximum: remember the definite minimum rather than discarding
+    // it, so `minmax(100px, 1fr)` cannot shrink below 100px.
+    if let Some(units) = parse_fr(max) {
+        let floor = match parse_definite_track(min) {
+            Some(Track::Fixed(px)) if px > 0.0 => Some(FrMin::Px(px)),
+            Some(Track::Percent(percent)) if percent > 0.0 => Some(FrMin::Percent(percent)),
+            _ => None,
+        };
+        return Some(match floor {
+            Some(floor) => Track::FrMin(units, floor),
+            None => Track::Fr(units),
+        });
+    }
     // A bare `0` is not a useful maximum (it would collapse the track).
     if let Some(track) = parse_definite_track(max)
         && !matches!(track, Track::Fixed(0.0))
@@ -652,6 +991,12 @@ fn parse_minmax(inner: &str) -> Option<Track> {
     // `min-content`, `max-content`, `auto` and `fit-content()` are all modelled
     // as `auto` by this subset.
     Some(Track::Auto)
+}
+
+fn parse_fr(token: &str) -> Option<f32> {
+    let prefix = token.trim().strip_suffix("fr")?;
+    let value = prefix.trim().parse::<f32>().ok()?;
+    value.is_finite().then_some(value.max(0.0))
 }
 
 fn parse_track(token: &str) -> Option<Track> {
@@ -756,27 +1101,23 @@ fn area_rect(rows: &[Vec<&str>], row: usize, col: usize, cols: usize) -> (usize,
     (end_row, final_col)
 }
 
-fn inject_area_lines(cols: &mut TrackList, rows: &mut TrackList, areas: &GridAreas) {
+/// Adds the implicit `<area>-start` / `<area>-end` line names of
+/// `grid-template-areas` to one axis of a track list.
+fn inject_area_axis(tracks: &mut TrackList, areas: &GridAreas, columns: bool) {
     for (name, &(row_start, col_start, row_end, col_end)) in &areas.rects {
-        let col_begin = col_start.saturating_sub(1);
-        let col_finish = col_end.saturating_sub(1);
-        ensure_line_names(cols, col_finish);
-        cols.line_names[col_begin].push(format!("{name}-start"));
-        cols.line_names[col_finish].push(format!("{name}-end"));
-
-        let row_begin = row_start.saturating_sub(1);
-        let row_finish = row_end.saturating_sub(1);
-        ensure_line_names(rows, row_finish);
-        rows.line_names[row_begin].push(format!("{name}-start"));
-        rows.line_names[row_finish].push(format!("{name}-end"));
+        let (begin, finish) = if columns {
+            (col_start.saturating_sub(1), col_end.saturating_sub(1))
+        } else {
+            (row_start.saturating_sub(1), row_end.saturating_sub(1))
+        };
+        ensure_line_names(tracks, finish);
+        tracks.line_names[begin].push(format!("{name}-start"));
+        tracks.line_names[finish].push(format!("{name}-end"));
     }
-    while cols.len() < areas.cols && cols.len() < MAX_TRACKS {
-        cols.tracks.push(Track::Auto);
-        ensure_line_names(cols, cols.len());
-    }
-    while rows.len() < areas.rows && rows.len() < MAX_TRACKS {
-        rows.tracks.push(Track::Auto);
-        ensure_line_names(rows, rows.len());
+    let wanted = if columns { areas.cols } else { areas.rows };
+    while tracks.len() < wanted && tracks.len() < MAX_TRACKS {
+        tracks.tracks.push(Track::Auto);
+        ensure_line_names(tracks, tracks.len());
     }
 }
 
@@ -1082,6 +1423,7 @@ fn find_slot(
     None
 }
 
+#[allow(clippy::too_many_arguments)]
 fn place_items(
     placements: &[Option<RawPlacement>],
     areas: &GridAreas,
@@ -1090,6 +1432,7 @@ fn place_items(
     auto_cols: &[Track],
     auto_rows: &[Track],
     column_flow: bool,
+    dense: bool,
 ) -> Vec<Cell> {
     let count = placements.len();
     let mut cells = vec![Cell::default(); count];
@@ -1153,13 +1496,17 @@ fn place_items(
             ),
             None => (None, None, 1, 1),
         };
+        // Sparse packing advances a single auto-placement cursor; dense
+        // packing restarts the search from the beginning so items backfill
+        // holes left earlier in the grid.
+        let search_cursor = if dense { (0, 0) } else { cursor };
         let Some((row, col)) = find_slot(
             &occupied,
             want_col,
             want_row,
             col_span,
             row_span,
-            cursor,
+            search_cursor,
             column_flow,
             if column_flow { MAX_TRACKS } else { cols.len() },
             if column_flow { rows.len() } else { MAX_TRACKS },
@@ -1884,6 +2231,141 @@ mod tests {
         // The sibling has ordinary `auto` width and still stretches to its cell.
         approx(b.rect.x, 300.0);
         approx(b.rect.width, 300.0);
+        let _ = doc;
+    }
+
+    // --- New tests: content distribution, dense, subgrid, fr minima ---------
+
+    #[test]
+    fn justify_content_center_distributes_track_set() {
+        let (doc, tree, ids) = layout_grid_inline(
+            "display: grid; width: 300px; grid-template-columns: 100px 100px; \
+             justify-content: center;",
+            &[("a", "height: 5px;"), ("b", "height: 5px;")],
+        );
+        let a = tree.find_node(ids[1]).unwrap();
+        let b = tree.find_node(ids[2]).unwrap();
+        // The 100px of free space is split into 50px offsets on both sides.
+        approx(a.rect.x, 50.0);
+        approx(b.rect.x, 150.0);
+        let _ = doc;
+    }
+
+    #[test]
+    fn align_content_center_offsets_rows() {
+        let (doc, tree, ids) = layout_grid_inline(
+            "display: grid; width: 300px; height: 100px; grid-template-columns: 300px; \
+             grid-template-rows: 20px 20px; align-content: center;",
+            &[("a", "height: 5px;"), ("b", "height: 5px;")],
+        );
+        let a = tree.find_node(ids[1]).unwrap();
+        let b = tree.find_node(ids[2]).unwrap();
+        approx(a.rect.y, 30.0);
+        approx(b.rect.y, 50.0);
+        let _ = doc;
+    }
+
+    #[test]
+    fn dense_packing_backfills_holes() {
+        let (doc, tree, ids) = layout_grid_inline(
+            "display: grid; width: 300px; grid-template-columns: repeat(3, 100px); \
+             grid-template-rows: 20px 20px; grid-auto-flow: row dense;",
+            &[
+                ("a", "grid-column: 2 / 4; grid-row: 1; height: 5px;"),
+                ("b", "grid-column: span 2; height: 5px;"),
+                ("c", "height: 5px;"),
+            ],
+        );
+        let a = tree.find_node(ids[1]).unwrap();
+        let b = tree.find_node(ids[2]).unwrap();
+        let c = tree.find_node(ids[3]).unwrap();
+        approx(a.rect.x, 100.0);
+        approx(b.rect.x, 0.0);
+        approx(b.rect.y, 20.0);
+        // Sparse packing would have put `c` at (200, 20); dense backfills the
+        // hole left by `a` on the first row.
+        approx(c.rect.x, 0.0);
+        approx(c.rect.y, 0.0);
+        let _ = doc;
+    }
+
+    #[test]
+    fn minmax_fr_honours_definite_min() {
+        let (doc, tree, ids) = layout_grid_inline(
+            "display: grid; width: 300px; \
+             grid-template-columns: minmax(100px, 1fr) 1fr;",
+            &[("a", "height: 5px;"), ("b", "height: 5px;")],
+        );
+        let a = tree.find_node(ids[1]).unwrap();
+        let b = tree.find_node(ids[2]).unwrap();
+        // The 100px floor is reserved first, then the remaining 200px are
+        // shared equally: 100 + 100 = 200 for the first track.
+        approx(a.rect.width, 200.0);
+        approx(b.rect.x, 200.0);
+        approx(b.rect.width, 100.0);
+        let _ = doc;
+    }
+
+    /// Builds a grid with a nested subgrid child and two items inside it.
+    fn layout_subgrid(
+        parent_css: &str,
+        sub_css: &str,
+        items: &[(&str, &str)],
+    ) -> (Document, LayoutTree, Vec<browser_dom::NodeId>) {
+        let mut doc = Document::new();
+        let html = doc.create_element("html");
+        let body = doc.create_element("body");
+        doc.append_child(doc.root(), html);
+        doc.append_child(html, body);
+        let grid = doc.create_element("div");
+        doc.set_attr(grid, "id", "g");
+        doc.set_attr(grid, "style", parent_css);
+        doc.append_child(body, grid);
+        let sub = doc.create_element("div");
+        doc.set_attr(sub, "id", "sub");
+        doc.set_attr(sub, "style", sub_css);
+        doc.append_child(grid, sub);
+        let mut ids = vec![grid, sub];
+        for (id, style) in items {
+            let child = doc.create_element("div");
+            doc.set_attr(child, "id", id);
+            doc.set_attr(child, "style", style);
+            doc.append_child(sub, child);
+            ids.push(child);
+        }
+        let mut engine = StyleEngine::new(Viewport {
+            width: 800.0,
+            height: 600.0,
+        });
+        engine.add_css("body { margin: 0; }", Origin::Author);
+        let styled = engine.compute(&doc);
+        let tree = layout(
+            &doc,
+            &styled,
+            Size {
+                width: 800.0,
+                height: 600.0,
+            },
+        );
+        (doc, tree, ids)
+    }
+
+    #[test]
+    fn subgrid_inherits_parent_tracks() {
+        let (doc, tree, ids) = layout_subgrid(
+            "display: grid; width: 300px; grid-template-columns: 100px 50px 150px;",
+            "display: grid; grid-template-columns: subgrid; grid-column: 1 / -1; height: 10px;",
+            &[
+                ("a", "grid-column: 1; height: 5px;"),
+                ("b", "grid-column: 2; height: 5px;"),
+            ],
+        );
+        let a = tree.find_node(ids[2]).unwrap();
+        let b = tree.find_node(ids[3]).unwrap();
+        approx(a.rect.x, 0.0);
+        approx(a.rect.width, 100.0);
+        approx(b.rect.x, 100.0);
+        approx(b.rect.width, 50.0);
         let _ = doc;
     }
 }

@@ -23,10 +23,17 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
 
-use crate::chrome::render::{FramePipeline, PageRenderJob, render_window_with_page};
+use crate::chrome::render::{
+    FramePipeline, PageRenderJob, render_context_menu, render_window_with_page_scaled,
+};
 use crate::chrome::{ChromeLayout, ChromePart, LoadStatus, UiState};
 use crate::devtools::{DevTools, LogLevel, RequestStatus, ResourceType};
 use crate::target::resolve_target;
+use crate::ui_extra::find_overlay;
+use crate::ui_extra::{
+    ContextAction, ContextMenu, Point as MenuPoint, TabDrag, ZoomController, push_tab, remove_tab,
+    reorder_tabs,
+};
 
 /// Runs the native window until it is closed.
 pub fn run(
@@ -73,6 +80,14 @@ struct WindowApp {
     pipeline: FramePipeline,
     /// True when the page content changed and a fresh frame must be submitted.
     render_dirty: bool,
+    /// Logical zoom level applied only to the page render scale.
+    zoom: ZoomController,
+    /// Right-click menu, open until an action or an outside click dismisses it.
+    context_menu: Option<ContextMenu>,
+    /// Link under the pointer when the context menu opened, if any.
+    context_link: Option<String>,
+    /// Drag-to-reorder state machine for the tab strip.
+    tab_drag: TabDrag,
 }
 
 impl WindowApp {
@@ -103,6 +118,10 @@ impl WindowApp {
             last_navigation_ms: 0,
             pipeline: FramePipeline::new(),
             render_dirty: true,
+            zoom: ZoomController::new(),
+            context_menu: None,
+            context_link: None,
+            tab_drag: TabDrag::new(),
         }
     }
 
@@ -122,8 +141,20 @@ impl WindowApp {
     }
 
     fn rebuild_chrome(&mut self) {
+        self.sync_tab_order();
         let size = self.logical_size();
         self.chrome = ChromeLayout::new(size, self.browser.tabs().len(), self.ui.status);
+    }
+
+    /// Keeps the display-slot → browser-tab mapping sized to the tab set.
+    ///
+    /// Close/new paths update the mapping explicitly; this is the safety net
+    /// for any tab change made through another entry point.
+    fn sync_tab_order(&mut self) {
+        let count = self.browser.tabs().len();
+        if self.ui.tab_order.len() != count {
+            self.ui.tab_order = (0..count).collect();
+        }
     }
 
     fn refresh(&mut self) {
@@ -222,6 +253,8 @@ impl WindowApp {
                 self.refresh();
             }
         }
+        // Match rectangles are tied to the laid-out text of the old page.
+        self.find_page_text_changed();
     }
 
     /// Escape fallback for an in-flight navigation.
@@ -235,6 +268,237 @@ impl WindowApp {
         self.ui.status = LoadStatus::Ready;
         self.ui.error = None;
         self.refresh();
+    }
+
+    // -- Find in page -------------------------------------------------------
+
+    /// Re-runs the current query against the active page and recomputes rects.
+    fn find_page_text_changed(&mut self) {
+        let text = self.browser.page().text();
+        self.ui.find.set_page_text(&text);
+        self.ui.find_highlights = find_overlay::highlights(self.browser.page(), &self.ui.find);
+    }
+
+    /// Opens (or refocuses) the find bar and selects its query field.
+    fn open_find(&mut self) {
+        self.find_page_text_changed();
+        self.ui.address.blur();
+        self.ui.find_open = true;
+        self.ui.find_focused = true;
+        self.refresh();
+    }
+
+    /// Hides the find bar and its highlight layer.
+    fn close_find(&mut self) {
+        self.ui.find_open = false;
+        self.ui.find_focused = false;
+        self.ui.find_highlights.clear();
+        self.refresh();
+    }
+
+    fn find_insert(&mut self, text: &str) {
+        let mut query = self.ui.find.query().to_string();
+        query.push_str(text);
+        self.ui.find.set_query(&query, &self.browser.page().text());
+        self.ui.find_highlights = find_overlay::highlights(self.browser.page(), &self.ui.find);
+        self.refresh();
+    }
+
+    fn find_backspace(&mut self) {
+        let mut query = self.ui.find.query().to_string();
+        query.pop();
+        self.ui.find.set_query(&query, &self.browser.page().text());
+        self.ui.find_highlights = find_overlay::highlights(self.browser.page(), &self.ui.find);
+        self.refresh();
+    }
+
+    fn find_navigate(&mut self, forward: bool) {
+        if forward {
+            self.ui.find.next();
+        } else {
+            self.ui.find.previous();
+        }
+        self.ui.find_highlights = find_overlay::highlights(self.browser.page(), &self.ui.find);
+        self.refresh();
+    }
+
+    // -- Zoom ---------------------------------------------------------------
+
+    /// Applies a zoom step and marks the page image for re-rasterization.
+    ///
+    /// Only the page render scale changes; the chrome stays at the device pixel
+    /// ratio so the output image still matches the window and UI text stays
+    /// readable. See [`render_window_with_page_scaled`].
+    fn apply_zoom(&mut self, step: i8) {
+        let changed = match step {
+            1 => self.zoom.zoom_in(),
+            -1 => self.zoom.zoom_out(),
+            0 => {
+                self.zoom.reset();
+                true
+            }
+            _ => false,
+        };
+        if changed {
+            self.render_dirty = true;
+            self.refresh();
+        }
+    }
+
+    // -- Tab strip ----------------------------------------------------------
+
+    /// Display slot under a tab-strip x coordinate.
+    fn tab_slot_at(&self, x: f32) -> Option<usize> {
+        self.chrome
+            .tabs
+            .iter()
+            .position(|rect| x >= rect.x && x < rect.right())
+    }
+
+    /// Activates the browser tab shown in a display slot.
+    fn select_tab_slot(&mut self, display_slot: usize) {
+        let index = self.ui.tab_index(display_slot);
+        let id = self.browser.tabs().ids().get(index).copied();
+        if let Some(id) = id
+            && self.browser.select_tab(id).is_ok()
+        {
+            self.ui.status = LoadStatus::Ready;
+            self.address_sync();
+            self.update_title();
+            self.find_page_text_changed();
+        }
+        self.refresh();
+    }
+
+    /// Opens a tab and extends the display mapping.
+    fn open_new_tab(&mut self) {
+        let index = self.browser.tabs().len();
+        self.browser.new_tab();
+        self.ui.tab_order = push_tab(&self.ui.tab_order, index);
+        self.sync_tab_order();
+        self.ui.address.set_exact("");
+        self.ui.address.focus();
+        self.ui.status = LoadStatus::Ready;
+        self.refresh();
+    }
+
+    /// Closes a browser tab index and removes it from the display mapping.
+    fn close_tab_index(&mut self, index: usize) {
+        let Some(id) = self.browser.tabs().ids().get(index).copied() else {
+            return;
+        };
+        if self.browser.tabs_mut().close(id) {
+            self.ui.tab_order = remove_tab(&self.ui.tab_order, index);
+            self.sync_tab_order();
+            self.ui.status = LoadStatus::Ready;
+            self.address_sync();
+            self.update_title();
+            self.find_page_text_changed();
+        }
+        self.refresh();
+    }
+
+    /// Commits the pending tab drag to the display mapping.
+    ///
+    /// `browser_core::TabSet` has no reorder method, so the committed order is
+    /// applied to `UiState::tab_order` and translated at every tab hit test.
+    fn commit_tab_drag(&mut self) {
+        let Some(source) = self.tab_drag.source() else {
+            return;
+        };
+        let target = self.tab_drag.target().unwrap_or(source);
+        self.sync_tab_order();
+        if source != target
+            && let Some(order) = self.tab_drag.commit(self.browser.tabs().len())
+            && let Some(next) = reorder_tabs(&self.ui.tab_order, &order)
+        {
+            self.ui.tab_order = next;
+            self.devtools.push_diagnostic(
+                LogLevel::Info,
+                format!("tab {source} moved to slot {target}"),
+            );
+        }
+        self.tab_drag.cancel();
+        self.ui.tab_drag_source = None;
+        self.ui.tab_drag_target = None;
+        self.refresh();
+    }
+
+    // -- Context menu -------------------------------------------------------
+
+    fn close_context_menu(&mut self) {
+        self.context_menu = None;
+        self.context_link = None;
+        self.ui.context_hover = None;
+        self.refresh();
+    }
+
+    fn open_context_menu(&mut self, x: f32, y: f32) {
+        let link = self
+            .chrome
+            .page_local(x, y)
+            .and_then(|(page_x, page_y)| self.browser.page().link_at(page_x, page_y))
+            .map(|url| url.as_str().to_string());
+        let width = ContextMenu::DEFAULT_ITEM_WIDTH;
+        let rows = ContextAction::ALL.len() as f32;
+        let height = ContextMenu::DEFAULT_ITEM_HEIGHT * rows;
+        let anchor_x = x.clamp(
+            self.chrome.page.x,
+            (self.chrome.width - width - 4.0).max(self.chrome.page.x),
+        );
+        let anchor_y = y.clamp(
+            self.chrome.page.y,
+            (self.chrome.height - height - 4.0).max(self.chrome.page.y),
+        );
+        let mut menu = ContextMenu::new(MenuPoint::new(anchor_x, anchor_y));
+        if link.is_none() || !self.browser.tab().history.can_go_back() {
+            for item in &mut menu.items {
+                let unavailable = match item.action {
+                    ContextAction::OpenInNewTab | ContextAction::CopyLink => link.is_none(),
+                    ContextAction::Back => !self.browser.tab().history.can_go_back(),
+                    ContextAction::Reload | ContextAction::Inspect => false,
+                };
+                item.enabled = !unavailable;
+            }
+        }
+        self.context_link = link;
+        self.context_menu = Some(menu);
+        self.refresh();
+    }
+
+    fn run_context_action(&mut self, action: ContextAction) {
+        let link = self.context_link.take();
+        self.close_context_menu();
+        match action {
+            ContextAction::OpenInNewTab => {
+                self.open_new_tab();
+                if let Some(url) = link {
+                    self.navigate(&url);
+                }
+            }
+            ContextAction::CopyLink => {
+                // No clipboard backend is linked into this binary; the menu row
+                // stays available but only reports the link to the console.
+                if let Some(url) = link {
+                    self.devtools
+                        .push_diagnostic(LogLevel::Info, format!("link: {url}"));
+                }
+            }
+            ContextAction::Back => {
+                self.run_navigation(|browser| browser.back());
+                let url = self.current_url();
+                self.record_navigation(&url);
+            }
+            ContextAction::Reload => {
+                self.run_navigation(|browser| browser.reload());
+                let url = self.current_url();
+                self.record_navigation(&url);
+            }
+            ContextAction::Inspect => {
+                self.devtools.toggle();
+                self.refresh();
+            }
+        }
     }
 
     fn navigate(&mut self, input: &str) {
@@ -295,6 +559,28 @@ impl WindowApp {
                 return;
             }
         }
+        if self.ui.find_open {
+            match self.chrome.hit(x, y) {
+                Some(ChromePart::FindInput) => {
+                    self.ui.find_focused = true;
+                    self.refresh();
+                    return;
+                }
+                Some(ChromePart::FindClose) => {
+                    self.close_find();
+                    return;
+                }
+                Some(ChromePart::FindPrev) => {
+                    self.find_navigate(false);
+                    return;
+                }
+                Some(ChromePart::FindNext) => {
+                    self.find_navigate(true);
+                    return;
+                }
+                _ => {}
+            }
+        }
         match self.chrome.hit(x, y) {
             Some(ChromePart::Back) => {
                 self.run_navigation(|browser| browser.back());
@@ -315,35 +601,11 @@ impl WindowApp {
                 self.ui.address.focus();
                 self.refresh();
             }
-            Some(ChromePart::Tab(index)) => {
-                let id = self.browser.tabs().ids().get(index).copied();
-                if let Some(id) = id
-                    && self.browser.select_tab(id).is_ok()
-                {
-                    self.ui.status = LoadStatus::Ready;
-                    self.address_sync();
-                    self.update_title();
-                }
-                self.refresh();
+            Some(ChromePart::Tab(display_slot)) => self.select_tab_slot(display_slot),
+            Some(ChromePart::CloseTab(display_slot)) => {
+                self.close_tab_index(self.ui.tab_index(display_slot));
             }
-            Some(ChromePart::CloseTab(index)) => {
-                let id = self.browser.tabs().ids().get(index).copied();
-                if let Some(id) = id
-                    && self.browser.tabs_mut().close(id)
-                {
-                    self.ui.status = LoadStatus::Ready;
-                    self.address_sync();
-                    self.update_title();
-                }
-                self.refresh();
-            }
-            Some(ChromePart::NewTab) => {
-                self.browser.new_tab();
-                self.ui.address.set_exact("");
-                self.ui.address.focus();
-                self.ui.status = LoadStatus::Ready;
-                self.refresh();
-            }
+            Some(ChromePart::NewTab) => self.open_new_tab(),
             Some(ChromePart::Page) => {
                 let Some((page_x, page_y)) = self.chrome.page_local(x, y) else {
                     return;
@@ -354,7 +616,7 @@ impl WindowApp {
                 let submitter = self.browser.page().hit_test_node(page_x, page_y);
                 let form = submitter.and_then(|node| {
                     let doc = self.browser.page().document.borrow();
-                    let is_button = doc.element_name(node).as_deref() == Some("input")
+                    let is_button = doc.element_name(node) == Some("input")
                         && matches!(
                             doc.attr(node, "type")
                                 .unwrap_or("")
@@ -398,7 +660,12 @@ impl WindowApp {
                     self.refresh();
                 }
             }
-            Some(ChromePart::Status) | None => {}
+            Some(ChromePart::Status)
+            | Some(ChromePart::FindInput)
+            | Some(ChromePart::FindClose)
+            | Some(ChromePart::FindPrev)
+            | Some(ChromePart::FindNext)
+            | None => {}
         }
     }
 
@@ -408,6 +675,10 @@ impl WindowApp {
         };
         if self.browser.scroll_at(page_x, page_y, delta_y) {
             self.render_dirty = true;
+            if self.ui.find_open {
+                self.ui.find_highlights =
+                    find_overlay::highlights(self.browser.page(), &self.ui.find);
+            }
             if let Some(window) = &self.window {
                 window.request_redraw();
             }
@@ -436,14 +707,67 @@ impl WindowApp {
                     return;
                 }
                 "t" => {
-                    self.browser.new_tab();
-                    self.ui.address.set_exact("");
-                    self.ui.address.focus();
-                    self.ui.status = LoadStatus::Ready;
-                    self.refresh();
+                    self.open_new_tab();
+                    return;
+                }
+                "f" => {
+                    self.open_find();
+                    return;
+                }
+                "+" | "=" => {
+                    self.apply_zoom(1);
+                    return;
+                }
+                "-" | "_" => {
+                    self.apply_zoom(-1);
+                    return;
+                }
+                "0" => {
+                    self.apply_zoom(0);
                     return;
                 }
                 _ => {}
+            }
+        }
+
+        if matches!(key, Key::Named(NamedKey::Escape)) && self.context_menu.is_some() {
+            self.close_context_menu();
+            return;
+        }
+        if matches!(key, Key::Named(NamedKey::Escape)) && self.ui.find_open {
+            self.close_find();
+            return;
+        }
+        if self.ui.find_open && self.ui.find_focused {
+            match key {
+                Key::Named(NamedKey::Enter) => {
+                    self.find_navigate(!self.modifiers.shift_key());
+                    return;
+                }
+                Key::Named(NamedKey::ArrowDown) => {
+                    self.find_navigate(true);
+                    return;
+                }
+                Key::Named(NamedKey::ArrowUp) => {
+                    self.find_navigate(false);
+                    return;
+                }
+                Key::Named(NamedKey::Backspace) => {
+                    self.find_backspace();
+                    return;
+                }
+                _ => {
+                    if !command
+                        && !alt
+                        && let Some(text) = &event.text
+                    {
+                        self.find_insert(text);
+                        return;
+                    }
+                    if command || alt {
+                        return;
+                    }
+                }
             }
         }
 
@@ -465,10 +789,7 @@ impl WindowApp {
             }
         }
 
-        let toggle_devtools = matches!(key, Key::Named(NamedKey::F12))
-            || (command
-                && self.modifiers.shift_key()
-                && matches!(key, Key::Character(chars) if chars.to_lowercase() == "i"));
+        let toggle_devtools = is_devtools_toggle(key, command, self.modifiers.shift_key());
         if toggle_devtools {
             self.devtools.toggle();
             self.refresh();
@@ -557,17 +878,28 @@ impl WindowApp {
             .window
             .as_ref()
             .map_or(1.0, |window| window.scale_factor()) as f32;
+        // Zoom multiplies only the page raster scale; the chrome and the output
+        // image stay at the device scale so UI text remains readable and the
+        // presenter still sees a window-sized texture.
+        let page_scale = self.zoom.scale(scale);
         // Rasterize the page off-thread; the UI thread only composes the cached
         // chrome with the newest completed frame. Submitting never blocks and
         // stale jobs are dropped by the pipeline, so scrolling stays fluid.
         if self.render_dirty {
             self.pipeline
-                .submit(PageRenderJob::from_browser(&self.browser, scale));
+                .submit(PageRenderJob::from_browser(&self.browser, page_scale));
             self.render_dirty = false;
         }
         let completed = self.pipeline.try_take();
         let page = completed.as_ref().or_else(|| self.pipeline.latest());
-        let mut image = render_window_with_page(&self.browser, &self.ui, &self.chrome, scale, page);
+        let mut image = render_window_with_page_scaled(
+            &self.browser,
+            &self.ui,
+            &self.chrome,
+            scale,
+            page,
+            page_scale,
+        );
 
         // The worker does not drive the event loop: keep requesting redraws
         // until its newest frame is actually presented, otherwise the window
@@ -581,6 +913,10 @@ impl WindowApp {
             self.devtools
                 .render(&mut image, &self.browser, panel, scale);
         }
+        // The context menu is the topmost layer so it stays above devtools.
+        if let Some(menu) = &self.context_menu {
+            render_context_menu(&mut image, menu, self.ui.context_hover, scale);
+        }
         window.pre_present_notify();
         match presenter.present(&image) {
             Ok(_) => self.present_error = false,
@@ -592,6 +928,12 @@ impl WindowApp {
             }
         }
     }
+}
+
+/// The DevTools shortcut is unchanged by the find bar: `F12` or Ctrl+Shift+I.
+fn is_devtools_toggle(key: &Key, command: bool, shift: bool) -> bool {
+    matches!(key, Key::Named(NamedKey::F12))
+        || (command && shift && matches!(key, Key::Character(chars) if chars.to_lowercase() == "i"))
 }
 
 impl ApplicationHandler for WindowApp {
@@ -691,12 +1033,39 @@ impl ApplicationHandler for WindowApp {
                 let x = position.x as f32 / scale;
                 let y = position.y as f32 / scale;
                 self.cursor = (x, y);
-                let hover = if self.pointer_in_devtools(x, y) {
+                if self.tab_drag.is_dragging()
+                    && y >= self.chrome.tab_strip.y
+                    && y < self.chrome.tab_strip.bottom()
+                    && let Some(slot) = self.tab_slot_at(x)
+                    && self.tab_drag.move_to(slot)
+                {
+                    self.ui.tab_drag_target = Some(slot);
+                    self.refresh();
+                }
+                let menu_hover = self
+                    .context_menu
+                    .as_ref()
+                    .and_then(|menu| menu.hit_test(MenuPoint::new(x, y)));
+                if menu_hover != self.ui.context_hover {
+                    self.ui.context_hover = menu_hover;
+                    self.refresh();
+                }
+                let hover = if self.pointer_in_devtools(x, y) || menu_hover.is_some() {
                     None
                 } else {
                     self.chrome
                         .hit(x, y)
                         .filter(|part| !matches!(part, ChromePart::Page | ChromePart::Status))
+                        .filter(|part| {
+                            self.ui.find_open
+                                || !matches!(
+                                    part,
+                                    ChromePart::FindInput
+                                        | ChromePart::FindClose
+                                        | ChromePart::FindPrev
+                                        | ChromePart::FindNext
+                                )
+                        })
                 };
                 if hover != self.ui.hover {
                     self.ui.hover = hover;
@@ -705,30 +1074,84 @@ impl ApplicationHandler for WindowApp {
                     }
                 }
             }
-            WindowEvent::MouseInput {
-                state,
-                button: MouseButton::Left,
-                ..
-            } => {
+            WindowEvent::MouseInput { state, button, .. } => {
                 let (x, y) = self.cursor;
-                match state {
-                    ElementState::Pressed => {
-                        self.ui.pressed = if self.pointer_in_devtools(x, y) {
-                            None
-                        } else {
-                            self.chrome.hit(x, y).filter(|part| {
-                                !matches!(part, ChromePart::Page | ChromePart::Status)
-                            })
-                        };
-                        self.click_at(x, y);
-                    }
-                    ElementState::Released => {
-                        if self.ui.pressed.take().is_some()
-                            && let Some(window) = &self.window
-                        {
-                            window.request_redraw();
+                match button {
+                    MouseButton::Right => {
+                        if state == ElementState::Pressed {
+                            if self.context_menu.is_some() {
+                                self.close_context_menu();
+                            } else {
+                                self.open_context_menu(x, y);
+                            }
                         }
                     }
+                    MouseButton::Left => match state {
+                        ElementState::Pressed => {
+                            let menu_action = self
+                                .context_menu
+                                .as_ref()
+                                .and_then(|menu| menu.hit_test(MenuPoint::new(x, y)));
+                            if self.context_menu.is_some() {
+                                self.close_context_menu();
+                                if let Some(action) = menu_action {
+                                    self.run_context_action(action);
+                                    return;
+                                }
+                                // A click outside the menu dismisses it and then
+                                // continues to the control underneath.
+                            }
+                            if self.ui.find_focused
+                                && !matches!(
+                                    self.chrome.hit(x, y),
+                                    Some(
+                                        ChromePart::FindInput
+                                            | ChromePart::FindClose
+                                            | ChromePart::FindPrev
+                                            | ChromePart::FindNext
+                                    )
+                                )
+                            {
+                                self.ui.find_focused = false;
+                            }
+                            self.ui.pressed = if self.pointer_in_devtools(x, y) {
+                                None
+                            } else {
+                                self.chrome.hit(x, y).filter(|part| {
+                                    !matches!(part, ChromePart::Page | ChromePart::Status)
+                                })
+                            };
+                            // A press on a tab starts a drag; selection happens
+                            // on release if the pointer never left the slot.
+                            if !self.pointer_in_devtools(x, y)
+                                && self.context_menu.is_none()
+                                && let Some(ChromePart::Tab(slot)) = self.chrome.hit(x, y)
+                                && self.tab_drag.start(slot)
+                            {
+                                self.ui.tab_drag_source = Some(slot);
+                                self.ui.tab_drag_target = Some(slot);
+                                self.refresh();
+                                return;
+                            }
+                            self.click_at(x, y);
+                        }
+                        ElementState::Released => {
+                            if self.tab_drag.is_dragging() {
+                                let source = self.tab_drag.source();
+                                let was_click = source == self.tab_drag.target();
+                                self.ui.pressed = None;
+                                self.commit_tab_drag();
+                                if was_click && let Some(slot) = source {
+                                    self.select_tab_slot(slot);
+                                }
+                            } else if self.ui.pressed.take().is_some()
+                                && let Some(window) = &self.window
+                            {
+                                window.request_redraw();
+                            }
+                        }
+                    },
+                    _ => {}
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => self.on_wheel(delta),
@@ -802,5 +1225,103 @@ mod tests {
         assert_eq!(app.ui.status, LoadStatus::Ready);
         assert!(app.ui.error.is_none());
         assert!(!app.ui.address.is_focused());
+    }
+
+    fn app_with_page() -> WindowApp {
+        let mut app = app();
+        app.browser
+            .load_html("<html><body><p>alpha beta alpha</p></body></html>", None)
+            .unwrap();
+        app.find_page_text_changed();
+        app
+    }
+
+    #[test]
+    fn find_bar_filters_and_navigates_matches() {
+        let mut app = app_with_page();
+        app.open_find();
+        assert!(app.ui.find_open && app.ui.find_focused);
+
+        app.find_insert("alpha");
+        assert_eq!(app.ui.find.query(), "alpha");
+        assert_eq!(app.ui.find.match_count(), 2);
+        assert_eq!(app.ui.find.current_index(), Some(0));
+        assert_eq!(app.ui.find_highlights.len(), 2);
+
+        app.find_navigate(true);
+        assert_eq!(app.ui.find.current_index(), Some(1));
+        assert!(
+            app.ui
+                .find_highlights
+                .iter()
+                .any(|highlight| highlight.current)
+        );
+        app.find_navigate(true);
+        assert_eq!(app.ui.find.current_index(), Some(0), "navigation wraps");
+
+        app.close_find();
+        assert!(!app.ui.find_open && !app.ui.find_focused);
+        assert!(app.ui.find_highlights.is_empty());
+    }
+
+    #[test]
+    fn zoom_only_changes_the_page_render_scale() {
+        let mut app = app();
+        assert_eq!(app.zoom.level(), 1.0);
+        app.apply_zoom(1);
+        assert!(app.render_dirty);
+        assert_eq!(app.zoom.level(), 1.1);
+        assert!((app.zoom.scale(2.0) - 2.2).abs() < 1e-6);
+        app.apply_zoom(0);
+        assert_eq!(app.zoom.level(), 1.0);
+        assert_eq!(app.zoom.scale(2.0), 2.0);
+    }
+
+    #[test]
+    fn tab_drag_commits_a_display_order() {
+        let mut app = app();
+        app.browser.new_tab();
+        app.browser.new_tab();
+        app.sync_tab_order();
+        assert_eq!(app.ui.tab_order, vec![0, 1, 2]);
+
+        assert!(app.tab_drag.start(0));
+        assert!(app.tab_drag.move_to(2));
+        app.ui.tab_drag_source = Some(0);
+        app.ui.tab_drag_target = Some(2);
+        app.commit_tab_drag();
+        assert_eq!(app.ui.tab_order, vec![1, 2, 0]);
+        assert!(app.tab_drag.is_idle());
+        assert_eq!(app.ui.tab_index(0), 1);
+
+        let id = app.browser.tabs().ids()[1];
+        app.select_tab_slot(0);
+        assert_eq!(app.browser.tab().id, id);
+    }
+
+    #[test]
+    fn context_menu_opens_and_actions_run() {
+        let mut app = app_with_page();
+        app.open_context_menu(500.0, 300.0);
+        let menu = app.context_menu.as_ref().unwrap();
+        assert_eq!(menu.item_count(), 5);
+        assert!(app.context_link.is_none());
+
+        app.run_context_action(ContextAction::Inspect);
+        assert!(app.context_menu.is_none());
+        assert!(app.devtools.open);
+    }
+
+    #[test]
+    fn f12_remains_the_devtools_shortcut() {
+        // The find bar handles text keys only; F12 still reaches the DevTools
+        // branch of `on_key`.
+        assert!(is_devtools_toggle(&Key::Named(NamedKey::F12), false, false));
+        assert!(is_devtools_toggle(&Key::Character("I".into()), true, true));
+        assert!(!is_devtools_toggle(
+            &Key::Character("f".into()),
+            true,
+            false
+        ));
     }
 }

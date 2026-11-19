@@ -6,7 +6,7 @@ use browser_js_parser::{Regex, RegexMatch};
 
 use crate::Runtime;
 use crate::errors::JsError;
-use crate::object::{ObjectKind, SYMBOL_ITERATOR_KEY};
+use crate::object::{ObjectKind, SYMBOL_ASYNC_ITERATOR_KEY, SYMBOL_ITERATOR_KEY};
 use crate::value::{Value, number_to_string};
 
 impl Runtime {
@@ -46,6 +46,9 @@ impl Runtime {
         self.install_promise();
         self.install_symbol_and_iterators();
         self.install_generator_prototype();
+        self.install_reflect();
+        self.install_weak_refs();
+        self.install_intl();
 
         self.declare_binding(
             global_scope,
@@ -114,21 +117,42 @@ impl Runtime {
         if let Value::Object(id) = iterator {
             self.symbol_iterator = id;
         }
+        let async_iterator = self.new_symbol("Symbol.asyncIterator");
+        if let Value::Object(id) = async_iterator {
+            self.symbol_async_iterator = id;
+        }
         let constructor = self.new_builtin_value("Symbol", 0, symbol_constructor);
-        self.define_data_property(
-            match &constructor {
-                Value::Object(id) => *id,
-                _ => unreachable!("builtin values are objects"),
-            },
-            "iterator",
-            iterator.clone(),
-        );
+        if let Value::Object(id) = &constructor {
+            self.define_data_property(*id, "iterator", iterator.clone());
+            self.define_data_property(*id, "asyncIterator", async_iterator);
+        }
         self.declare_global("Symbol", constructor);
 
         let array_iterator = self.new_builtin_value("[Symbol.iterator]", 0, array_iterator);
-        self.define_data_property(self.prototypes.array, SYMBOL_ITERATOR_KEY, array_iterator);
+        self.define_data_property(
+            self.prototypes.array,
+            SYMBOL_ITERATOR_KEY,
+            array_iterator.clone(),
+        );
+        // `for await...of` also accepts synchronous iterables; exposing the same
+        // iterator under the async key makes the loop's lookup succeed and the
+        // awaited `next()` value passes through unchanged.
+        self.define_data_property(
+            self.prototypes.array,
+            SYMBOL_ASYNC_ITERATOR_KEY,
+            array_iterator,
+        );
         let string_iterator = self.new_builtin_value("[Symbol.iterator]", 0, string_iterator);
-        self.define_data_property(self.prototypes.string, SYMBOL_ITERATOR_KEY, string_iterator);
+        self.define_data_property(
+            self.prototypes.string,
+            SYMBOL_ITERATOR_KEY,
+            string_iterator.clone(),
+        );
+        self.define_data_property(
+            self.prototypes.string,
+            SYMBOL_ASYNC_ITERATOR_KEY,
+            string_iterator,
+        );
         let generator_iterator =
             self.new_builtin_value("[Symbol.iterator]", 0, generator_self_iterator);
         self.define_data_property(
@@ -207,6 +231,7 @@ impl Runtime {
         self.define_builtin_method(prototype, "trim", 0, string_trim);
         self.define_builtin_method(prototype, "replace", 2, string_replace);
         self.define_builtin_method(prototype, "match", 1, string_match);
+        self.define_builtin_method(prototype, "matchAll", 1, string_match_all);
         self.define_builtin_method(prototype, "includes", 1, string_includes);
         self.define_builtin_method(prototype, "startsWith", 1, string_starts_with);
         self.define_builtin_method(prototype, "endsWith", 1, string_ends_with);
@@ -1246,7 +1271,7 @@ fn string_match(runtime: &mut Runtime, this: Value, args: Vec<Value>) -> Result<
             return Ok(runtime.new_array(matches));
         }
         return Ok(match regex.find_from(&chars, 0) {
-            Some(found) => match_value(runtime, &text, &found),
+            Some(found) => match_value_with_regex(runtime, &text, &found, &regex),
             None => Value::Null,
         });
     }
@@ -1275,6 +1300,96 @@ fn match_value(runtime: &mut Runtime, text: &str, found: &RegexMatch) -> Value {
     runtime.set_property(array.clone(), "index", Value::Number(found.start as f64));
     runtime.set_property(array.clone(), "input", Value::String(text.to_owned()));
     array
+}
+
+/// Build a match array including named `groups` and `d`-flag `indices`.
+fn match_value_with_regex(
+    runtime: &mut Runtime,
+    text: &str,
+    found: &RegexMatch,
+    regex: &Regex,
+) -> Value {
+    let array = match_value(runtime, text, found);
+    let names = regex.group_names();
+    let has_names = names.iter().flatten().next().is_some();
+
+    if has_names {
+        let groups = runtime.new_object();
+        for (index, name) in names.iter().enumerate() {
+            if let Some(name) = name {
+                let value = found
+                    .groups
+                    .get(index)
+                    .cloned()
+                    .flatten()
+                    .map_or(Value::Undefined, Value::String);
+                runtime.set_property(groups.clone(), name, value);
+            }
+        }
+        runtime.set_property(array.clone(), "groups", groups);
+    }
+
+    if regex.flags().has_indices {
+        let mut ranges = Vec::with_capacity(found.ranges.len());
+        for range in &found.ranges {
+            ranges.push(match range {
+                Some((start, end)) => runtime.new_array(vec![
+                    Value::Number(*start as f64),
+                    Value::Number(*end as f64),
+                ]),
+                None => Value::Undefined,
+            });
+        }
+        let indices = runtime.new_array(ranges);
+        if has_names {
+            let named = runtime.new_object();
+            for (index, name) in names.iter().enumerate() {
+                if let Some(name) = name {
+                    let value = found.ranges.get(index).copied().flatten().map_or(
+                        Value::Undefined,
+                        |(start, end)| {
+                            runtime.new_array(vec![
+                                Value::Number(start as f64),
+                                Value::Number(end as f64),
+                            ])
+                        },
+                    );
+                    runtime.set_property(named.clone(), name, value);
+                }
+            }
+            runtime.set_property(indices.clone(), "groups", named);
+        }
+        runtime.set_property(array.clone(), "indices", indices);
+    }
+    array
+}
+
+fn string_match_all(
+    runtime: &mut Runtime,
+    this: Value,
+    args: Vec<Value>,
+) -> Result<Value, JsError> {
+    let text = this_string(runtime, &this)?;
+    let pattern = args.first().cloned().unwrap_or(Value::Undefined);
+    let regex = runtime
+        .regex_of(&pattern)
+        .ok_or_else(|| JsError::type_error("String.prototype.matchAll requires a RegExp"))?;
+    let chars: Vec<char> = text.chars().collect();
+    let mut matches = Vec::new();
+    let mut cursor = 0usize;
+    while cursor <= chars.len() {
+        runtime.tick()?;
+        let Some(found) = regex.find_from(&chars, cursor) else {
+            break;
+        };
+        matches.push(match_value_with_regex(runtime, &text, &found, &regex));
+        cursor = if found.end == found.start {
+            found.end + 1
+        } else {
+            found.end
+        };
+    }
+    Ok(runtime.new_array_iterator(matches))
 }
 
 fn global_regexp(runtime: &mut Runtime, _this: Value, args: Vec<Value>) -> Result<Value, JsError> {
@@ -1314,17 +1429,17 @@ fn regexp_test(runtime: &mut Runtime, this: Value, args: Vec<Value>) -> Result<V
     let regex = require_regexp(runtime, &this)?;
     let text = runtime.to_string_rt(&args.first().cloned().unwrap_or(Value::Undefined))?;
     let chars: Vec<char> = text.chars().collect();
-    let global = regex.flags().global;
-    let start = last_index(runtime, &this, global);
+    let stateful = regex.flags().global || regex.flags().sticky;
+    let start = last_index(runtime, &this, stateful);
     match regex.find_from(&chars, start) {
         Some(found) => {
-            if global {
+            if stateful {
                 advance_last_index(runtime, &this, &found);
             }
             Ok(Value::Bool(true))
         }
         None => {
-            if global {
+            if stateful {
                 runtime.set_property(this, "lastIndex", Value::Number(0.0));
             }
             Ok(Value::Bool(false))
@@ -1336,17 +1451,17 @@ fn regexp_exec(runtime: &mut Runtime, this: Value, args: Vec<Value>) -> Result<V
     let regex = require_regexp(runtime, &this)?;
     let text = runtime.to_string_rt(&args.first().cloned().unwrap_or(Value::Undefined))?;
     let chars: Vec<char> = text.chars().collect();
-    let global = regex.flags().global;
-    let start = last_index(runtime, &this, global);
+    let stateful = regex.flags().global || regex.flags().sticky;
+    let start = last_index(runtime, &this, stateful);
     match regex.find_from(&chars, start) {
         Some(found) => {
-            if global {
+            if stateful {
                 advance_last_index(runtime, &this, &found);
             }
-            Ok(match_value(runtime, &text, &found))
+            Ok(match_value_with_regex(runtime, &text, &found, &regex))
         }
         None => {
-            if global {
+            if stateful {
                 runtime.set_property(this, "lastIndex", Value::Number(0.0));
             }
             Ok(Value::Null)
@@ -1956,7 +2071,7 @@ fn string_iterator(
     Ok(runtime.new_array_iterator(items))
 }
 
-fn generator_self_iterator(
+pub(crate) fn generator_self_iterator(
     _runtime: &mut Runtime,
     this: Value,
     _args: Vec<Value>,
@@ -1968,6 +2083,24 @@ fn generator_next(runtime: &mut Runtime, this: Value, args: Vec<Value>) -> Resul
     let frame = runtime
         .generator_frame_of(&this)
         .ok_or_else(|| JsError::type_error("Generator.prototype.next on non-generator"))?;
+    let is_async = frame.borrow().is_async;
+    if is_async {
+        // An async generator's `next()` returns a promise for an iterator result.
+        let (promise_id, _state) = runtime.new_promise();
+        let promise = Value::Object(promise_id);
+        if frame.borrow().done {
+            let result = runtime.new_iterator_result(Value::Undefined, true);
+            runtime.resolve_promise(promise_id, result);
+            return Ok(promise);
+        }
+        let resume = if frame.borrow().suspended {
+            Some(args.first().cloned().unwrap_or(Value::Undefined))
+        } else {
+            None
+        };
+        runtime.drive_async_generator(frame, promise.clone(), resume)?;
+        return Ok(promise);
+    }
     if frame.borrow().done {
         return Ok(runtime.new_iterator_result(Value::Undefined, true));
     }
@@ -1994,6 +2127,12 @@ fn generator_return(
         .ok_or_else(|| JsError::type_error("Generator.prototype.return on non-generator"))?;
     let value = args.first().cloned().unwrap_or(Value::Undefined);
     frame.borrow_mut().done = true;
+    if frame.borrow().is_async {
+        let (promise_id, _state) = runtime.new_promise();
+        let result = runtime.new_iterator_result(value, true);
+        runtime.resolve_promise(promise_id, result);
+        return Ok(Value::Object(promise_id));
+    }
     Ok(runtime.new_iterator_result(value, true))
 }
 
@@ -2003,7 +2142,14 @@ fn generator_throw(runtime: &mut Runtime, this: Value, args: Vec<Value>) -> Resu
         .ok_or_else(|| JsError::type_error("Generator.prototype.throw on non-generator"))?;
     let value = args.first().cloned().unwrap_or(Value::Undefined);
     // With no `try`/`catch` inside the generator machine, a thrown value
-    // propagates to the caller and terminates the generator.
+    // propagates to the caller and terminates the generator. Async generators
+    // surface the failure as a rejected promise instead.
+    if frame.borrow().is_async {
+        let (promise_id, _state) = runtime.new_promise();
+        runtime.reject_promise(promise_id, value);
+        frame.borrow_mut().done = true;
+        return Ok(Value::Object(promise_id));
+    }
     if frame.borrow().done {
         return Err(runtime.error_from_throw(value));
     }

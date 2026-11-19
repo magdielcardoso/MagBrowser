@@ -122,7 +122,7 @@ fn parse_complex_inner(
     let mut parts: Vec<(Option<Combinator>, CompoundSelector)> = Vec::new();
     let mut specificity = Specificity::default();
     let mut pending: Option<Combinator> = None;
-    let mut pseudo_element: Option<String> = None;
+    let mut pseudo_element: Option<PseudoElementInfo> = None;
 
     loop {
         cursor.skip_whitespace();
@@ -192,16 +192,34 @@ fn parse_complex_inner(
         parts,
         specificity,
         text: text.trim().to_string(),
-        pseudo_element,
+        pseudo_element: pseudo_element.as_ref().map(|info| info.name.clone()),
+        pseudo_element_argument: pseudo_element.and_then(|info| info.argument),
     })
+}
+
+/// A parsed pseudo-element together with the raw text of its functional
+/// argument (for example the `div.foo` in `::slotted(div.foo)`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PseudoElementInfo {
+    name: String,
+    argument: Option<String>,
+}
+
+impl PseudoElementInfo {
+    fn simple(name: String) -> Self {
+        Self {
+            name,
+            argument: None,
+        }
+    }
 }
 
 fn parse_compound(
     cursor: &mut Cursor<'_>,
-) -> Result<(CompoundSelector, Specificity, Option<String>), SelectorError> {
+) -> Result<(CompoundSelector, Specificity, Option<PseudoElementInfo>), SelectorError> {
     let mut simples = Vec::new();
     let mut specificity = Specificity::default();
-    let mut pseudo_element: Option<String> = None;
+    let mut pseudo_element: Option<PseudoElementInfo> = None;
 
     match cursor.peek() {
         Some('*') => {
@@ -244,7 +262,7 @@ fn parse_compound(
                     let element = parse_pseudo_element(cursor)?;
                     specificity.c += 1;
                     pseudo_element = Some(element.clone());
-                    simples.push(SimpleSelector::PseudoElement(element));
+                    simples.push(SimpleSelector::PseudoElement(element.name));
                     break;
                 }
                 match parse_pseudo(cursor)? {
@@ -254,6 +272,12 @@ fn parse_compound(
                             PseudoClass::Not(list)
                             | PseudoClass::Is(list)
                             | PseudoClass::Has(list) => {
+                                specificity = specificity.add(max_specificity(list));
+                            }
+                            // `:host-context()` counts as a pseudo-class plus
+                            // the most specific selector in its argument.
+                            PseudoClass::HostContext(list) => {
+                                specificity.b += 1;
                                 specificity = specificity.add(max_specificity(list));
                             }
                             // `:nth-child(... of S)` contributes one
@@ -270,7 +294,7 @@ fn parse_compound(
                     }
                     Pseudo::Element(element) => {
                         specificity.c += 1;
-                        pseudo_element = Some(element.clone());
+                        pseudo_element = Some(PseudoElementInfo::simple(element.clone()));
                         simples.push(SimpleSelector::PseudoElement(element));
                         break;
                     }
@@ -352,6 +376,7 @@ fn parse_pseudo(cursor: &mut Cursor<'_>) -> Result<Pseudo, SelectorError> {
                 let (a, b) = parse_nth(content, content_base)?;
                 PseudoClass::NthLastOfType(a, b)
             }
+            "host-context" => PseudoClass::HostContext(parse_list(content, content_base)?),
             "lang" => PseudoClass::Lang(unquote(content.trim()).to_string()),
             "dir" => {
                 let value = unquote(content.trim()).to_ascii_lowercase();
@@ -423,16 +448,20 @@ fn parse_pseudo(cursor: &mut Cursor<'_>) -> Result<Pseudo, SelectorError> {
     Ok(Pseudo::Class(class))
 }
 
-fn parse_pseudo_element(cursor: &mut Cursor<'_>) -> Result<String, SelectorError> {
+fn parse_pseudo_element(cursor: &mut Cursor<'_>) -> Result<PseudoElementInfo, SelectorError> {
     let name = cursor
         .consume_ident_required("expected pseudo-element name")?
         .to_ascii_lowercase();
     if cursor.peek() == Some('(') {
-        // Functional pseudo-elements (`::part()`, `::slotted()`) are parsed
-        // and their arguments consumed, but they never match.
-        let _ = cursor.consume_parenthesized()?;
+        // Functional pseudo-elements (`::part()`, `::slotted()`) keep their
+        // raw argument so the matcher can evaluate `::slotted(...)`.
+        let (content, _) = cursor.consume_parenthesized()?;
+        return Ok(PseudoElementInfo {
+            name,
+            argument: Some(content.trim().to_string()),
+        });
     }
-    Ok(name)
+    Ok(PseudoElementInfo::simple(name))
 }
 
 fn parse_attribute(cursor: &mut Cursor<'_>) -> Result<SimpleSelector, SelectorError> {
@@ -1220,6 +1249,30 @@ mod tests {
             SimpleSelector::PseudoElement("part".into())
         );
         assert_eq!(selector("p::before").specificity, Specificity::new(0, 0, 2));
+    }
+
+    #[test]
+    fn parses_shadow_dom_selectors() {
+        let parsed = selector(":host-context(.theme, #dark)");
+        let SimpleSelector::Pseudo(PseudoClass::HostContext(list)) = &parsed.parts[0].1.simples[0]
+        else {
+            panic!("expected :host-context");
+        };
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].text, ".theme");
+        assert_eq!(list[1].text, "#dark");
+        assert_eq!(parsed.specificity, Specificity::new(1, 1, 0));
+
+        let parsed = selector("slot[name=title]::slotted(h1.big)");
+        assert_eq!(parsed.pseudo_element.as_deref(), Some("slotted"));
+        assert_eq!(parsed.pseudo_element_argument.as_deref(), Some("h1.big"));
+        assert_eq!(parsed.specificity, Specificity::new(0, 1, 2));
+
+        assert_eq!(
+            selector("::slotted(*)").pseudo_element_argument.as_deref(),
+            Some("*")
+        );
+        assert_eq!(selector("p::before").pseudo_element_argument, None);
     }
 
     #[test]

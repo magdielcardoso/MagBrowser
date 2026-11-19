@@ -9,11 +9,13 @@
 pub mod layout;
 pub mod render;
 
+use browser_core::Browser;
 use browser_css::Color;
 
 pub use layout::{ChromeLayout, ChromePart};
 
 use crate::address_bar::AddressBar;
+use crate::ui_extra::{ContextAction, FindBar, FindHighlight};
 
 /// Tab strip height in logical pixels.
 pub const TAB_STRIP_HEIGHT: f32 = 36.0;
@@ -90,6 +92,26 @@ pub struct UiState {
     pub pressed: Option<ChromePart>,
     /// Last navigation error, when any.
     pub error: Option<String>,
+    /// Find-in-page state (query, matches and current match).
+    pub find: FindBar,
+    /// Whether the find bar overlay is visible.
+    pub find_open: bool,
+    /// Whether typed characters go to the find query field.
+    pub find_focused: bool,
+    /// Approximate rectangles for every current match, in page-local CSS pixels.
+    pub find_highlights: Vec<FindHighlight>,
+    /// Maps display slots in the tab strip to browser tab indices.
+    ///
+    /// `browser_core::TabSet` has no reorder API, so drag-to-reorder is kept
+    /// here and translated at every hit test.
+    pub tab_order: Vec<usize>,
+    /// Display slot of the tab being dragged, for visual feedback.
+    pub tab_drag_source: Option<usize>,
+    /// Target slot of the tab being dragged, for visual feedback.
+    pub tab_drag_target: Option<usize>,
+    /// Context-menu row under the pointer, for hover feedback.
+    #[cfg_attr(not(feature = "window"), allow(dead_code))]
+    pub context_hover: Option<ContextAction>,
 }
 
 impl Default for UiState {
@@ -100,6 +122,14 @@ impl Default for UiState {
             hover: None,
             pressed: None,
             error: None,
+            find: FindBar::new(),
+            find_open: false,
+            find_focused: false,
+            find_highlights: Vec::new(),
+            tab_order: Vec::new(),
+            tab_drag_source: None,
+            tab_drag_target: None,
+            context_hover: None,
         }
     }
 }
@@ -108,5 +138,50 @@ impl UiState {
     /// Creates empty UI state.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Titles in display order and the display slot of the active tab.
+    ///
+    /// The browser's own `titles()` order is only used when no custom tab order
+    /// is set (the default and the self-check path).
+    pub fn tab_titles(&self, browser: &Browser) -> (Vec<String>, usize) {
+        let (titles, active) = browser.tabs().titles();
+        if self.tab_order.len() == titles.len() && is_permutation(&self.tab_order, titles.len()) {
+            let active_slot = self.tab_order.iter().position(|&index| index == active);
+            let reordered: Vec<String> = self
+                .tab_order
+                .iter()
+                .map(|&index| {
+                    titles
+                        .get(index)
+                        .cloned()
+                        .unwrap_or_else(|| "?".to_string())
+                })
+                .collect();
+            return (reordered, active_slot.unwrap_or(active));
+        }
+        (titles, active)
+    }
+
+    /// Converts a display slot into a browser tab index.
+    #[cfg_attr(not(feature = "window"), allow(dead_code))]
+    pub fn tab_index(&self, display_slot: usize) -> usize {
+        self.tab_order
+            .get(display_slot)
+            .copied()
+            .unwrap_or(display_slot)
+    }
+}
+
+fn is_permutation(order: &[usize], len: usize) -> bool {
+    order.len() == len && {
+        let mut seen = vec![false; len];
+        order.iter().all(|&index| {
+            if index >= len || seen[index] {
+                return false;
+            }
+            seen[index] = true;
+            true
+        })
     }
 }

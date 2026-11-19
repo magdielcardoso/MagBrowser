@@ -149,6 +149,15 @@ impl GeneratorFrame {
     }
 }
 
+/// Which kind of async frame is being driven: a plain async function (its
+/// result promise receives the return value) or an async generator (each
+/// `next()` promise receives an iterator result).
+#[derive(Clone, Copy)]
+enum AsyncMode {
+    Function,
+    Generator,
+}
+
 /// Why a machine stopped running.
 #[derive(Clone, Debug)]
 pub(crate) enum Step {
@@ -367,7 +376,8 @@ fn compile_stmt(stmt: &Stmt, compiler: &mut Compiler) {
             right,
             body,
             is_of,
-        } => compile_for_in(left, right, *is_of, body, compiler),
+            is_await,
+        } => compile_for_in(left, right, *is_of, *is_await, body, compiler),
         Stmt::Break(label) => {
             if let Some(index) = compiler.closest_loop(label.as_ref()) {
                 let jump = compiler.jump();
@@ -492,6 +502,7 @@ fn compile_for_in(
     left: &ForTarget,
     right: &Expr,
     is_of: bool,
+    is_await: bool,
     body: &Stmt,
     compiler: &mut Compiler,
 ) {
@@ -502,9 +513,14 @@ fn compile_for_in(
     let item_index = compiler.temp();
     let iter_name = temp_name(iter_index);
     let step_name = temp_name(step_index);
+    let iterator_name = if is_await {
+        "asyncIterator"
+    } else {
+        "iterator"
+    };
     let symbol_iterator = Expr::Member {
         object: Box::new(Expr::Identifier("Symbol".to_owned())),
-        property: Box::new(Expr::Identifier("iterator".to_owned())),
+        property: Box::new(Expr::Identifier(iterator_name.to_owned())),
         computed: false,
     };
     let iter_call = Expr::Call {
@@ -535,7 +551,13 @@ fn compile_for_in(
         }),
         arguments: Vec::new(),
     };
-    let step_call_temp = compiler.eval(next_call);
+    // For `for await...of` each `next()` result is a promise, so await it
+    // before reading `done` and `value`.
+    let step_call_temp = if is_await {
+        compiler.eval_expr(&Expr::Await(Box::new(next_call)))
+    } else {
+        compiler.eval(next_call)
+    };
     compiler.emit(Instr::Eval {
         expr: Expr::Identifier(temp_name(step_call_temp)),
         temp: step_index,
@@ -1054,6 +1076,18 @@ impl crate::Runtime {
                     None => Value::Undefined,
                 };
                 let scope = self.current_scope();
+                if kind != DeclKind::Var {
+                    let binding_kind = if kind == DeclKind::Const {
+                        BindingKind::Const
+                    } else {
+                        BindingKind::Let
+                    };
+                    let mut names = Vec::new();
+                    pattern.bound_names(&mut names);
+                    for name in names {
+                        self.prepare_binding(scope, &name, binding_kind);
+                    }
+                }
                 self.bind_decl_pattern_in_scope(&pattern, value, kind, scope)?;
                 frame.borrow_mut().pc = pc + 1;
             }
@@ -1265,18 +1299,49 @@ impl crate::Runtime {
         promise: Value,
         resume: Option<Value>,
     ) -> Result<(), JsError> {
+        self.drive_async(frame, promise, resume, AsyncMode::Function)
+    }
+
+    /// Drive one step of an async generator, resolving its `next()` promise.
+    pub(crate) fn drive_async_generator(
+        &mut self,
+        frame: Rc<RefCell<GeneratorFrame>>,
+        promise: Value,
+        resume: Option<Value>,
+    ) -> Result<(), JsError> {
+        self.drive_async(frame, promise, resume, AsyncMode::Generator)
+    }
+
+    fn drive_async(
+        &mut self,
+        frame: Rc<RefCell<GeneratorFrame>>,
+        promise: Value,
+        resume: Option<Value>,
+        mode: AsyncMode,
+    ) -> Result<(), JsError> {
         match self.step_generator(&frame, resume) {
             Ok(Step::Await(value)) => {
-                self.schedule_async_resume(frame, promise, value);
+                self.schedule_async_resume(frame, promise, value, mode);
                 Ok(())
             }
             Ok(Step::Yield(value)) => {
-                // Async generators are not part of the supported subset.
-                self.schedule_async_resume(frame, promise, value);
+                match mode {
+                    AsyncMode::Function => {
+                        self.schedule_async_resume(frame, promise, value, mode);
+                    }
+                    AsyncMode::Generator => {
+                        let result = self.new_iterator_result(value, false);
+                        self.resolve_promise_value(&promise, result);
+                    }
+                }
                 Ok(())
             }
             Ok(Step::Return(value)) => {
-                self.resolve_promise_value(&promise, value);
+                let result = match mode {
+                    AsyncMode::Function => value,
+                    AsyncMode::Generator => self.new_iterator_result(value, true),
+                };
+                self.resolve_promise_value(&promise, result);
                 Ok(())
             }
             Err(error) => {
@@ -1291,6 +1356,7 @@ impl crate::Runtime {
         frame: Rc<RefCell<GeneratorFrame>>,
         promise: Value,
         awaited: Value,
+        mode: AsyncMode,
     ) {
         let resolve_frame = Rc::clone(&frame);
         let resolve_promise = promise.clone();
@@ -1302,10 +1368,11 @@ impl crate::Runtime {
             Box::new(move |runtime, _this, args| {
                 let value = args.first().cloned().unwrap_or(Value::Undefined);
                 runtime
-                    .continue_async(
+                    .drive_async(
                         Rc::clone(&resolve_frame),
                         resolve_promise.clone(),
                         Some(value),
+                        mode,
                     )
                     .map(|()| Value::Undefined)
             }),
@@ -1315,7 +1382,12 @@ impl crate::Runtime {
             1,
             Box::new(move |runtime, _this, args| {
                 let value = args.first().cloned().unwrap_or(Value::Undefined);
-                runtime.reject_async(Rc::clone(&reject_frame), reject_promise.clone(), value)
+                runtime.reject_async(
+                    Rc::clone(&reject_frame),
+                    reject_promise.clone(),
+                    value,
+                    mode,
+                )
             }),
         );
         let then = self.get_property(&awaited, "then");
@@ -1324,7 +1396,12 @@ impl crate::Runtime {
         } else {
             self.enqueue_microtask(Box::new(move |runtime, _this, _args| {
                 runtime
-                    .continue_async(Rc::clone(&frame), promise.clone(), Some(awaited.clone()))
+                    .drive_async(
+                        Rc::clone(&frame),
+                        promise.clone(),
+                        Some(awaited.clone()),
+                        mode,
+                    )
                     .map(|()| Value::Undefined)
             }));
         }
@@ -1335,16 +1412,27 @@ impl crate::Runtime {
         frame: Rc<RefCell<GeneratorFrame>>,
         promise: Value,
         value: Value,
+        mode: AsyncMode,
     ) -> Result<Value, JsError> {
         let error = self.error_from_throw(value);
         match self.throw_generator(&frame, error) {
             Ok(Step::Await(awaited)) => {
-                self.schedule_async_resume(frame, promise, awaited);
+                self.schedule_async_resume(frame, promise, awaited, mode);
             }
-            Ok(Step::Yield(value)) => {
-                self.schedule_async_resume(frame, promise, value);
+            Ok(Step::Yield(value)) => match mode {
+                AsyncMode::Function => self.schedule_async_resume(frame, promise, value, mode),
+                AsyncMode::Generator => {
+                    let result = self.new_iterator_result(value, false);
+                    self.resolve_promise_value(&promise, result);
+                }
+            },
+            Ok(Step::Return(value)) => {
+                let result = match mode {
+                    AsyncMode::Function => value,
+                    AsyncMode::Generator => self.new_iterator_result(value, true),
+                };
+                self.resolve_promise_value(&promise, result);
             }
-            Ok(Step::Return(value)) => self.resolve_promise_value(&promise, value),
             Err(error) => self.reject_promise_value(&promise, error.thrown_value()),
         }
         Ok(Value::Undefined)

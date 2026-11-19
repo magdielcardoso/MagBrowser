@@ -93,9 +93,63 @@ impl crate::Runtime {
             }
         }
 
+        // Finalization registries learn about collected targets before the
+        // sweep so their cleanup callbacks can be queued as microtasks.
+        let mut due: Vec<(Value, Value, Option<Value>)> = Vec::new();
+        for (index, slot) in self.heap.iter().enumerate() {
+            if !marked[index] {
+                continue;
+            }
+            let Some(object) = slot.as_ref() else {
+                continue;
+            };
+            let ObjectKind::FinalizationRegistry(state) = &object.kind else {
+                continue;
+            };
+            let cleanup = object
+                .properties
+                .iter()
+                .find(|(name, _)| name == crate::weak::FINALIZATION_CLEANUP)
+                .and_then(|(_, data)| match data {
+                    PropertyData::Data(value) => Some(value.clone()),
+                    PropertyData::Accessor { .. } => None,
+                });
+            let Some(cleanup) = cleanup else {
+                continue;
+            };
+            let dead: Vec<usize> = state
+                .borrow()
+                .registrations
+                .iter()
+                .enumerate()
+                .filter(|(_, registration)| {
+                    !marked.get(registration.target.0).copied().unwrap_or(false)
+                        || self.heap_generations.get(registration.target.0).copied()
+                            != Some(registration.generation)
+                })
+                .map(|(position, _)| position)
+                .collect();
+            let mut state = state.borrow_mut();
+            for position in dead.into_iter().rev() {
+                let registration = state.registrations.remove(position);
+                due.push((cleanup.clone(), registration.held, registration.token));
+            }
+        }
+        for (cleanup, held, token) in due {
+            let args = vec![held, token.unwrap_or(Value::Undefined)];
+            self.microtasks
+                .push_back(Box::new(move |runtime: &mut crate::Runtime| {
+                    runtime.call_function(&cleanup, Value::Undefined, args.clone())?;
+                    Ok(())
+                }));
+        }
+
         for (index, slot) in self.heap.iter_mut().enumerate() {
             if slot.is_some() && !marked[index] {
                 *slot = None;
+                // Invalidate weak references to this slot. A later allocation
+                // bumps it again, so stale references never alias a new object.
+                self.heap_generations[index] += 1;
                 self.heap_free.push(index);
             }
         }
@@ -156,6 +210,24 @@ fn mark_object(
             push_promise_values(state, values);
         }
         ObjectKind::RegExp(_) | ObjectKind::Symbol(_) => {}
+        ObjectKind::Proxy { target, handler } => {
+            values.push(target.clone());
+            values.push(handler.clone());
+        }
+        // A weak reference deliberately does not trace its target.
+        ObjectKind::WeakRef { .. } => {}
+        // The cleanup callback is an ordinary property and is traced above;
+        // held values and tokens are strong, but registration targets are weak.
+        ObjectKind::FinalizationRegistry(state) => {
+            if let Ok(state) = state.try_borrow() {
+                for registration in &state.registrations {
+                    values.push(registration.held.clone());
+                    if let Some(token) = &registration.token {
+                        values.push(token.clone());
+                    }
+                }
+            }
+        }
         ObjectKind::Generator(frame) => {
             if let Ok(frame) = frame.try_borrow() {
                 scopes.push(frame.scope);
